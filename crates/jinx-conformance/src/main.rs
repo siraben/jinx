@@ -47,7 +47,9 @@ struct Outcome {
 }
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // The engine is spawned with cwd=corpus; resolve it before that.
+    args.engine = args.engine.canonicalize().expect("engine binary");
     let corpus = args.corpus.canonicalize().expect("corpus dir");
     let lang = corpus.join("lang");
 
