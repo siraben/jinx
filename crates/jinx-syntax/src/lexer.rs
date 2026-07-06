@@ -213,10 +213,36 @@ impl<'a> Lexer<'a> {
         positions.add(self.origin, offset)
     }
 
+    /// Port of C++ `forceNoNullByte` (lexer.l): a string token whose (for
+    /// regular strings: unescaped; for indented strings: raw) content contains
+    /// a NUL byte cannot be represented as a Nix string. The NUL is rendered as
+    /// U+2400 (␀) in the message, and the error is reported at the token's
+    /// start position. Checked at lex time, matching Nix.
+    fn no_null_byte(&self, positions: &PosTable, tok: &Token) -> Result<(), ParseError> {
+        if !tok.text.contains(&0u8) {
+            return Ok(());
+        }
+        let mut shown = Vec::with_capacity(tok.text.len());
+        for &b in &tok.text {
+            if b == 0 {
+                shown.extend_from_slice("␀".as_bytes());
+            } else {
+                shown.push(b);
+            }
+        }
+        let mut msg =
+            b"input string '".to_vec();
+        msg.extend_from_slice(&shown);
+        msg.extend_from_slice(
+            b"' cannot be represented as Nix string because it contains null bytes",
+        );
+        Err(ParseError::new(msg, self.pos_at(positions, tok.begin)))
+    }
+
     pub fn next_token(&mut self, positions: &PosTable) -> Result<Token, ParseError> {
         match self.state() {
-            State::String => self.lex_string(),
-            State::IndString => self.lex_ind_string(),
+            State::String => self.lex_string(positions),
+            State::IndString => self.lex_ind_string(positions),
             State::InPath | State::InPathSlash => self.lex_in_path(positions),
             State::Initial | State::Default => self.lex_default(positions),
         }
@@ -476,7 +502,7 @@ impl<'a> Lexer<'a> {
 
     // ---------- STRING ----------
 
-    fn lex_string(&mut self) -> Result<Token, ParseError> {
+    fn lex_string(&mut self, positions: &PosTable) -> Result<Token, ParseError> {
         let src = self.src;
         let len = src.len();
         let p = self.pos;
@@ -519,7 +545,9 @@ impl<'a> Lexer<'a> {
         }
         if q > p {
             let text = unescape_str(&src[p..q]);
-            return Ok(self.tok_with_text(TokKind::Str { has_indent: false }, q - p, text));
+            let tok = self.tok_with_text(TokKind::Str { has_indent: false }, q - p, text);
+            self.no_null_byte(positions, &tok)?;
+            return Ok(tok);
         }
         if p >= len {
             return Ok(self.eof());
@@ -551,7 +579,7 @@ impl<'a> Lexer<'a> {
 
     // ---------- IND_STRING ----------
 
-    fn lex_ind_string(&mut self) -> Result<Token, ParseError> {
+    fn lex_ind_string(&mut self, positions: &PosTable) -> Result<Token, ParseError> {
         let src = self.src;
         let len = src.len();
         let p = self.pos;
@@ -616,13 +644,17 @@ impl<'a> Lexer<'a> {
         match best_rule {
             0 => {
                 let text = src[p..p + best_len].to_vec();
-                Ok(self.tok_with_text(TokKind::IndStr { has_indent: true }, best_len, text))
+                let tok = self.tok_with_text(TokKind::IndStr { has_indent: true }, best_len, text);
+                self.no_null_byte(positions, &tok)?;
+                Ok(tok)
             }
             1 => Ok(self.tok_with_text(TokKind::IndStr { has_indent: false }, 3, b"$".to_vec())),
             2 => Ok(self.tok_with_text(TokKind::IndStr { has_indent: false }, 3, b"''".to_vec())),
             3 => {
                 let text = unescape_str(&src[p + 2..p + 4]);
-                Ok(self.tok_with_text(TokKind::IndStr { has_indent: false }, 4, text))
+                let tok = self.tok_with_text(TokKind::IndStr { has_indent: false }, 4, text);
+                self.no_null_byte(positions, &tok)?;
+                Ok(tok)
             }
             4 => {
                 self.push(State::Default);
