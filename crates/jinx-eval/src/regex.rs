@@ -1272,6 +1272,8 @@ mod tests {
         let toks: &[&[u8]] = &[
             b"a", b"b", b"c", b".", b"*", b"+", b"?", b"(", b")", b"|", b"[", b"]", b"^", b"$",
             b"[abc]", b"[^ab]", b"[a-c]", b"{1,2}", b"{2}", b"a*", b"b+",
+            // composite tokens that exercise nested groups and repeated groups
+            b"(a)", b"(a|b)", b"((a)|(b))", b"(a)(b)", b"(a|b)+", b"((a)|(b))*", b"(a?)",
         ];
         let len = 1 + rng.upto(6);
         let mut p = Vec::new();

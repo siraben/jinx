@@ -102,8 +102,6 @@ const UNIMPLEMENTED: &[(&str, u8)] = &[
     ("__toXML", 1),
     // flakes (experimental): present in `builtins` so failures are clearly
     // "not implemented" rather than "attribute missing".
-    ("parseFlakeRef", 1),
-    ("flakeRefToString", 1),
     ("getFlake", 1),
 ];
 
@@ -201,6 +199,8 @@ pub fn register_globals(vm: &mut VM) {
         Reg { name: "__match", arity: 2, func: prim_match },
         Reg { name: "__split", arity: 2, func: prim_split },
         Reg { name: "fromTOML", arity: 1, func: prim_from_toml },
+        Reg { name: "parseFlakeRef", arity: 1, func: prim_parse_flake_ref },
+        Reg { name: "flakeRefToString", arity: 1, func: prim_flake_ref_to_string },
         Reg { name: "__getContext", arity: 1, func: prim_get_context },
         Reg { name: "__hasContext", arity: 1, func: prim_has_context },
     ];
@@ -1848,6 +1848,311 @@ fn derivation_strict_internal(
     let v = vm.new_bindings_value(&result);
     vm.temp_end(scope);
     Ok(v)
+}
+
+// ---------------------------------------------------------------------
+// flakerefs (experimental: flakes)
+// ---------------------------------------------------------------------
+
+fn flakes_disabled(vm: &mut VM, pos: PosIdx) -> ErrId {
+    vm.new_err(
+        ErrKind::Eval,
+        "experimental Nix feature 'flakes' is disabled; add '--extra-experimental-features flakes' to enable it",
+        pos,
+    )
+}
+
+/// 40-char lowercase hex git rev.
+fn is_git_rev(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Parse a flakeref string into a sorted list of (key, value) string attrs.
+/// Supports the `github:` scheme, `flake:`/indirect ids, and `path:`/absolute
+/// paths — enough for `builtins.parseFlakeRef`.
+fn parse_flake_ref(s: &str) -> Result<Vec<(String, String)>, String> {
+    if let Some(hidx) = s.find('#') {
+        return Err(format!(
+            "unexpected fragment '{}' in flake reference '{}'",
+            &s[hidx + 1..],
+            s
+        ));
+    }
+    // Split off the query string.
+    let (body, query) = match s.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (s, None),
+    };
+    let mut qmap: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = pair.split_once('=') {
+                qmap.insert(k.to_string(), url_decode(v));
+            }
+        }
+    }
+    let mut attrs: Vec<(String, String)> = Vec::new();
+    let dir = qmap.remove("dir");
+
+    if let Some(rest) = body.strip_prefix("github:").or_else(|| body.strip_prefix("gitlab:").or_else(|| body.strip_prefix("sourcehut:"))) {
+        let scheme = &body[..body.find(':').unwrap()];
+        let segs: Vec<&str> = rest.splitn(3, '/').collect();
+        if segs.len() < 2 {
+            return Err(format!("'{s}' is not a valid flake reference"));
+        }
+        attrs.push(("type".into(), scheme.into()));
+        attrs.push(("owner".into(), segs[0].into()));
+        attrs.push(("repo".into(), segs[1].into()));
+        if let Some(third) = segs.get(2) {
+            if is_git_rev(third) {
+                attrs.push(("rev".into(), (*third).into()));
+            } else {
+                attrs.push(("ref".into(), (*third).into()));
+            }
+        }
+        for (k, v) in &qmap {
+            attrs.push((k.clone(), v.clone()));
+        }
+    } else if let Some(rest) = body.strip_prefix("flake:") {
+        parse_indirect(rest, &mut attrs)?;
+    } else if let Some(rest) = body.strip_prefix("path:") {
+        attrs.push(("type".into(), "path".into()));
+        attrs.push(("path".into(), url_decode(rest)));
+        for (k, v) in &qmap {
+            attrs.push((k.clone(), v.clone()));
+        }
+    } else if body.starts_with('/') {
+        attrs.push(("type".into(), "path".into()));
+        attrs.push(("path".into(), body.into()));
+    } else if !body.contains(':') {
+        // Bare flake id: "nixpkgs" or "nixpkgs/ref".
+        parse_indirect(body, &mut attrs)?;
+    } else {
+        return Err(format!("'{s}' is not a valid flake reference"));
+    }
+
+    if let Some(d) = dir {
+        attrs.push(("dir".into(), d));
+    }
+    attrs.sort_by(|a, b| a.0.cmp(&b.0));
+    attrs.dedup_by(|a, b| a.0 == b.0);
+    Ok(attrs)
+}
+
+fn parse_indirect(rest: &str, attrs: &mut Vec<(String, String)>) -> Result<(), String> {
+    let segs: Vec<&str> = rest.splitn(3, '/').collect();
+    attrs.push(("type".into(), "indirect".into()));
+    attrs.push(("id".into(), segs[0].into()));
+    match segs.get(1) {
+        Some(a) if is_git_rev(a) => attrs.push(("rev".into(), (*a).into())),
+        Some(a) => {
+            attrs.push(("ref".into(), (*a).into()));
+            if let Some(rev) = segs.get(2) {
+                attrs.push(("rev".into(), (*rev).into()));
+            }
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn prim_parse_flake_ref(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    if !vm.experimental.flakes {
+        return Err(flakes_disabled(vm, pos));
+    }
+    let s = vm.force_string_no_ctx(
+        args[0],
+        pos,
+        "while evaluating the argument passed to builtins.parseFlakeRef",
+    )?;
+    let attrs = parse_flake_ref(&String::from_utf8_lossy(&s))
+        .map_err(|m| vm.new_err(ErrKind::Eval, m, pos))?;
+    let scope = vm.temp_scope();
+    let mut entries: Vec<Attr> = Vec::with_capacity(attrs.len());
+    for (k, v) in &attrs {
+        let sv = mk_string(vm, v.as_bytes());
+        let vc = temp_cell(vm, sv);
+        entries.push(Attr {
+            sym: vm.symbols.create(k.as_bytes()).0,
+            pos: 0,
+            val: vc,
+        });
+    }
+    entries.sort_by_key(|a| a.sym);
+    entries.dedup_by_key(|a| a.sym);
+    let v = vm.new_bindings_value(&entries);
+    vm.temp_end(scope);
+    Ok(v)
+}
+
+/// Render flakeref attrs back to a string.
+fn flake_ref_to_string(attrs: &std::collections::BTreeMap<String, FlakeVal>) -> Result<String, String> {
+    let get_str = |k: &str| -> Option<&str> {
+        match attrs.get(k) {
+            Some(FlakeVal::Str(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    };
+    let ty = get_str("type").ok_or_else(|| "flake reference has no 'type' attribute".to_string())?;
+    // Query params (sorted): everything not consumed by the scheme's path.
+    let mut out = String::new();
+    let mut query: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    match ty {
+        "github" | "gitlab" | "sourcehut" => {
+            let owner = get_str("owner").unwrap_or("");
+            let repo = get_str("repo").unwrap_or("");
+            out.push_str(ty);
+            out.push(':');
+            out.push_str(owner);
+            out.push('/');
+            out.push_str(repo);
+            if let Some(r) = get_str("ref") {
+                out.push('/');
+                out.push_str(r);
+            } else if let Some(r) = get_str("rev") {
+                out.push('/');
+                out.push_str(r);
+            }
+            if let Some(h) = get_str("host") {
+                query.insert("host".into(), h.into());
+            }
+            if let Some(h) = get_str("narHash") {
+                query.insert("narHash".into(), h.into());
+            }
+        }
+        "path" => {
+            out.push_str("path:");
+            out.push_str(get_str("path").unwrap_or(""));
+            if let Some(r) = get_str("rev") {
+                query.insert("rev".into(), r.into());
+            }
+            if let Some(r) = get_str("ref") {
+                query.insert("ref".into(), r.into());
+            }
+        }
+        "indirect" => {
+            out.push_str("flake:");
+            out.push_str(get_str("id").unwrap_or(""));
+            if let Some(r) = get_str("ref") {
+                out.push('/');
+                out.push_str(r);
+            }
+            if let Some(r) = get_str("rev") {
+                out.push('/');
+                out.push_str(r);
+            }
+        }
+        "git" | "tarball" | "file" => {
+            let url = get_str("url").unwrap_or("");
+            out.push_str(url);
+            if let Some(r) = get_str("ref") {
+                query.insert("ref".into(), r.into());
+            }
+            if let Some(r) = get_str("rev") {
+                query.insert("rev".into(), r.into());
+            }
+        }
+        other => return Err(format!("don't know how to serialize flakeref of type '{other}'")),
+    }
+    if let Some(FlakeVal::Str(d)) = attrs.get("dir") {
+        query.insert("dir".into(), d.clone());
+    }
+    if !query.is_empty() {
+        out.push('?');
+        let mut first = true;
+        for (k, v) in &query {
+            if !first {
+                out.push('&');
+            }
+            first = false;
+            out.push_str(k);
+            out.push('=');
+            out.push_str(v);
+        }
+    }
+    Ok(out)
+}
+
+enum FlakeVal {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+}
+
+fn prim_flake_ref_to_string(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    if !vm.experimental.flakes {
+        return Err(flakes_disabled(vm, pos));
+    }
+    vm.force_attrs(
+        args[0],
+        pos,
+        "while evaluating the argument passed to builtins.flakeRefToString",
+    )?;
+    let entries = attrs_entries(&val(args[0])).to_vec();
+    let mut map: std::collections::BTreeMap<String, FlakeVal> = std::collections::BTreeMap::new();
+    for a in &entries {
+        let key = String::from_utf8_lossy(vm.symbols.resolve(Symbol(a.sym))).into_owned();
+        vm.force(a.val, PosIdx(a.pos))?;
+        let v = val(a.val);
+        let fv = match v.tag() {
+            Tag::Int => {
+                let iv = v.as_int();
+                if iv < 0 {
+                    return Err(vm.new_err(
+                        ErrKind::Eval,
+                        format!("negative value given for flake ref attr {key}: {iv}"),
+                        pos,
+                    ));
+                }
+                FlakeVal::Int(iv)
+            }
+            Tag::True | Tag::False => FlakeVal::Bool(v.as_bool()),
+            Tag::String => FlakeVal::Str(String::from_utf8_lossy(str_bytes(&v)).into_owned()),
+            _ => {
+                return Err(vm.new_err(
+                    ErrKind::Eval,
+                    format!(
+                        "flake reference attribute sets may only contain integers, Booleans, and strings, but attribute '{key}' is {}",
+                        vm.show_type(&v)
+                    ),
+                    pos,
+                ))
+            }
+        };
+        map.insert(key, fv);
+    }
+    let s = flake_ref_to_string(&map).map_err(|m| vm.new_err(ErrKind::Eval, m, pos))?;
+    Ok(mk_string(vm, s.as_bytes()))
 }
 
 // ---------------------------------------------------------------------
