@@ -16,7 +16,7 @@
 use rustc_hash::FxHashMap;
 use std::ptr::NonNull;
 
-use jinx_syntax::pos::{PosIdx, PosTable, NO_POS};
+use jinx_syntax::pos::{PosIdx, PosTable};
 use jinx_syntax::symbol::{Symbol, SymbolTable};
 
 use crate::chunk::{Chunk, CodeRef, Op, CTX_STRINGS};

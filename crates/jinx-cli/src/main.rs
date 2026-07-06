@@ -3,7 +3,7 @@
 //! --arg/--argstr/-A/-I/NIX_PATH, printing via printAmbiguous.
 
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use jinx_eval::builtins;
@@ -71,7 +71,7 @@ fn parse_args() -> Result<Options, String> {
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
-    let mut need = |args: &[String], i: &mut usize, flag: &str| -> Result<String, String> {
+    let need = |args: &[String], i: &mut usize, flag: &str| -> Result<String, String> {
         *i += 1;
         args.get(*i)
             .cloned()

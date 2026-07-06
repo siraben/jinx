@@ -108,6 +108,11 @@ const UNIMPLEMENTED: &[(&str, u8)] = &[
     ("__toFile", 2),
     ("__toXML", 1),
     ("__unsafeDiscardOutputDependency", 1),
+    // flakes (experimental): present in `builtins` so failures are clearly
+    // "not implemented" rather than "attribute missing".
+    ("parseFlakeRef", 1),
+    ("flakeRefToString", 1),
+    ("getFlake", 1),
 ];
 
 pub fn register_globals(vm: &mut VM) {
@@ -222,7 +227,7 @@ pub fn register_globals(vm: &mut VM) {
     }
 
     // Constants.
-    let mut add_const = |vm: &mut VM, name: &str, cell: VRef, entries: &mut Vec<(Vec<u8>, VRef)>| {
+    let add_const = |vm: &mut VM, name: &str, cell: VRef, entries: &mut Vec<(Vec<u8>, VRef)>| {
         let sym = vm.symbols.create(name.as_bytes());
         vm.globals.insert(sym, cell);
         let display = name.strip_prefix("__").unwrap_or(name);
@@ -954,7 +959,7 @@ fn prim_replace_strings(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
     }
     // Replacement strings are evaluated lazily, only when actually used.
     let mut tos: Vec<Option<(Vec<u8>, Vec<u32>)>> = vec![None; to_cells.len()];
-    let mut get_to = |vm: &mut VM,
+    let get_to = |vm: &mut VM,
                       tos: &mut Vec<Option<(Vec<u8>, Vec<u32>)>>,
                       i: usize|
      -> Result<(Vec<u8>, Vec<u32>), ErrId> {
