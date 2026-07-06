@@ -140,6 +140,12 @@ fn base_env(cmd: &mut Command, corpus: &Path, test_root: &Path) {
     // usage errors embed argv[0], and jinx dispatches CLI personality on it.
     cmd.arg0("nix-instantiate");
     cmd.env_clear();
+    // Forward GC knobs so `JINX_GC_STRESS=1 jinx-conformance ...` reaches the engine.
+    for k in ["JINX_GC_STRESS", "JINX_GC_OFF", "JINX_GC_STATS", "JINX_GC_HEAP_MB"] {
+        if let Ok(v) = std::env::var(k) {
+            cmd.env(k, v);
+        }
+    }
     // PATH kept minimal; .postprocess runs under bash separately.
     cmd.env("PATH", "/usr/bin:/bin");
     cmd.env("NIX_CONF_DIR", test_root.join("etc"));
