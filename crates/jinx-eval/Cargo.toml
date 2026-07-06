@@ -1,0 +1,18 @@
+[package]
+name = "jinx-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# jinx-syntax dep re-added when the compiler consumes the AST (M2)
+jinx-store.workspace = true
+bstr.workspace = true
+rustc-hash.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+md-5.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+regex.workspace = true
+libc.workspace = true
