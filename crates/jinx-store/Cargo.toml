@@ -1,0 +1,12 @@
+[package]
+name = "jinx-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bstr.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+md-5.workspace = true
+rustc-hash.workspace = true

@@ -572,8 +572,9 @@ name = "jinx-store"
 version = "0.1.0"
 dependencies = [
  "bstr",
- "libc",
+ "md-5",
  "rustc-hash",
+ "sha1",
  "sha2",
 ]
 
