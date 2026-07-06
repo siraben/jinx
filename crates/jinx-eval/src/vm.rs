@@ -16,7 +16,7 @@
 use rustc_hash::FxHashMap;
 use std::ptr::NonNull;
 
-use jinx_syntax::pos::{PosIdx, PosTable};
+use jinx_syntax::pos::{PosIdx, PosTable, NO_POS};
 use jinx_syntax::symbol::{Symbol, SymbolTable};
 
 use crate::chunk::{Chunk, CodeRef, Op, CTX_STRINGS};
@@ -110,7 +110,7 @@ pub fn primapp_parts<'a>(v: &Value) -> (&'static PrimOpDef, &'a [VRef]) {
 }
 
 pub fn thunk_code(v: &Value) -> (&'static CodeRef, &'static [VRef]) {
-    debug_assert!(matches!(v.tag(), Tag::Thunk | Tag::Closure));
+    debug_assert!(matches!(v.tag(), Tag::Thunk | Tag::Closure | Tag::Blackhole));
     // SAFETY: thunk/closure data objects carry a &'static CodeRef.
     unsafe {
         let (code, elems) = value::code_and_elems(v.ptr() as *const u64);
@@ -182,6 +182,16 @@ pub struct VM {
         FxHashMap<jinx_store::store_path::StorePath, jinx_store::derivation::Derivation>,
     /// Synthetic apply chunks for lazy applications (set at registration).
     pub apply_prog: Option<&'static crate::chunk::Program>,
+    /// Definition position of the most recently selected attribute (C++
+    /// ExprSelect `pos2`), used by `SelectForce` for the final force and its
+    /// "while evaluating the attribute" frame.
+    pub last_select_pos: PosIdx,
+    /// Whether the error renderer prints full traces (`--show-trace`).
+    pub show_trace: bool,
+    /// Position the current thunk was forced with. C++ `forceValue(v, pos)`
+    /// threads `pos` into `callFunction` for `tApp` values; jinx's synthetic
+    /// apply thunks (no call pos of their own) recover it from here.
+    pub force_pos: PosIdx,
 }
 
 /// RAII guard for `temp_roots`.
@@ -204,6 +214,9 @@ impl VM {
             file_cache: Vec::new(),
             call_depth: 0,
             max_call_depth: 10000,
+            last_select_pos: NO_POS,
+            show_trace: true,
+            force_pos: NO_POS,
             search_path: Vec::new(),
             true_cell: immortal::cell(Value::bool(true)),
             false_cell: immortal::cell(Value::bool(false)),
@@ -316,10 +329,67 @@ impl VM {
         (self.errors.len() - 1) as ErrId
     }
 
+    /// Port of the `if (fn->addTrace) addErrorTrace(e, pos, "while calling
+    /// the '%1%' builtin", fn->name)` in `EvalState::callFunction`. Every
+    /// builtin adds this frame except `addErrorContext` (whose own frame is
+    /// redundant with the error context it injects).
+    /// Port of `Value::determinePos` for the value kinds that carry a
+    /// position: attribute sets and lambdas. Everything else falls back.
+    pub fn determine_pos(&self, v: &Value, fallback: PosIdx) -> PosIdx {
+        match v.tag() {
+            // Runtime attribute sets don't retain their definition position in
+            // jinx's heap layout, so only the lambda case is handled here.
+            Tag::Closure => {
+                let (code, _) = thunk_code(v);
+                code.chunk().pos
+            }
+            // A blackhole retains its thunk pointer (w1); its chunk carries the
+            // position of the expression under evaluation. Bare sentinels
+            // (w1 == 0) have no position and fall back.
+            Tag::Blackhole if v.w1 != 0 => {
+                let (code, _) = thunk_code(v);
+                code.chunk().pos
+            }
+            _ => fallback,
+        }
+    }
+
+    pub fn add_primop_trace(&mut self, e: ErrId, def: &'static PrimOpDef, pos: PosIdx) {
+        if def.name == "__addErrorContext" {
+            return;
+        }
+        self.add_trace(
+            e,
+            pos,
+            format!("while calling the '{}' builtin", def.display()),
+        );
+    }
+
+    /// C++ skips the "while evaluating the attribute" frame when the attr's
+    /// position lives in the internal `derivation-internal.nix`. jinx compiles
+    /// that wrapper from an in-memory source; detect it by source identity.
+    pub fn pos_is_derivation_internal(&self, p: PosIdx) -> bool {
+        matches!(
+            self.positions.origin_of(p),
+            Some(o) if o.source() == crate::builtins::DERIVATION_NIX
+        )
+    }
+
     pub fn add_trace(&mut self, e: ErrId, pos: PosIdx, text: impl Into<String>) {
         self.errors[e as usize].traces.push(Trace {
             pos,
             text: text.into(),
+            always: false,
+        });
+    }
+
+    /// Like [`add_trace`] but marks the frame as `TracePrint::Always`
+    /// (`builtins.addErrorContext`): shown even when traces are truncated.
+    pub fn add_trace_always(&mut self, e: ErrId, pos: PosIdx, text: impl Into<String>) {
+        self.errors[e as usize].traces.push(Trace {
+            pos,
+            text: text.into(),
+            always: true,
         });
     }
 
@@ -383,9 +453,18 @@ impl VM {
             let v = val(cell);
             match v.tag() {
                 Tag::Thunk => {
-                    set(cell, Value::make(Tag::Blackhole, 0));
+                    // Retain the thunk's data pointer in the blackhole so that
+                    // `determine_pos` can recover the position of the
+                    // expression being computed (C++ `Value::determinePos`
+                    // over the blackholed thunk). The GC traces blackholes
+                    // like thunks (see `has_heap_payload`).
+                    set(cell, Value::make(Tag::Blackhole, v.w1));
                     let (code, _) = thunk_code(&v);
-                    match self.run_code(code, v) {
+                    let saved_force_pos = self.force_pos;
+                    self.force_pos = pos;
+                    let run = self.run_code(code, v);
+                    self.force_pos = saved_force_pos;
+                    match run {
                         Ok(res) => {
                             set(cell, res);
                             // The chunk may itself return an (unforced)
@@ -403,13 +482,42 @@ impl VM {
                     }
                 }
                 Tag::Blackhole => {
+                    // Re-forcing a blackhole is infinite recursion. The
+                    // position C++ reports is the reference site that closes
+                    // the cycle:
+                    //   * Direct self-reference (a thunk forces *itself*, e.g.
+                    //     `a = {} // a`): the offending reference is the current
+                    //     `pos`. We detect this by comparing the blackhole's
+                    //     retained thunk pointer (w1) against the thunk of the
+                    //     currently running frame — they're equal iff the
+                    //     running thunk is re-forcing its own cell.
+                    //   * Indirect cycle (x -> y -> x): the reference site lives
+                    //     in the *enclosing* thunk, whose force position jinx
+                    //     tracks as `force_pos`.
+                    let running = self.frames.last().map(|f| f.data.w1).unwrap_or(0);
+                    let bpos = if v.w1 != 0 && v.w1 == running {
+                        pos
+                    } else if self.force_pos != NO_POS {
+                        self.force_pos
+                    } else {
+                        pos
+                    };
                     return Err(self.new_err(
                         ErrKind::InfiniteRecursion,
                         "infinite recursion encountered",
-                        pos,
-                    ))
+                        bpos,
+                    ));
                 }
-                Tag::Failed => return Err(v.w1 as ErrId),
+                Tag::Failed => {
+                    // Errors are memoised on the thunk, but re-forcing a failed
+                    // value yields a *fresh* copy so that later `addTrace`
+                    // (e.g. from `addErrorContext`) does not mutate the cached
+                    // error (see eval-fail-memoised-error-trace-not-mutated).
+                    let orig = v.w1 as ErrId;
+                    let copy = self.errors[orig as usize].clone();
+                    self.errors.push(copy);
+                    return Err((self.errors.len() - 1) as ErrId);
+                }
                 _ => return Ok(()),
             }
         }
@@ -435,7 +543,11 @@ impl VM {
         })?;
         let v = val(cell);
         if v.tag() != Tag::Attrs {
-            return Err(self.type_err(&v, "a set", pos, Some(ctx)));
+            // C++ forceAttrs uses `.withTrace(pos, ctx)` only — no position on
+            // the base error itself.
+            let e = self.type_err(&v, "a set", NO_POS, None);
+            self.add_trace(e, pos, ctx);
+            return Err(e);
         }
         Ok(())
     }
@@ -447,7 +559,11 @@ impl VM {
         })?;
         let v = val(cell);
         if v.tag() != Tag::List {
-            return Err(self.type_err(&v, "a list", pos, Some(ctx)));
+            // C++ forceList uses `.withTrace(pos, ctx)` only — no position on
+            // the base error itself.
+            let e = self.type_err(&v, "a list", NO_POS, None);
+            self.add_trace(e, pos, ctx);
+            return Err(e);
         }
         Ok(())
     }
@@ -719,10 +835,30 @@ impl VM {
                     let found = attrs_get(&v, Symbol(sym));
                     match found {
                         Some(a) => {
+                            self.last_select_pos = PosIdx(a.pos);
                             *self.stack.last_mut().unwrap() = a.val;
                         }
                         None => return Err(self.missing_attr_err(&v, Symbol(sym), pos!())),
                     }
+                }
+                Op::SelectForce(t) => {
+                    let c = *self.stack.last().unwrap();
+                    let p = self.last_select_pos;
+                    self.force(c, p).map_err(|e| {
+                        if p.is_set() && !self.pos_is_derivation_internal(p) {
+                            let text =
+                                self.frames[fi].code.prog().texts[t as usize].clone();
+                            self.add_trace(
+                                e,
+                                p,
+                                format!(
+                                    "while evaluating the attribute '{}'",
+                                    String::from_utf8_lossy(&text)
+                                ),
+                            );
+                        }
+                        e
+                    })?;
                 }
                 Op::SelectOr { sym, target } => {
                     let c = *self.stack.last().unwrap();
@@ -734,7 +870,10 @@ impl VM {
                         None
                     };
                     match found {
-                        Some(a) => *self.stack.last_mut().unwrap() = a.val,
+                        Some(a) => {
+                            self.last_select_pos = PosIdx(a.pos);
+                            *self.stack.last_mut().unwrap() = a.val
+                        }
                         None => {
                             self.stack.pop();
                             ip = target as usize;
@@ -754,7 +893,10 @@ impl VM {
                     self.force_attrs(c, pos!(), "while selecting an attribute")?;
                     let v = val(c);
                     match attrs_get(&v, sym) {
-                        Some(a) => *self.stack.last_mut().unwrap() = a.val,
+                        Some(a) => {
+                            self.last_select_pos = PosIdx(a.pos);
+                            *self.stack.last_mut().unwrap() = a.val
+                        }
                         None => return Err(self.missing_attr_err(&v, sym, pos!())),
                     }
                 }
@@ -775,7 +917,10 @@ impl VM {
                         None
                     };
                     match found {
-                        Some(a) => *self.stack.last_mut().unwrap() = a.val,
+                        Some(a) => {
+                            self.last_select_pos = PosIdx(a.pos);
+                            *self.stack.last_mut().unwrap() = a.val
+                        }
                         None => {
                             self.stack.pop();
                             ip = target as usize;
@@ -791,7 +936,19 @@ impl VM {
                     let args_start = self.stack.len() - n;
                     let fun = self.stack[args_start - 1];
                     let args: Vec<VRef> = self.stack[args_start..].to_vec();
-                    let v = self.call_function(fun, &args, pos!())?;
+                    // Synthetic apply thunks (map/genList/…) carry no call
+                    // pos; C++ threads the enclosing `forceValue` pos into the
+                    // `tApp` call. Recover it from `force_pos`, else fall back
+                    // to the callee's `determinePos` (as `forceValueDeep`
+                    // forces at the callee position with no explicit pos).
+                    let mut cpos = pos!();
+                    if !cpos.is_set() {
+                        cpos = self.force_pos;
+                        if !cpos.is_set() {
+                            cpos = self.determine_pos(&val(fun), NO_POS);
+                        }
+                    }
+                    let v = self.call_function(fun, &args, cpos)?;
                     self.stack.truncate(args_start - 1);
                     let c = self.alloc_cell(v);
                     self.stack.push(c);
@@ -813,6 +970,28 @@ impl VM {
                         m
                     };
                     return Err(self.new_err(ErrKind::Assertion, msg, pos!()));
+                }
+                Op::AssertEq(t) => {
+                    // Stack: [.., lhs, rhs]. Port of ExprAssert's ExprOpEq path.
+                    let rhs = self.stack.pop().unwrap();
+                    let lhs = self.stack.pop().unwrap();
+                    let apos = pos!();
+                    if let Err(e) =
+                        self.assert_eq_values(lhs, rhs, NO_POS, "in an equality assertion")
+                    {
+                        let text =
+                            self.frames[fi].code.prog().texts[t as usize].clone();
+                        self.add_trace(
+                            e,
+                            apos,
+                            format!(
+                                "while evaluating the condition of the assertion '{}'",
+                                String::from_utf8_lossy(&text)
+                            ),
+                        );
+                        return Err(e);
+                    }
+                    // Values compared equal: fall through to AssertFail.
                 }
                 Op::PushWith => {
                     let c = self.stack.pop().unwrap();
@@ -891,16 +1070,19 @@ impl VM {
         Ok(())
     }
 
-    fn op_rec_overrides(&mut self, fi: usize, rd: u32, pos: PosIdx) -> Result<(), ErrId> {
+    fn op_rec_overrides(&mut self, fi: usize, rd: u32, _pos: PosIdx) -> Result<(), ErrId> {
         let prog = self.frames[fi].code.prog();
         let rdesc = &prog.rec_descs[rd as usize];
         let desc = &prog.attrs_descs[rdesc.attrs_desc as usize];
         let attrs_cell = *self.stack.last().unwrap();
         let av = val(attrs_cell);
         let ov_attr = attrs_entries(&av)[rdesc.overrides_idx as usize];
+        // C++ forces at `vOverrides->determinePos(noPos)` computed on the
+        // (unforced) value — noPos for a non-attrs/non-lambda thunk.
+        let opos = self.determine_pos(&val(ov_attr.val), NO_POS);
         self.force_attrs(
             ov_attr.val,
-            pos,
+            opos,
             "while evaluating the `__overrides` attribute",
         )?;
         let ov = val(ov_attr.val);
@@ -1243,13 +1425,16 @@ impl VM {
         args: &[VRef],
         pos: PosIdx,
     ) -> Result<Value, ErrId> {
+        self.depth_check(pos)?;
         self.call_depth += 1;
         let r = self.call_function_inner(fun, args, pos);
         self.call_depth -= 1;
         r
     }
 
-    fn depth_check(&mut self, pos: PosIdx) -> Result<(), ErrId> {
+    /// Port of `addCallDepth`: must be called *before* incrementing
+    /// `call_depth` for the current frame.
+    pub(crate) fn depth_check(&mut self, pos: PosIdx) -> Result<(), ErrId> {
         if self.call_depth > self.max_call_depth {
             return Err(self.new_err(
                 ErrKind::StackOverflow,
@@ -1266,7 +1451,6 @@ impl VM {
         args: &[VRef],
         pos: PosIdx,
     ) -> Result<Value, ErrId> {
-        self.depth_check(pos)?;
         self.force(fun, pos)?;
         let mut vcur = val(fun);
         let mut i = 0usize;
@@ -1290,7 +1474,14 @@ impl VM {
                         return Ok(v);
                     }
                     let f = def.func;
-                    vcur = f(self, def, &args[i..i + needed], pos)?;
+                    // C++ invokes primops with `vCur.determinePos(noPos)`,
+                    // which is `noPos` for a bare primop. The call-site `pos`
+                    // is only used for the "while calling the '…' builtin"
+                    // frame.
+                    vcur = f(self, def, &args[i..i + needed], NO_POS).map_err(|e| {
+                        self.add_primop_trace(e, def, pos);
+                        e
+                    })?;
                     i += needed;
                 }
                 Tag::PrimOpApp => {
@@ -1311,9 +1502,12 @@ impl VM {
                     let scope = self.temp_scope();
                     self.temp_roots.extend_from_slice(&all);
                     let f = def.func;
-                    let r = f(self, def, &all, pos);
+                    let r = f(self, def, &all, NO_POS);
                     self.temp_end(scope);
-                    vcur = r?;
+                    vcur = r.map_err(|e| {
+                        self.add_primop_trace(e, def, pos);
+                        e
+                    })?;
                     i += needed;
                 }
                 Tag::Attrs => {
@@ -1376,11 +1570,17 @@ impl VM {
         let spec = chunk.lambda.as_ref().expect("closure without lambda spec");
         let base = self.stack.len();
 
+        // `raw_name` is the bare name (or "anonymous lambda"); the
+        // "called without/with … argument" errors quote it as '%1%'.
+        // `lambda_name` is the trace form: named lambdas are quoted, but the
+        // anonymous case is shown unquoted ("while calling anonymous lambda").
+        let raw_name: String = if chunk.name.is_set() {
+            String::from_utf8_lossy(self.symbols.resolve(chunk.name)).into_owned()
+        } else {
+            "anonymous lambda".into()
+        };
         let lambda_name: String = if chunk.name.is_set() {
-            format!(
-                "'{}'",
-                String::from_utf8_lossy(self.symbols.resolve(chunk.name))
-            )
+            format!("'{raw_name}'")
         } else {
             "anonymous lambda".into()
         };
@@ -1417,13 +1617,13 @@ impl VM {
                             self.stack.push(c);
                         }
                         None => {
-                            let name = lambda_name.clone();
+                            let name = raw_name.clone();
                             let fname =
                                 String::from_utf8_lossy(self.symbols.resolve(f.name)).into_owned();
                             let e = self.new_err(
                                 ErrKind::Type,
                                 format!(
-                                    "function {} called without required argument '{}'",
+                                    "function '{}' called without required argument '{}'",
                                     name, fname
                                 ),
                                 chunk.pos,
@@ -1440,7 +1640,7 @@ impl VM {
             if !formals.ellipsis && attrs_used != attrs_entries(&attrs).len() {
                 for a in attrs_entries(&attrs) {
                     if !formals.formals.iter().any(|f| f.name.0 == a.sym) {
-                        let name = lambda_name.clone();
+                        let name = raw_name.clone();
                         let aname = String::from_utf8_lossy(self.symbols.resolve(Symbol(a.sym)))
                             .into_owned();
                         let cands: Vec<String> = formals
@@ -1454,7 +1654,7 @@ impl VM {
                         let e = self.new_err(
                             ErrKind::Type,
                             format!(
-                                "function {} called with unexpected argument '{}'",
+                                "function '{}' called with unexpected argument '{}'",
                                 name, aname
                             ),
                             chunk.pos,
@@ -1487,9 +1687,24 @@ impl VM {
             let dst = self.stack[slot_idx];
             set(dst, val(t));
         }
+        let chunk_pos = chunk.pos;
         let r = self.run_top_frame();
         self.frames.pop();
-        let out = r.map(val);
+        let out = match r {
+            Ok(v) => Ok(val(v)),
+            Err(e) => {
+                // Port of callFunction's body-eval catch: "while calling
+                // <name>" at the lambda pos, then "from call site" at the
+                // application pos. C++ only adds these when `showTrace` is on.
+                if self.show_trace {
+                    self.add_trace(e, chunk_pos, format!("while calling {lambda_name}"));
+                    if pos.is_set() {
+                        self.add_trace(e, pos, "from call site");
+                    }
+                }
+                Err(e)
+            }
+        };
         self.stack.truncate(base);
         out
     }
@@ -1504,6 +1719,7 @@ impl VM {
         ctx: &str,
         top: bool,
     ) -> Result<bool, ErrId> {
+        self.depth_check(pos)?;
         self.call_depth += 1;
         let r = self.eq_values_inner(a, b, pos, ctx, top);
         self.call_depth -= 1;
@@ -1518,7 +1734,6 @@ impl VM {
         ctx: &str,
         top: bool,
     ) -> Result<bool, ErrId> {
-        self.depth_check(pos)?;
         self.force(a, pos)?;
         self.force(b, pos)?;
 
@@ -1592,6 +1807,224 @@ impl VM {
         }
     }
 
+    /// Port of `EvalState::assertEqValues` (eval.cc): deep structural equality
+    /// that, on the first difference, throws a detailed `AssertionError`
+    /// describing exactly how the two values differ. Used by `assert a == b`.
+    pub fn assert_eq_values(
+        &mut self,
+        a: VRef,
+        b: VRef,
+        pos: PosIdx,
+        ctx: &str,
+    ) -> Result<(), ErrId> {
+        self.depth_check(pos)?;
+        self.call_depth += 1;
+        let r = self.assert_eq_values_inner(a, b, pos, ctx);
+        self.call_depth -= 1;
+        r
+    }
+
+    fn assert_eq_values_inner(
+        &mut self,
+        a: VRef,
+        b: VRef,
+        pos: PosIdx,
+        ctx: &str,
+    ) -> Result<(), ErrId> {
+        self.force(a, pos)?;
+        self.force(b, pos)?;
+        if a == b {
+            return Ok(());
+        }
+        let (va, vb) = (val(a), val(b));
+        let pr = |vm: &Self, v: &Value| crate::print::print_value_err(vm, v);
+
+        let a_num = matches!(va.tag(), Tag::Int | Tag::Float);
+        let b_num = matches!(vb.tag(), Tag::Int | Tag::Float);
+
+        // Special case type-compatibility between float and int.
+        if a_num && b_num {
+            let eq = match (va.tag(), vb.tag()) {
+                (Tag::Int, Tag::Int) => va.as_int() == vb.as_int(),
+                (Tag::Float, Tag::Float) => va.as_float() == vb.as_float(),
+                (Tag::Int, Tag::Float) => va.as_int() as f64 == vb.as_float(),
+                (Tag::Float, Tag::Int) => va.as_float() == vb.as_int() as f64,
+                _ => unreachable!(),
+            };
+            if eq {
+                return Ok(());
+            }
+            let msg = format!(
+                "{} with value '{}' is not equal to {} with value '{}'",
+                self.show_type(&va),
+                pr(self, &va),
+                self.show_type(&vb),
+                pr(self, &vb),
+            );
+            return Err(self.new_err(ErrKind::Assertion, msg, NO_POS));
+        }
+
+        let same_type = match (va.tag(), vb.tag()) {
+            (Tag::True | Tag::False, Tag::True | Tag::False) => true,
+            (x, y) => x == y,
+        };
+        if !same_type {
+            let msg = format!(
+                "{} of value '{}' is not equal to {} of value '{}'",
+                self.show_type(&va),
+                pr(self, &va),
+                self.show_type(&vb),
+                pr(self, &vb),
+            );
+            return Err(self.new_err(ErrKind::Assertion, msg, NO_POS));
+        }
+
+        match va.tag() {
+            Tag::True | Tag::False => {
+                if va.tag() != vb.tag() {
+                    let msg = format!(
+                        "boolean '{}' is not equal to boolean '{}'",
+                        pr(self, &va),
+                        pr(self, &vb),
+                    );
+                    return Err(self.new_err(ErrKind::Assertion, msg, NO_POS));
+                }
+                Ok(())
+            }
+            Tag::String => {
+                if str_bytes(&va) != str_bytes(&vb) {
+                    let msg = format!(
+                        "string '{}' is not equal to string '{}'",
+                        pr(self, &va),
+                        pr(self, &vb),
+                    );
+                    return Err(self.new_err(ErrKind::Assertion, msg, NO_POS));
+                }
+                Ok(())
+            }
+            Tag::Path => {
+                if path_bytes(&va) != path_bytes(&vb) {
+                    let msg = format!(
+                        "path '{}' is not equal to path '{}'",
+                        pr(self, &va),
+                        pr(self, &vb),
+                    );
+                    return Err(self.new_err(ErrKind::Assertion, msg, NO_POS));
+                }
+                Ok(())
+            }
+            Tag::Null => Ok(()),
+            Tag::List => {
+                let (ea, eb) = (list_elems(&va), list_elems(&vb));
+                if ea.len() != eb.len() {
+                    let msg = format!(
+                        "list of size '{}' is not equal to list of size '{}', left hand side is '{}', right hand side is '{}'",
+                        ea.len(),
+                        eb.len(),
+                        pr(self, &va),
+                        pr(self, &vb),
+                    );
+                    return Err(self.new_err(ErrKind::Assertion, msg, NO_POS));
+                }
+                let (ea, eb) = (ea.to_vec(), eb.to_vec());
+                for n in 0..ea.len() {
+                    self.assert_eq_values(ea[n], eb[n], pos, ctx).map_err(|e| {
+                        self.add_trace(e, pos, format!("while comparing list element {n}"));
+                        e
+                    })?;
+                }
+                Ok(())
+            }
+            Tag::Attrs => {
+                if self.is_derivation(&va)? && self.is_derivation(&vb)? {
+                    let i = attrs_get(&va, self.syms.out_path);
+                    let j = attrs_get(&vb, self.syms.out_path);
+                    if let (Some(i), Some(j)) = (i, j) {
+                        let (iv, jv) = (i.val, j.val);
+                        return self.assert_eq_values(iv, jv, pos, ctx).map_err(|e| {
+                            self.add_trace(
+                                e,
+                                pos,
+                                "while comparing a derivation by its 'outPath' attribute",
+                            );
+                            e
+                        });
+                    }
+                }
+                let (ea, eb) = (attrs_entries(&va), attrs_entries(&vb));
+                if ea.len() != eb.len() {
+                    let msg = format!(
+                        "attribute names of attribute set '{}' differs from attribute set '{}'",
+                        pr(self, &va),
+                        pr(self, &vb),
+                    );
+                    return Err(self.new_err(ErrKind::Assertion, msg, NO_POS));
+                }
+                let ea = ea.to_vec();
+                let eb = eb.to_vec();
+                for k in 0..ea.len() {
+                    if ea[k].sym != eb[k].sym {
+                        // Names differ: figure out which side is missing.
+                        if attrs_get(&vb, Symbol(ea[k].sym)).is_none() {
+                            let name = String::from_utf8_lossy(
+                                self.symbols.resolve(Symbol(ea[k].sym)),
+                            )
+                            .into_owned();
+                            let msg = format!(
+                                "attribute name '{}' is contained in '{}', but not in '{}'",
+                                name,
+                                pr(self, &va),
+                                pr(self, &vb),
+                            );
+                            return Err(self.new_err(ErrKind::Assertion, msg, NO_POS));
+                        }
+                        if attrs_get(&va, Symbol(eb[k].sym)).is_none() {
+                            let name = String::from_utf8_lossy(
+                                self.symbols.resolve(Symbol(eb[k].sym)),
+                            )
+                            .into_owned();
+                            let msg = format!(
+                                "attribute name '{}' is missing in '{}', but is contained in '{}'",
+                                name,
+                                pr(self, &va),
+                                pr(self, &vb),
+                            );
+                            return Err(self.new_err(ErrKind::Assertion, msg, NO_POS));
+                        }
+                        unreachable!();
+                    }
+                    let (iv, jv) = (ea[k].val, eb[k].val);
+                    let (ipos, jpos) = (PosIdx(ea[k].pos), PosIdx(eb[k].pos));
+                    let name =
+                        String::from_utf8_lossy(self.symbols.resolve(Symbol(ea[k].sym)))
+                            .into_owned();
+                    self.assert_eq_values(iv, jv, pos, ctx).map_err(|e| {
+                        // Reversed order (push order): rhs, lhs, comparing.
+                        if jpos.is_set() {
+                            self.add_trace(e, jpos, "where right hand side is");
+                        }
+                        if ipos.is_set() {
+                            self.add_trace(e, ipos, "where left hand side is");
+                        }
+                        self.add_trace(e, pos, format!("while comparing attribute '{name}'"));
+                        e
+                    })?;
+                }
+                Ok(())
+            }
+            Tag::Closure | Tag::PrimOp | Tag::PrimOpApp => Err(self.new_err(
+                ErrKind::Assertion,
+                "distinct functions and immediate comparisons of identical functions compare as unequal",
+                NO_POS,
+            )),
+            Tag::Int | Tag::Float => {
+                // Both numeric: handled by the int/float branch above.
+                Ok(())
+            }
+            Tag::Thunk | Tag::Blackhole | Tag::Failed => unreachable!("forced"),
+        }
+    }
+
     pub fn is_derivation(&mut self, v: &Value) -> Result<bool, ErrId> {
         if v.tag() != Tag::Attrs {
             return Ok(false);
@@ -1630,6 +2063,12 @@ impl VM {
         let (hash, _sz) = match jinx_store::nar::hash_path(os, HashAlgorithm::Sha256) {
             Ok(r) => r,
             Err(e) => {
+                // C++ throws a bare `FileNotFound("path '%s' does not exist")`
+                // for a missing path (no position, no surrounding trace).
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    let msg = format!("path '{}' does not exist", String::from_utf8_lossy(path));
+                    return Err(self.new_err(ErrKind::Eval, msg, NO_POS));
+                }
                 let msg = format!(
                     "getting attributes of path '{}': {}",
                     String::from_utf8_lossy(path),
@@ -1670,6 +2109,7 @@ impl VM {
         copy_to_store: bool,
         canonicalize_path: bool,
     ) -> Result<(Vec<u8>, Vec<u32>), ErrId> {
+        self.depth_check(pos)?;
         self.call_depth += 1;
         let r =
             self.coerce_inner(cell, pos, ctx, coerce_more, copy_to_store, canonicalize_path);
@@ -1686,7 +2126,6 @@ impl VM {
         copy_to_store: bool,
         canonicalize_path: bool,
     ) -> Result<(Vec<u8>, Vec<u32>), ErrId> {
-        self.depth_check(pos)?;
         self.force(cell, pos)?;
         let v = val(cell);
         match v.tag() {
@@ -1706,13 +2145,10 @@ impl VM {
             Tag::Path => {
                 if copy_to_store {
                     let path = path_bytes(&v).to_vec();
-                    match self.copy_path_to_store(&path, pos) {
-                        Ok((printed, id)) => Ok((printed, vec![id])),
-                        Err(e) => {
-                            self.add_trace(e, pos, ctx);
-                            Err(e)
-                        }
-                    }
+                    // C++ does not wrap copyPathToStore errors with `errorCtx`
+                    // (the "path segment" frame), so neither do we.
+                    let (printed, id) = self.copy_path_to_store(&path, pos)?;
+                    Ok((printed, vec![id]))
                 } else {
                     // canonicalizePath=false preserves literal trailing
                     // slashes; our path payload is stored as-is either way.
@@ -1800,7 +2236,9 @@ impl VM {
             self.show_type(v),
             printed
         );
-        let e = self.new_err(ErrKind::Type, msg, pos);
+        // C++ coerceToString uses `.withTrace(pos, ctx)` — the base error has
+        // no position of its own.
+        let e = self.new_err(ErrKind::Type, msg, NO_POS);
         self.add_trace(e, pos, ctx);
         e
     }

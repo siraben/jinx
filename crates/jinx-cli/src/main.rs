@@ -44,6 +44,11 @@ struct Options {
     experimental: Vec<String>,
     /// XML output source locations (`--no-location` clears this).
     location: bool,
+    /// `--max-call-depth` override (C++ default 10000).
+    max_call_depth: Option<usize>,
+    /// Whether to print full traces. The harness nix.conf enables show-trace
+    /// by default; `--no-show-trace` turns it off (traces are truncated).
+    show_trace: bool,
 }
 
 fn parse_lint_level(v: &str) -> Result<LintLevel, String> {
@@ -74,6 +79,8 @@ fn parse_args() -> Result<Options, String> {
         pure_eval: false,
         experimental: vec![],
         location: true,
+        max_call_depth: None,
+        show_trace: true,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -113,8 +120,9 @@ fn parse_args() -> Result<Options, String> {
             }
             "--impure" => opts.pure_eval = false,
             "--pure-eval" => opts.pure_eval = true,
-            "--show-trace" | "--no-show-trace" | "--read-write-mode" | "--dry-run"
-            | "--indirect" => {}
+            "--show-trace" => opts.show_trace = true,
+            "--no-show-trace" => opts.show_trace = false,
+            "--read-write-mode" | "--dry-run" | "--indirect" => {}
             "--extra-experimental-features" | "--experimental-features" => {
                 let v = need(&args, &mut i, a)?;
                 for f in v.split_whitespace() {
@@ -134,7 +142,8 @@ fn parse_args() -> Result<Options, String> {
                 let _ = need(&args, &mut i, a)?;
             }
             "--max-call-depth" => {
-                let _ = need(&args, &mut i, a)?;
+                let v = need(&args, &mut i, a)?;
+                opts.max_call_depth = v.parse::<usize>().ok();
             }
             "--lint-url-literals" => {
                 let v = need(&args, &mut i, a)?;
@@ -181,6 +190,38 @@ fn run(opts: Options) -> ExitCode {
         return run_parse(&opts);
     }
     if !opts.eval {
+        // Lint diagnostics fire at parse time regardless of the output mode.
+        // Support fatal lint flags (e.g. `--lint-absolute-path-literals fatal`)
+        // without `--eval`, matching nix-instantiate's default mode.
+        let lint_on = opts.lint_url != LintLevel::Allow
+            || opts.lint_abs != LintLevel::Allow
+            || opts.lint_short != LintLevel::Allow;
+        if lint_on {
+            if let Some(file) = opts.files.first() {
+                let path = if file.starts_with('/') {
+                    PathBuf::from(file)
+                } else {
+                    PathBuf::from(cwd_string()).join(file)
+                };
+                if let Ok(source) = std::fs::read(&path) {
+                    let mut vm = VM::new(SymbolTable::new(), PosTable::new());
+                    let origin = Origin::Path {
+                        path: path.to_string_lossy().into_owned(),
+                        source: source.clone(),
+                    };
+                    if let Some(code) = lint_scan(&mut vm, &source, origin, &opts) {
+                        return code;
+                    }
+                }
+            }
+        }
+        // Default (instantiate) mode: nix-instantiate still evaluates the
+        // expression (an error surfaces during evaluation). jinx has no
+        // derivation-building backend, but evaluation-failure tests only need
+        // the error, so route through the evaluator.
+        if !opts.files.is_empty() || opts.read_stdin {
+            return run_eval(opts);
+        }
         eprintln!("error: only --parse and --eval are supported in this milestone");
         return ExitCode::FAILURE;
     }
@@ -332,6 +373,10 @@ fn run_eval(opts: Options) -> ExitCode {
         vm.store_dir = sd.into_bytes();
     }
     vm.pure_eval = opts.pure_eval;
+    if let Some(d) = opts.max_call_depth {
+        vm.max_call_depth = d;
+    }
+    vm.show_trace = opts.show_trace;
     for f in nix_conf_experimental_features() {
         vm.experimental.enable(&f);
     }
@@ -430,7 +475,7 @@ fn run_eval(opts: Options) -> ExitCode {
                 return code;
             }
         }
-        builtins::eval_file(&mut vm, &path, NO_POS)
+        builtins::eval_file_traced(&mut vm, &path, NO_POS, false)
     };
 
     let root = match root {
@@ -700,7 +745,12 @@ fn find_along_attr_path(
 
 fn report_err(vm: &VM, e: ErrId) {
     let err = &vm.errors[e as usize];
-    write_stderr_line(&err.render(&vm.positions));
+    write_stderr_line(&err.render_with(&vm.positions, vm.show_trace));
+    // A UsageError triggers the arg-parser's help hint (main.cc), printed at
+    // column 0 after the error block.
+    if err.kind == ErrKind::Usage {
+        write_stderr_line(b"Try 'nix-instantiate --help' for more information.");
+    }
 }
 
 // ---------------- lint warnings ----------------
@@ -728,8 +778,14 @@ fn lint_scan_err(vm: &mut VM, source: &[u8], origin: Origin, opts: &Options) -> 
             TokKind::Eof => break,
             TokKind::Uri => {
                 if opts.lint_url != LintLevel::Allow {
+                    // C++ varies the wording by severity (parser.y).
+                    let word = if opts.lint_url == LintLevel::Fatal {
+                        "disallowed"
+                    } else {
+                        "discouraged"
+                    };
                     let msg = format!(
-                        "URL literals are discouraged. Consider using a string literal \"{}\" instead (lint-url-literals)",
+                        "URL literals are {word}. Consider using a string literal \"{}\" instead (lint-url-literals)",
                         String::from_utf8_lossy(&tok.text)
                     );
                     if emit_lint(vm, &msg, tok.begin, origin_id, opts.lint_url) {

@@ -94,6 +94,10 @@ pub enum Op {
     ConcatStrings(u32),
     /// Force TOS as attrs; select `sym`, error if missing; push attr cell.
     Select(u32),
+    /// Force TOS (the final selected value) at the last-selected attribute's
+    /// definition position, adding a "while evaluating the attribute '<path>'"
+    /// frame on error. Operand = `texts` index of the selection-path string.
+    SelectForce(u32),
     /// Like Select but on missing/non-attrs pop and jump to `target`.
     SelectOr { sym: u32, target: u32 },
     /// Stack: [v, name] -> [v.<name>]; dynamic component.
@@ -111,6 +115,10 @@ pub enum Op {
     CurPos,
     /// Assertion failure: operand = texts index of the condition source.
     AssertFail(u32),
+    /// `assert a == b` failed: pop rhs and lhs, run `assertEqValues` to
+    /// produce a detailed inequality error (operand = condition texts index).
+    /// Falls through to a following `AssertFail` if the values compare equal.
+    AssertEq(u32),
     /// Pop a cell, push it onto the frame's with-chain.
     PushWith,
     PopWith,

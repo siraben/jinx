@@ -88,15 +88,11 @@ const UNIMPLEMENTED: &[(&str, u8)] = &[
     ("fetchGit", 1),
     ("fetchMercurial", 1),
     ("fetchTarball", 1),
-    ("fetchTree", 1),
     ("__exec", 1),
     ("__fetchClosure", 1),
-    ("__fetchurl", 1),
-    ("__filterSource", 2),
     ("__forceLazyFetcherAttr", 1),
     ("__importNative", 2),
     ("__outputOf", 2),
-    ("__storePath", 1),
     ("__toFile", 2),
     // flakes (experimental): present in `builtins` so failures are clearly
     // "not implemented" rather than "attribute missing".
@@ -153,6 +149,10 @@ pub fn register_globals(vm: &mut VM) {
         Reg { name: "__catAttrs", arity: 2, func: prim_cat_attrs },
         Reg { name: "__functionArgs", arity: 1, func: prim_function_args },
         Reg { name: "__genericClosure", arity: 1, func: prim_generic_closure },
+        Reg { name: "__storePath", arity: 1, func: prim_store_path },
+        Reg { name: "__filterSource", arity: 2, func: prim_filter_source },
+        Reg { name: "__fetchurl", arity: 1, func: prim_fetchurl },
+        Reg { name: "fetchTree", arity: 1, func: prim_fetch_tree },
         Reg { name: "__unsafeGetAttrPos", arity: 2, func: prim_unsafe_get_attr_pos },
         Reg { name: "__stringLength", arity: 1, func: prim_string_length },
         Reg { name: "__substring", arity: 3, func: prim_substring },
@@ -328,7 +328,7 @@ pub fn register_globals(vm: &mut VM) {
 }
 
 /// primops/derivation.nix, minus comments.
-const DERIVATION_NIX: &[u8] = br#"
+pub(crate) const DERIVATION_NIX: &[u8] = br#"
 drvAttrs@{
   outputs ? [ "out" ],
   ...
@@ -458,7 +458,7 @@ fn compare_values(vm: &mut VM, a: VRef, b: VRef, pos: PosIdx, ctx: &str) -> Resu
                 print::print_value_err(vm, &vb),
             );
             let msg = format!(
-                "cannot compare {} with {}; values of that type are incomparable; values are {} and {}",
+                "cannot compare {} with {}; values of that type are incomparable (values are {} and {})",
                 vm.show_type(&va),
                 vm.show_type(&vb),
                 pa,
@@ -594,7 +594,7 @@ fn prim_add_error_context(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], po
                 false,
                 true,
             )?;
-            vm.add_trace(e, NO_POS, String::from_utf8_lossy(&s).into_owned());
+            vm.add_trace_always(e, NO_POS, String::from_utf8_lossy(&s).into_owned());
             Err(e)
         }
     }
@@ -1375,11 +1375,16 @@ fn prim_derivation_strict(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], po
         }
     };
     let name_pos = PosIdx(name_attr.pos);
-    let drv_name = vm.force_string_no_ctx(
-        name_attr.val,
-        pos,
-        "while evaluating the `name` attribute passed to builtins.derivationStrict",
-    )?;
+    let drv_name = vm
+        .force_string_no_ctx(
+            name_attr.val,
+            pos,
+            "while evaluating the `name` attribute passed to builtins.derivationStrict",
+        )
+        .map_err(|e| {
+            vm.add_trace(e, name_pos, "while evaluating the derivation attribute 'name'");
+            e
+        })?;
     let r = derivation_strict_internal(vm, &drv_name, args[0], pos);
     r.map_err(|e| {
         let loc = vm
@@ -1398,6 +1403,160 @@ fn prim_derivation_strict(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], po
         );
         e
     })
+}
+
+/// Mutable derivation-construction state threaded through [`process_drv_attr`].
+struct DrvAttrState<'a> {
+    drv: &'a mut jinx_store::derivation::Derivation,
+    context: &'a mut Vec<u32>,
+    content_addressed: &'a mut bool,
+    is_impure: &'a mut bool,
+    output_hash: &'a mut Option<Vec<u8>>,
+    output_hash_algo: &'a mut Option<jinx_store::hash::HashAlgorithm>,
+    ingestion_method: &'a mut Option<jinx_store::store_path::ContentAddressMethod>,
+    outputs: &'a mut std::collections::BTreeSet<String>,
+    json_members: &'a mut Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Process a single derivation attribute. Ported from the body of the
+/// per-attribute loop in C++ `derivationStrictInternal`; the caller attaches
+/// the "while evaluating attribute '…' of derivation '…'" frame on error.
+/// Inner forces use `pos` (the primop's `noPos`) and empty contexts.
+fn process_drv_attr(
+    vm: &mut VM,
+    key: &[u8],
+    a: &Attr,
+    structured: bool,
+    ignore_nulls: bool,
+    pos: PosIdx,
+    drv_name_s: &str,
+    st: &mut DrvAttrState,
+) -> Result<(), ErrId> {
+    // __ignoreNulls: drop null-valued attrs entirely.
+    if ignore_nulls {
+        vm.force(a.val, pos)?;
+        if val(a.val).tag() == Tag::Null {
+            return Ok(());
+        }
+    }
+    match key {
+        b"__structuredAttrs" => return Ok(()),
+        b"__contentAddressed" => {
+            *st.content_addressed = vm.force_bool(a.val, pos, "")?;
+            if *st.content_addressed && !vm.experimental.ca_derivations {
+                return Err(vm.new_err(
+                    ErrKind::Eval,
+                    "experimental Nix feature 'ca-derivations' is disabled; add '--extra-experimental-features ca-derivations' to enable it",
+                    pos,
+                ));
+            }
+            return Ok(());
+        }
+        b"__impure" => {
+            *st.is_impure = vm.force_bool(a.val, pos, "")?;
+            if *st.is_impure && !vm.experimental.impure_derivations {
+                return Err(vm.new_err(
+                    ErrKind::Eval,
+                    "experimental Nix feature 'impure-derivations' is disabled; add '--extra-experimental-features impure-derivations' to enable it",
+                    pos,
+                ));
+            }
+            return Ok(());
+        }
+        b"args" => {
+            vm.force_list(a.val, pos, "")?;
+            let elems = list_elems(&val(a.val)).to_vec();
+            for el in &elems {
+                let (s, cids) = vm.coerce_to_string(
+                    *el,
+                    pos,
+                    "while evaluating an element of the argument list",
+                    true,
+                    true,
+                    true,
+                )?;
+                merge_ctx(st.context, &cids);
+                st.drv.args.push(s.into());
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // A regular attribute.
+    if structured {
+        let mut jbuf = Vec::new();
+        crate::json::to_json_ctx(vm, a.val, pos, &mut jbuf, st.context)?;
+        st.json_members.push((key.to_vec(), jbuf));
+        if let b"allowedReferences" | b"allowedRequisites" | b"disallowedReferences"
+        | b"disallowedRequisites" | b"maxSize" | b"maxClosureSize" = key
+        {
+            let ks = String::from_utf8_lossy(key);
+            emit_warning(&format!(
+                "In a derivation named '{drv_name_s}', 'structuredAttrs' disables the effect of the derivation attribute '{ks}'; use 'outputChecks.<output>.{ks}' instead"
+            ));
+        }
+        match key {
+            b"builder" => {
+                let (s, cids) = coerce_str_ctx(vm, a.val, pos)?;
+                merge_ctx(st.context, &cids);
+                st.drv.builder = s.into();
+            }
+            b"system" => {
+                st.drv.platform = vm.force_string_no_ctx(a.val, pos, "")?.into();
+            }
+            b"outputHash" => {
+                *st.output_hash = Some(vm.force_string_no_ctx(a.val, pos, "")?);
+            }
+            b"outputHashAlgo" => {
+                let s = vm.force_string_no_ctx(a.val, pos, "")?;
+                *st.output_hash_algo =
+                    jinx_store::hash::HashAlgorithm::parse_opt(&String::from_utf8_lossy(&s));
+            }
+            b"outputHashMode" => {
+                let s = vm.force_string_no_ctx(a.val, pos, "")?;
+                *st.ingestion_method = Some(handle_hash_mode(vm, &s, pos)?);
+            }
+            b"outputs" => {
+                vm.force_list(a.val, pos, "")?;
+                let elems = list_elems(&val(a.val)).to_vec();
+                let mut ss: Vec<Vec<u8>> = Vec::new();
+                for el in &elems {
+                    ss.push(vm.force_string_no_ctx(*el, pos, "")?);
+                }
+                handle_outputs(vm, &ss, st.outputs, pos)?;
+            }
+            _ => {}
+        }
+    } else {
+        let (s, cids) = vm.coerce_to_string(a.val, pos, "", true, true, true)?;
+        merge_ctx(st.context, &cids);
+        if key == b"__json" {
+            st.drv.env.insert(b"__json".as_slice().into(), s.clone().into());
+        } else {
+            st.drv.env.insert(key.into(), s.clone().into());
+            match key {
+                b"builder" => st.drv.builder = s.into(),
+                b"system" => st.drv.platform = s.into(),
+                b"outputHash" => *st.output_hash = Some(s),
+                b"outputHashAlgo" => {
+                    *st.output_hash_algo =
+                        jinx_store::hash::HashAlgorithm::parse_opt(&String::from_utf8_lossy(&s))
+                }
+                b"outputHashMode" => *st.ingestion_method = Some(handle_hash_mode(vm, &s, pos)?),
+                b"outputs" => {
+                    let ss: Vec<Vec<u8>> = s
+                        .split(|c| c.is_ascii_whitespace())
+                        .filter(|x| !x.is_empty())
+                        .map(|x| x.to_vec())
+                        .collect();
+                    handle_outputs(vm, &ss, st.outputs, pos)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn derivation_strict_internal(
@@ -1470,147 +1629,33 @@ fn derivation_strict_internal(
             continue;
         }
         let apos = PosIdx(a.pos);
-        // __ignoreNulls: drop null-valued attrs entirely.
-        if ignore_nulls {
-            vm.force(a.val, apos)?;
-            if val(a.val).tag() == Tag::Null {
-                continue;
-            }
-        }
-        match key.as_slice() {
-            b"__structuredAttrs" => continue,
-            b"__contentAddressed" => {
-                content_addressed = vm.force_bool(
-                    a.val,
+        let mut st = DrvAttrState {
+            drv: &mut drv,
+            context: &mut context,
+            content_addressed: &mut content_addressed,
+            is_impure: &mut is_impure,
+            output_hash: &mut output_hash,
+            output_hash_algo: &mut output_hash_algo,
+            ingestion_method: &mut ingestion_method,
+            outputs: &mut outputs,
+            json_members: &mut json_members,
+        };
+        // C++ wraps the whole per-attribute body in a single
+        // "while evaluating attribute '<key>' of derivation '<name>'" frame
+        // (at the attribute's position); inner forces carry no position.
+        process_drv_attr(vm, key, a, structured, ignore_nulls, pos, &drv_name_s, &mut st)
+            .map_err(|e| {
+                vm.add_trace(
+                    e,
                     apos,
-                    "while evaluating the `__contentAddressed` attribute passed to builtins.derivationStrict",
-                )?;
-                if content_addressed && !vm.experimental.ca_derivations {
-                    return Err(vm.new_err(
-                        ErrKind::Eval,
-                        "experimental Nix feature 'ca-derivations' is disabled; add '--extra-experimental-features ca-derivations' to enable it",
-                        pos,
-                    ));
-                }
-                continue;
-            }
-            b"__impure" => {
-                is_impure = vm.force_bool(
-                    a.val,
-                    apos,
-                    "while evaluating the `__impure` attribute passed to builtins.derivationStrict",
-                )?;
-                if is_impure && !vm.experimental.impure_derivations {
-                    return Err(vm.new_err(
-                        ErrKind::Eval,
-                        "experimental Nix feature 'impure-derivations' is disabled; add '--extra-experimental-features impure-derivations' to enable it",
-                        pos,
-                    ));
-                }
-                continue;
-            }
-            b"args" => {
-                vm.force_list(
-                    a.val,
-                    apos,
-                    "while evaluating the `args` attribute passed to builtins.derivationStrict",
-                )?;
-                let elems = list_elems(&val(a.val)).to_vec();
-                for el in &elems {
-                    let (s, cids) = vm.coerce_to_string(
-                        *el,
-                        apos,
-                        "while evaluating an element of the argument list",
-                        true,
-                        true,
-                        true,
-                    )?;
-                    merge_ctx(&mut context, &cids);
-                    drv.args.push(s.into());
-                }
-                continue;
-            }
-            _ => {}
-        }
-
-        // A regular attribute.
-        if structured {
-            // Serialize the value into the structuredAttrs JSON.
-            let mut jbuf = Vec::new();
-            crate::json::to_json_ctx(vm, a.val, apos, &mut jbuf, &mut context)?;
-            json_members.push((key.clone(), jbuf));
-            // Warn that structuredAttrs disables these attributes.
-            if let b"allowedReferences" | b"allowedRequisites" | b"disallowedReferences"
-            | b"disallowedRequisites" | b"maxSize" | b"maxClosureSize" = key.as_slice()
-            {
-                let ks = String::from_utf8_lossy(key);
-                emit_warning(&format!(
-                    "In a derivation named '{drv_name_s}', 'structuredAttrs' disables the effect of the derivation attribute '{ks}'; use 'outputChecks.<output>.{ks}' instead"
-                ));
-            }
-            // Also extract typed fields.
-            match key.as_slice() {
-                b"builder" => {
-                    let (s, cids) = coerce_str_ctx(vm, a.val, apos)?;
-                    merge_ctx(&mut context, &cids);
-                    drv.builder = s.into();
-                }
-                b"system" => {
-                    drv.platform =
-                        vm.force_string_no_ctx(a.val, apos, "")?.into();
-                }
-                b"outputHash" => {
-                    output_hash = Some(vm.force_string_no_ctx(a.val, apos, "")?);
-                }
-                b"outputHashAlgo" => {
-                    let s = vm.force_string_no_ctx(a.val, apos, "")?;
-                    output_hash_algo =
-                        jinx_store::hash::HashAlgorithm::parse_opt(&String::from_utf8_lossy(&s));
-                }
-                b"outputHashMode" => {
-                    let s = vm.force_string_no_ctx(a.val, apos, "")?;
-                    ingestion_method = Some(handle_hash_mode(vm, &s, pos)?);
-                }
-                b"outputs" => {
-                    vm.force_list(a.val, apos, "")?;
-                    let elems = list_elems(&val(a.val)).to_vec();
-                    let mut ss: Vec<Vec<u8>> = Vec::new();
-                    for el in &elems {
-                        ss.push(vm.force_string_no_ctx(*el, apos, "")?);
-                    }
-                    handle_outputs(vm, &ss, &mut outputs, pos)?;
-                }
-                _ => {}
-            }
-        } else {
-            let (s, cids) = vm.coerce_to_string(a.val, apos, "", true, true, true)?;
-            merge_ctx(&mut context, &cids);
-            if key.as_slice() == b"__json" {
-                drv.env.insert(b"__json".as_slice().into(), s.clone().into());
-            } else {
-                drv.env.insert(key.as_slice().into(), s.clone().into());
-                match key.as_slice() {
-                    b"builder" => drv.builder = s.into(),
-                    b"system" => drv.platform = s.into(),
-                    b"outputHash" => output_hash = Some(s),
-                    b"outputHashAlgo" => {
-                        output_hash_algo = jinx_store::hash::HashAlgorithm::parse_opt(
-                            &String::from_utf8_lossy(&s),
-                        )
-                    }
-                    b"outputHashMode" => ingestion_method = Some(handle_hash_mode(vm, &s, pos)?),
-                    b"outputs" => {
-                        let ss: Vec<Vec<u8>> = s
-                            .split(|c| c.is_ascii_whitespace())
-                            .filter(|x| !x.is_empty())
-                            .map(|x| x.to_vec())
-                            .collect();
-                        handle_outputs(vm, &ss, &mut outputs, pos)?;
-                    }
-                    _ => {}
-                }
-            }
-        }
+                    format!(
+                        "while evaluating attribute '{}' of derivation '{}'",
+                        String::from_utf8_lossy(key),
+                        drv_name_s
+                    ),
+                );
+                e
+            })?;
     }
 
     // Finish structuredAttrs: build the __json env var.
@@ -2359,14 +2404,21 @@ fn toml_normalize_datetime(dt: &toml::value::Datetime) -> String {
 
 fn toml_no_null_byte(vm: &mut VM, s: &[u8], pos: PosIdx) -> Result<(), ErrId> {
     if s.contains(&0) {
-        return Err(vm.new_err(
-            ErrKind::Eval,
-            format!(
-                "while parsing TOML: error: input string '{}' cannot be represented as Nix string because it contains null bytes",
-                String::from_utf8_lossy(s)
-            ),
-            pos,
-        ));
+        // NUL is rendered as `␀` (U+2400), like C++ `forceNoNullByte`.
+        let mut shown = Vec::with_capacity(s.len());
+        for &b in s {
+            if b == 0 {
+                shown.extend_from_slice("␀".as_bytes());
+            } else {
+                shown.push(b);
+            }
+        }
+        let mut msg = b"while parsing TOML: error: input string '".to_vec();
+        msg.extend_from_slice(&shown);
+        msg.extend_from_slice(
+            b"' cannot be represented as Nix string because it contains null bytes",
+        );
+        return Err(vm.new_err(ErrKind::Eval, msg, pos));
     }
     Ok(())
 }
@@ -3043,14 +3095,17 @@ fn prim_concat_map(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosI
         "while evaluating the second argument passed to builtins.concatMap",
     )?;
     let elems = list_elems(&val(args[1])).to_vec();
+    // C++ forces each result at `result.determinePos(fn.determinePos(pos))`.
+    let fn_pos = vm.determine_pos(&val(args[0]), pos);
     let scope = vm.temp_scope();
     let mut results: Vec<VRef> = Vec::with_capacity(elems.len());
     for el in &elems {
         let r = vm.call_function(args[0], &[*el], pos)?;
         let rc = temp_cell(vm, r);
+        let rpos = vm.determine_pos(&val(rc), fn_pos);
         vm.force_list(
             rc,
-            pos,
+            rpos,
             "while evaluating the return value of the function passed to builtins.concatMap",
         )?;
         results.push(rc);
@@ -3493,9 +3548,10 @@ fn prim_map_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
         let nc = temp_cell(vm, nv);
         let t = vm.new_apply_thunk(args[0], &[nc, a.val]);
         let tc = temp_cell(vm, t);
+        // C++ `attrs.alloc(i.name)` gives the result attributes no position.
         entries.push(Attr {
             sym: a.sym,
-            pos: a.pos,
+            pos: 0,
             val: tc,
         });
     }
@@ -3543,7 +3599,7 @@ fn prim_cat_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
         vm.force_attrs(
             el,
             pos,
-            "while evaluating an element in the list passed to builtins.catAttrs",
+            "while evaluating an element in the list passed as second argument to builtins.catAttrs",
         )?;
         if let Some(a) = attrs_get(&val(el), sym) {
             out.push(a.val);
@@ -3661,31 +3717,51 @@ fn prim_generic_closure(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
     let mut work: std::collections::VecDeque<VRef> =
         list_elems(&val(start.val)).iter().copied().collect();
     let mut done_keys: Vec<VRef> = Vec::new();
+    let mut done_elems: Vec<VRef> = Vec::new();
     let mut res: Vec<VRef> = Vec::new();
     while let Some(e) = work.pop_front() {
-        vm.force_attrs(e, NO_POS, "")?;
+        // C++ adds "in genericClosure element %s" if forcing the element or
+        // reading its 'key' fails.
+        let elem_ctx = |vm: &mut VM, er: ErrId| {
+            let printed = crate::print::print_value_err(vm, &val(e));
+            vm.add_trace(er, NO_POS, format!("in genericClosure element {printed}"));
+        };
+        vm.force_attrs(e, NO_POS, "").map_err(|er| {
+            elem_ctx(vm, er);
+            er
+        })?;
         let ev = val(e);
         let Some(key) = attrs_get(&ev, key_sym) else {
-            let er = vm.new_err(ErrKind::Type, "attribute 'key' missing", pos);
-            vm.add_trace(
-                er,
-                NO_POS,
-                "in one of the attrsets generated by (or initially passed to) builtins.genericClosure",
-            );
+            let er = vm.new_err(ErrKind::Type, "attribute 'key' missing", NO_POS);
+            elem_ctx(vm, er);
             vm.temp_end(scope);
             return Err(er);
         };
         vm.force(key.val, NO_POS)?;
-        // Insert into done set (ordered by CompareValues).
+        // Insert into done set (ordered by CompareValues). The new key is
+        // compared *first* so an incomparability error reports the new
+        // element's type before the existing one (matching std::map order).
         let mut lo = 0usize;
         let mut hi = done_keys.len();
         let mut is_dup = false;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if compare_values(vm, done_keys[mid], key.val, NO_POS, "")? {
-                lo = mid + 1;
-            } else if compare_values(vm, key.val, done_keys[mid], NO_POS, "")? {
+            let other_elem = done_elems[mid];
+            let cmp = |vm: &mut VM, a: VRef, b: VRef| -> Result<bool, ErrId> {
+                compare_values(vm, a, b, NO_POS, "").map_err(|er| {
+                    // Pre-swapped for reverse printing: "with element",
+                    // then "while comparing element".
+                    let other_p = crate::print::print_value_err(vm, &val(other_elem));
+                    let e_p = crate::print::print_value_err(vm, &val(e));
+                    vm.add_trace(er, NO_POS, format!("with element {other_p}"));
+                    vm.add_trace(er, NO_POS, format!("while comparing element {e_p}"));
+                    er
+                })
+            };
+            if cmp(vm, key.val, done_keys[mid])? {
                 hi = mid;
+            } else if cmp(vm, done_keys[mid], key.val)? {
+                lo = mid + 1;
             } else {
                 is_dup = true;
                 break;
@@ -3695,19 +3771,35 @@ fn prim_generic_closure(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
             continue;
         }
         done_keys.insert(lo, key.val);
+        done_elems.insert(lo, e);
         vm.temp_roots.push(key.val);
         res.push(e);
         vm.temp_roots.push(e);
 
-        // Call the operator and queue new elements.
-        let r = vm.call_function(op.val, &[e], NO_POS)?;
-        let rc = temp_cell(vm, r);
-        vm.force_list(
-            rc,
-            NO_POS,
-            "while evaluating the return value of the `operator` passed to builtins.genericClosure",
-        )?;
-        for &n in list_elems(&val(rc)) {
+        // Call the operator and queue new elements. C++ wraps the call, the
+        // return-value forceList, and forcing each element with a single
+        // "while calling operator on genericClosure element %s" frame.
+        let op_val = op.val;
+        let queued: Result<Vec<VRef>, ErrId> = (|vm: &mut VM| {
+            let r = vm.call_function(op_val, &[e], NO_POS)?;
+            let rc = temp_cell(vm, r);
+            vm.force_list(
+                rc,
+                NO_POS,
+                "while evaluating the return value of the `operator` passed to builtins.genericClosure",
+            )?;
+            Ok(list_elems(&val(rc)).to_vec())
+        })(vm);
+        let new_elems = queued.map_err(|er| {
+            let printed = crate::print::print_value_err(vm, &val(e));
+            vm.add_trace(
+                er,
+                NO_POS,
+                format!("while calling operator on genericClosure element {printed}"),
+            );
+            er
+        })?;
+        for n in new_elems {
             work.push_back(n);
             vm.temp_roots.push(n);
         }
@@ -3770,6 +3862,240 @@ fn prim_zip_attrs_with(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
 // paths / files / env
 // ---------------------------------------------------------------------
 
+fn prim_fetch_tree(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    // Partial port: only the attribute-set validation errors are reproduced;
+    // the actual fetch (and flake-ref string parsing) is not implemented.
+    vm.force(args[0], pos)?;
+    let av = val(args[0]);
+    if av.tag() != Tag::Attrs {
+        // String form: coerce to a URL and reproduce the tarball fetcher's
+        // "file scheme relative path" diagnostic (the only string-form error
+        // exercised by the suite).
+        let (url, _) = vm.coerce_to_string(
+            args[0],
+            pos,
+            "while evaluating the first argument passed to 'fetchTree'",
+            false,
+            false,
+            false,
+        )?;
+        let us = String::from_utf8_lossy(&url).into_owned();
+        if let Some(rest) = us.strip_prefix("file:") {
+            let path = rest.strip_prefix("//").unwrap_or(rest);
+            if !path.starts_with('/') {
+                let msg = format!(
+                    "tarball '{us}' must use an absolute path. The 'file' scheme does not support relative paths."
+                );
+                let e = vm.new_err(ErrKind::Eval, msg, pos);
+                vm.add_trace(e, NO_POS, format!("while fetching the input '{us}'"));
+                return Err(e);
+            }
+        }
+        return Err(vm.new_err(
+            ErrKind::Eval,
+            "the 'fetchTree' builtin is not implemented by jinx yet",
+            pos,
+        ));
+    }
+    if av.tag() == Tag::Attrs {
+        let type_sym = vm.symbols.create(b"type").0;
+        let entries = attrs_entries(&av).to_vec();
+        for a in &entries {
+            if a.sym == type_sym {
+                continue;
+            }
+            vm.force(a.val, PosIdx(a.pos))?;
+            let v = val(a.val);
+            if v.tag() == Tag::Int && v.as_int() < 0 {
+                let name = String::from_utf8_lossy(vm.symbols.resolve(Symbol(a.sym))).into_owned();
+                let msg = format!(
+                    "negative value given for 'fetchTree' argument '{}': {}",
+                    name,
+                    v.as_int()
+                );
+                return Err(vm.new_err(ErrKind::Eval, msg, pos));
+            }
+        }
+    }
+    Err(vm.new_err(
+        ErrKind::Eval,
+        "the 'fetchTree' builtin is not implemented by jinx yet",
+        pos,
+    ))
+}
+
+fn prim_fetchurl(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    // Partial port of the fetchurl/fetchTree name-validation path; the actual
+    // fetch is not implemented, but store-path-name errors are reproduced.
+    vm.force(args[0], pos)?;
+    let av = val(args[0]);
+    let is_attrs = av.tag() == Tag::Attrs;
+    let mut url: Option<Vec<u8>> = None;
+    let mut name: Vec<u8> = Vec::new();
+    let mut name_passed = false;
+    if is_attrs {
+        let entries = attrs_entries(&av).to_vec();
+        for a in &entries {
+            let n = vm.symbols.resolve(Symbol(a.sym)).to_vec();
+            match n.as_slice() {
+                b"url" => {
+                    url = Some(vm.force_string_no_ctx(
+                        a.val,
+                        PosIdx(a.pos),
+                        "while evaluating the url we should fetch",
+                    )?)
+                }
+                b"sha256" => {
+                    vm.force_string_no_ctx(
+                        a.val,
+                        PosIdx(a.pos),
+                        "while evaluating the sha256 of the content we should fetch",
+                    )?;
+                }
+                b"name" => {
+                    name_passed = true;
+                    name = vm.force_string_no_ctx(
+                        a.val,
+                        PosIdx(a.pos),
+                        "while evaluating the name of the content we should fetch",
+                    )?;
+                }
+                _ => {
+                    let msg = format!(
+                        "unsupported argument '{}' to 'fetchurl'",
+                        String::from_utf8_lossy(&n)
+                    );
+                    return Err(vm.new_err(ErrKind::Eval, msg, pos));
+                }
+            }
+        }
+        if url.is_none() {
+            return Err(vm.new_err(ErrKind::Eval, "'url' argument required", pos));
+        }
+    } else {
+        url = Some(vm.force_string_no_ctx(
+            args[0],
+            pos,
+            "while evaluating the url we should fetch",
+        )?);
+    }
+    let url = url.unwrap();
+    if name.is_empty() {
+        // baseNameOf: the component after the last '/'.
+        let trimmed = url.strip_suffix(b"/").unwrap_or(&url);
+        name = match trimmed.iter().rposition(|&c| c == b'/') {
+            Some(i) => trimmed[i + 1..].to_vec(),
+            None => trimmed.to_vec(),
+        };
+    }
+    if let Err(e) = jinx_store::store_path::check_name(&String::from_utf8_lossy(&name)) {
+        let who = "fetchurl";
+        let resolution = if name_passed {
+            format!("Please change the value for the 'name' attribute passed to '{who}', so that it can create a valid store path.")
+        } else if is_attrs {
+            format!("Please add a valid 'name' attribute to the argument for '{who}', so that it can create a valid store path.")
+        } else {
+            format!("Please pass an attribute set with 'url' and 'name' attributes to '{who}',  so that it can create a valid store path.")
+        };
+        let msg = format!(
+            "invalid store path name when fetching URL '{}': {}. {}",
+            String::from_utf8_lossy(&url),
+            e.0,
+            resolution
+        );
+        return Err(vm.new_err(ErrKind::Eval, msg, pos));
+    }
+    Err(vm.new_err(
+        ErrKind::Eval,
+        "the 'fetchurl' builtin is not implemented by jinx yet",
+        pos,
+    ))
+}
+
+fn prim_store_path(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    // Only the coercion error path is exercised by the test suite; a genuine
+    // store-path realisation is not implemented.
+    let _p = coerce_to_path(
+        vm,
+        args[0],
+        pos,
+        "while evaluating the first argument passed to 'builtins.storePath'",
+    )?;
+    Err(vm.new_err(
+        ErrKind::Eval,
+        "the 'storePath' builtin is not implemented by jinx yet",
+        pos,
+    ))
+}
+
+fn prim_filter_source(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    // C++ coerces the path (second argument) before anything else, then forces
+    // the filter function, then walks the tree ("addPath"), invoking the
+    // filter on each entry. Only the error paths are exercised by the suite.
+    let path = coerce_to_path(
+        vm,
+        args[1],
+        pos,
+        "while evaluating the second argument (the path to filter) passed to 'builtins.filterSource'",
+    )?;
+    force_fun(
+        vm,
+        args[0],
+        pos,
+        "while evaluating the first argument passed to builtins.filterSource",
+    )?;
+    let filter = args[0];
+    let path_str = String::from_utf8_lossy(&path).into_owned();
+    filter_walk(vm, filter, &path_str).map_err(|e| {
+        vm.add_trace(e, pos, format!("while adding path '{path_str}'"));
+        e
+    })?;
+    Err(vm.new_err(
+        ErrKind::Eval,
+        "the 'filterSource' builtin is not implemented by jinx yet",
+        pos,
+    ))
+}
+
+/// Minimal port of the filter-invocation part of `addPath`: apply the filter
+/// to directory entries. `filter path type` must return a Boolean; the return
+/// value is forced with the C++ context string.
+fn filter_walk(vm: &mut VM, filter: VRef, dir: &str) -> Result<(), ErrId> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    let mut names: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
+    for ent in rd.flatten() {
+        let t = ent
+            .path()
+            .symlink_metadata()
+            .map(|m| file_type_str(&m))
+            .unwrap_or("unknown");
+        names.push((ent.path(), t));
+    }
+    names.sort();
+    for (p, t) in names {
+        let ps = p.to_string_lossy().into_owned();
+        let pv = mk_string(vm, ps.as_bytes());
+        let pc = temp_cell(vm, pv);
+        let tv = mk_string(vm, t.as_bytes());
+        let tc = temp_cell(vm, tv);
+        let scope = vm.temp_scope();
+        vm.temp_roots.push(pc);
+        vm.temp_roots.push(tc);
+        let r = vm.call_function(filter, &[pc, tc], NO_POS);
+        vm.temp_end(scope);
+        let rv = r?;
+        let rc = temp_cell(vm, rv);
+        vm.force_bool(
+            rc,
+            NO_POS,
+            "while evaluating the return value of the path filter function",
+        )?;
+    }
+    Ok(())
+}
+
 fn coerce_to_path(vm: &mut VM, cell: VRef, pos: PosIdx, ctx: &str) -> Result<Vec<u8>, ErrId> {
     vm.force(cell, pos).map_err(|e| {
         vm.add_trace(e, pos, ctx);
@@ -3808,7 +4134,7 @@ fn prim_to_path(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx)
         vm,
         args[0],
         pos,
-        "while evaluating the first argument passed to 'builtins.toPath'",
+        "while evaluating the first argument passed to builtins.toPath",
     )?;
     Ok(mk_string(vm, &p))
 }
@@ -3964,10 +4290,26 @@ fn prim_read_dir(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx
         "while evaluating the first argument passed to builtins.readDir",
     )?;
     let path = String::from_utf8_lossy(&p).into_owned();
-    let rd = match std::fs::read_dir(&path) {
+    // Mirror C++ `realisePath` + `readDirectory`: a missing path yields
+    // "path '%s' does not exist"; a non-directory yields "'%s' is not a
+    // directory" (ENOTDIR from opendir on the symlink-resolved path).
+    if std::fs::symlink_metadata(&path).is_err() {
+        let msg = format!("path '{path}' does not exist");
+        return Err(vm.new_err(ErrKind::Eval, msg, pos));
+    }
+    let target = std::fs::canonicalize(&path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.clone());
+    let rd = match std::fs::read_dir(&target) {
         Ok(rd) => rd,
         Err(err) => {
-            let msg = format!("reading directory '{}': {}", path, io_msg(&err));
+            let msg = if err.raw_os_error() == Some(20) {
+                format!("'{target}' is not a directory")
+            } else if err.kind() == std::io::ErrorKind::NotFound {
+                format!("path '{target}' does not exist")
+            } else {
+                format!("reading directory '{}': {}", target, io_msg(&err))
+            };
             return Err(vm.new_err(ErrKind::Eval, msg, pos));
         }
     };
@@ -4029,8 +4371,8 @@ fn parse_hash_algo(vm: &mut VM, s: &[u8], pos: PosIdx) -> Result<HashAlgorithm, 
     let name = String::from_utf8_lossy(s).into_owned();
     HashAlgorithm::parse_opt(&name).ok_or_else(|| {
         vm.new_err(
-            ErrKind::Eval,
-            format!("unknown hash algorithm '{name}', expect 'md5', 'sha1', 'sha256', or 'sha512'"),
+            ErrKind::Usage,
+            format!("unknown hash algorithm '{name}', expect 'blake3', 'md5', 'sha1', 'sha256', or 'sha512'"),
             pos,
         )
     })
@@ -4067,11 +4409,12 @@ fn prim_hash_file(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
     )?;
     let path = String::from_utf8_lossy(&p).into_owned();
     let bytes = std::fs::read(&path).map_err(|err| {
-        vm.new_err(
-            ErrKind::Eval,
-            format!("opening file '{}': {}", path, io_msg(&err)),
-            pos,
-        )
+        let msg = if err.kind() == std::io::ErrorKind::NotFound {
+            format!("path '{path}' does not exist")
+        } else {
+            format!("opening file '{}': {}", path, io_msg(&err))
+        };
+        vm.new_err(ErrKind::Eval, msg, pos)
     })?;
     let h = hash_string(algo, &bytes);
     Ok(mk_string(vm, h.to_string(HashFormat::Base16, false).as_bytes()))
@@ -4175,6 +4518,19 @@ fn prim_from_json(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
 // ---------------------------------------------------------------------
 
 pub fn eval_file(vm: &mut VM, path: &Path, pos: PosIdx) -> Result<VRef, ErrId> {
+    eval_file_traced(vm, path, pos, true)
+}
+
+/// Like [`eval_file`] but `add_trace` controls whether the
+/// "while evaluating the file '…'" frame is attached on error. The top-level
+/// nix-instantiate entry (`state.eval` on a parsed file) does *not* add it,
+/// whereas `builtins.import` (`evalFile`) does.
+pub fn eval_file_traced(
+    vm: &mut VM,
+    path: &Path,
+    pos: PosIdx,
+    add_trace: bool,
+) -> Result<VRef, ErrId> {
     let resolved = resolve_expr_path(path);
     if let Some((_, cell)) = vm
         .file_cache
@@ -4226,11 +4582,13 @@ pub fn eval_file(vm: &mut VM, path: &Path, pos: PosIdx) -> Result<VRef, ErrId> {
         vm.empty_list_cell,
     );
     let cell = vm.run_program(prog).map_err(|e| {
-        vm.add_trace(
-            e,
-            pos,
-            format!("while evaluating the file '{}':", resolved.display()),
-        );
+        if add_trace {
+            vm.add_trace(
+                e,
+                pos,
+                format!("while evaluating the file '{}':", resolved.display()),
+            );
+        }
         e
     })?;
     vm.file_cache.push((resolved, cell));

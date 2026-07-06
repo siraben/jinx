@@ -23,6 +23,9 @@ pub enum ErrKind {
     /// max-call-depth exceeded (EvalBaseError; not cacheable in C++, but we
     /// treat it like other errors for M2).
     StackOverflow,
+    /// `UsageError` (libutil): rendered like a normal error, but the CLI
+    /// appends a "Try '<program> --help' for more information." line.
+    Usage,
 }
 
 impl ErrKind {
@@ -37,6 +40,9 @@ impl ErrKind {
 pub struct Trace {
     pub pos: PosIdx,
     pub text: String,
+    /// `TracePrint::Always` (produced by `builtins.addErrorContext`): shown
+    /// even when the trace is truncated (without `--show-trace`).
+    pub always: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -62,30 +68,52 @@ impl EvalError {
         }
     }
 
-    /// Render like C++ `showErrorInfo` (without --show-trace frames for
-    /// now; trace fidelity is M3). Reuses jinx-syntax's renderer.
+    /// Render like C++ `showErrorInfo` with `--show-trace` on.
     pub fn render(&self, positions: &PosTable) -> Vec<u8> {
-        let mut msg = self.msg.clone();
+        self.render_with(positions, true)
+    }
+
+    /// Render like C++ `showErrorInfo`; `show_trace` controls whether the full
+    /// trace is shown or truncated (keeping only `TracePrint::Always` frames).
+    pub fn render_with(&self, positions: &PosTable, show_trace: bool) -> Vec<u8> {
+        // The "Did you mean …?" suffix, appended after the position block.
+        let mut suffix: Vec<u8> = Vec::new();
         if !self.suggestions.is_empty() {
-            msg.extend_from_slice(b"\nDid you mean ");
+            suffix.extend_from_slice(b"Did you mean ");
             if self.suggestions.len() == 1 {
-                msg.extend_from_slice(format!("{}?", self.suggestions[0]).as_bytes());
+                suffix.extend_from_slice(format!("{}?", self.suggestions[0]).as_bytes());
             } else {
-                msg.extend_from_slice(b"one of ");
+                suffix.extend_from_slice(b"one of ");
                 for (i, s) in self.suggestions.iter().enumerate() {
                     if i > 0 {
-                        msg.extend_from_slice(if i + 1 == self.suggestions.len() {
+                        suffix.extend_from_slice(if i + 1 == self.suggestions.len() {
                             b" or ".as_slice()
                         } else {
                             b", ".as_slice()
                         });
                     }
-                    msg.extend_from_slice(s.as_bytes());
+                    suffix.extend_from_slice(s.as_bytes());
                 }
-                msg.push(b'?');
+                suffix.push(b'?');
             }
+            suffix.push(b'\n');
         }
-        jinx_syntax::error::ParseError::new(msg, self.pos).render(positions)
+        // `traces` is stored in C++ `addTrace` order (each frame appended as
+        // the stack unwinds). C++ prints them front-to-back where front is the
+        // *last* added (push_front); replicate by iterating in reverse.
+        let frames: Vec<jinx_syntax::error::RenderFrame> = self
+            .traces
+            .iter()
+            .rev()
+            .map(|t| jinx_syntax::error::RenderFrame {
+                pos: t.pos,
+                text: t.text.clone().into_bytes(),
+                always: t.always,
+            })
+            .collect();
+        jinx_syntax::error::render_error(
+            &self.msg, self.pos, &frames, &suffix, show_trace, positions,
+        )
     }
 }
 
@@ -93,15 +121,19 @@ impl EvalError {
 /// entries with the smallest Levenshtein distance, provided it is at most
 /// `max(query.len(), match.len()) / 3`.
 pub fn best_matches(candidates: impl Iterator<Item = String>, query: &str) -> Vec<String> {
+    // Port of `Suggestions::bestMatches` + `trim(limit=5, maxDistance=2)`:
+    // sort by (distance, name), keep distance ≤ 2, at most 5. Names are shown
+    // verbatim (no quoting) — the quotes come from the surrounding message.
     let mut scored: Vec<(usize, String)> = candidates
         .map(|c| (levenshtein(query, &c), c))
         .collect();
     scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    scored.dedup();
     scored
         .into_iter()
-        .filter(|(d, c)| *d <= std::cmp::max(query.len(), c.len()) / 3)
-        .take(2)
-        .map(|(_, c)| format!("'{c}'"))
+        .filter(|(d, _)| *d <= 2)
+        .take(5)
+        .map(|(_, c)| c)
         .collect()
 }
 

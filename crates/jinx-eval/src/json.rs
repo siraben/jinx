@@ -108,6 +108,22 @@ pub fn to_json_ctx(
     out: &mut Vec<u8>,
     ctx: &mut Vec<u32>,
 ) -> Result<(), ErrId> {
+    // C++ `printValueAsJSON` calls `addCallDepth(pos)` per level, so a deep
+    // structure overflows at max-call-depth rather than the host stack.
+    vm.depth_check(pos)?;
+    vm.call_depth += 1;
+    let r = to_json_ctx_inner(vm, cell, pos, out, ctx);
+    vm.call_depth -= 1;
+    r
+}
+
+fn to_json_ctx_inner(
+    vm: &mut VM,
+    cell: VRef,
+    pos: PosIdx,
+    out: &mut Vec<u8>,
+    ctx: &mut Vec<u32>,
+) -> Result<(), ErrId> {
     vm.force(cell, pos)?;
     let v = val(cell);
     match v.tag() {
@@ -227,6 +243,29 @@ pub fn from_json(vm: &mut VM, s: &[u8], pos: PosIdx) -> Result<Value, ErrId> {
     json_to_value(vm, &parsed)
 }
 
+/// Port of `forceNoNullByte` (eval.cc): reject strings containing NUL, with
+/// the NUL rendered as `␀` (U+2400) in the message. The error carries no
+/// position.
+pub fn force_no_null_byte(vm: &mut VM, s: &[u8]) -> Result<(), ErrId> {
+    if s.contains(&0) {
+        let mut shown = Vec::with_capacity(s.len());
+        for &b in s {
+            if b == 0 {
+                shown.extend_from_slice("␀".as_bytes());
+            } else {
+                shown.push(b);
+            }
+        }
+        let mut msg = b"input string '".to_vec();
+        msg.extend_from_slice(&shown);
+        msg.extend_from_slice(
+            b"' cannot be represented as Nix string because it contains null bytes",
+        );
+        return Err(vm.new_err(ErrKind::Eval, msg, jinx_syntax::pos::NO_POS));
+    }
+    Ok(())
+}
+
 fn json_to_value(vm: &mut VM, j: &serde_json::Value) -> Result<Value, ErrId> {
     Ok(match j {
         serde_json::Value::Null => Value::null(),
@@ -234,11 +273,21 @@ fn json_to_value(vm: &mut VM, j: &serde_json::Value) -> Result<Value, ErrId> {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Value::int(i)
+            } else if let Some(u) = n.as_u64() {
+                // Integer literal too large for a signed 64-bit Nix integer.
+                return Err(vm.new_err(
+                    ErrKind::Eval,
+                    format!("unsigned json number {u} outside of Nix integer range"),
+                    jinx_syntax::pos::NO_POS,
+                ));
             } else {
                 Value::float(n.as_f64().unwrap_or(f64::NAN))
             }
         }
-        serde_json::Value::String(s) => vm.new_string_value(s.as_bytes(), std::ptr::null_mut()),
+        serde_json::Value::String(s) => {
+            force_no_null_byte(vm, s.as_bytes())?;
+            vm.new_string_value(s.as_bytes(), std::ptr::null_mut())
+        }
         serde_json::Value::Array(items) => {
             let scope = vm.temp_scope();
             let mut cells: Vec<VRef> = Vec::with_capacity(items.len());
@@ -256,6 +305,7 @@ fn json_to_value(vm: &mut VM, j: &serde_json::Value) -> Result<Value, ErrId> {
             let scope = vm.temp_scope();
             let mut entries: Vec<crate::value::Attr> = Vec::with_capacity(map.len());
             for (k, jv) in map {
+                force_no_null_byte(vm, k.as_bytes())?;
                 let sym = vm.symbols.create(k.as_bytes());
                 let v = json_to_value(vm, jv)?;
                 let c = vm.alloc_cell(v);

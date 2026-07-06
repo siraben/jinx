@@ -167,6 +167,13 @@ impl Value {
                 | Tag::Thunk
                 | Tag::Closure
                 | Tag::PrimOpApp
+                // A blackhole retains its thunk's data pointer (w1) so that
+                // `determinePos` can recover the position of the expression
+                // being computed for infinite-recursion diagnostics. It must
+                // therefore be traced by the GC exactly like a Thunk. A bare
+                // (w1 == 0) blackhole sentinel traces to null, which
+                // `mark_data` ignores.
+                | Tag::Blackhole
         )
     }
 }

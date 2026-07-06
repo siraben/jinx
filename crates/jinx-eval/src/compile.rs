@@ -118,6 +118,10 @@ pub struct Compiler<'a> {
     /// compiling inherit-from definitions.
     from_owner: Option<u32>,
     empty_list_cell: VRef,
+    /// Lambda naming: `ExprLambda::setName` (nixexpr.cc) sets a lambda's name
+    /// from the attr/let binding it is directly bound to, recursing into the
+    /// curried body chain. Keyed by `ExprId.0`.
+    lambda_names: FxHashMap<u32, Symbol>,
 }
 
 pub fn compile_program(
@@ -145,6 +149,7 @@ pub fn compile_program(
         states: Vec::new(),
         from_owner: None,
         empty_list_cell,
+        lambda_names: FxHashMap::default(),
     };
     // Chunk 0 = entry.
     c.push_state(0, NO_POS, Symbol(0));
@@ -452,14 +457,30 @@ impl<'a> Compiler<'a> {
                 let text = jinx_syntax::show::show(self.exprs, self.symbols, cond);
                 self.prog.texts.push(text);
                 let t = (self.prog.texts.len() - 1) as u32;
+                // If the condition is `a == b`, mirror ExprAssert's special
+                // case: re-evaluate both sides and run assertEqValues to build
+                // a detailed inequality message before the generic failure.
+                if let Expr::OpEq(a, b) = self.exprs.get(cond) {
+                    let (a, b) = (*a, *b);
+                    self.compile_expr(a);
+                    self.compile_expr(b);
+                    self.emit(Op::AssertEq(t), pos);
+                    self.bump(-2);
+                }
                 self.emit(Op::AssertFail(t), pos);
                 self.patch_jump(jt);
                 self.compile_expr(body);
             }
             Expr::OpNot(e) => {
                 let e = *e;
-                self.compile_expr(e);
-                self.emit(Op::ForceBool(2), NO_POS);
+                // ExprOpNot::eval forces its argument at `e->getPos()` with
+                // the "in the argument of the not operator" context.
+                let npos = self.expr_pos(e);
+                // Thunk the operand so that `ForceBool`'s error context wraps
+                // its *evaluation* (matching C++ `evalBool`), not just the
+                // final type check.
+                self.compile_maybe_thunk(e, None);
+                self.emit(Op::ForceBool(2), npos);
                 self.emit(Op::Not, NO_POS);
             }
             Expr::OpEq(a, b) => {
@@ -479,14 +500,18 @@ impl<'a> Compiler<'a> {
             Expr::OpAnd(pos, a, b) => self.compile_bool_op(*pos, *a, *b, 3, 4, false, false),
             Expr::OpOr(pos, a, b) => self.compile_bool_op(*pos, *a, *b, 5, 6, true, true),
             Expr::OpImpl(pos, a, b) => self.compile_bool_op(*pos, *a, *b, 7, 8, false, true),
-            Expr::OpUpdate(pos, a, b) => {
-                let (pos, a, b) = (*pos, *a, *b);
-                // C++ evaluates the rightmost operand first (UpdateQueue).
-                self.compile_expr(b);
-                self.emit(Op::ForceAttrs(10), pos);
-                self.compile_expr(a);
-                self.emit(Op::ForceAttrs(9), pos);
-                self.emit(Op::Update, pos);
+            Expr::OpUpdate(_pos, a, b) => {
+                let (a, b) = (*a, *b);
+                // C++ `evalForUpdate` wraps each operand's *evaluation* (via
+                // `evalAttrs`) with its error context at the operand's own
+                // position, evaluating the rightmost operand first. Thunk the
+                // operands so eager errors are caught by `ForceAttrs`.
+                let (pa, pb) = (self.expr_pos(a), self.expr_pos(b));
+                self.compile_maybe_thunk(b, None);
+                self.emit(Op::ForceAttrs(10), pb);
+                self.compile_maybe_thunk(a, None);
+                self.emit(Op::ForceAttrs(9), pa);
+                self.emit(Op::Update, NO_POS);
                 self.bump(-1);
             }
             Expr::OpConcatLists(pos, a, b) => {
@@ -527,6 +552,31 @@ impl<'a> Compiler<'a> {
     fn lambda_pos(&self, id: ExprId) -> PosIdx {
         match self.exprs.get(id) {
             Expr::Lambda(l) => l.pos,
+            _ => NO_POS,
+        }
+    }
+
+    /// Port of the per-node `Expr::getPos()` overrides (nixexpr.hh), used
+    /// where C++ threads an expression's own position into a trace/force.
+    fn expr_pos(&self, id: ExprId) -> PosIdx {
+        match self.exprs.get(id) {
+            Expr::Var { pos, .. } => *pos,
+            Expr::Select { pos, .. } => *pos,
+            Expr::OpHasAttr { e, .. } => self.expr_pos(*e),
+            Expr::Attrs(a) => a.pos,
+            Expr::List(elems) => elems.first().map(|e| self.expr_pos(*e)).unwrap_or(NO_POS),
+            Expr::Lambda(l) => l.pos,
+            Expr::Call { pos, .. } => *pos,
+            Expr::If { pos, .. } => *pos,
+            Expr::Assert { pos, .. } => *pos,
+            Expr::OpNot(e) => self.expr_pos(*e),
+            Expr::OpAnd(pos, ..)
+            | Expr::OpOr(pos, ..)
+            | Expr::OpImpl(pos, ..)
+            | Expr::OpUpdate(pos, ..)
+            | Expr::OpConcatLists(pos, ..) => *pos,
+            Expr::ConcatStrings { pos, .. } => *pos,
+            Expr::CurPos(pos) => *pos,
             _ => NO_POS,
         }
     }
@@ -704,15 +754,42 @@ impl<'a> Compiler<'a> {
         } else {
             for an in &attrpath {
                 if let Some(de) = an.expr {
+                    // The dynamic name is forced at its own position (C++
+                    // `getName` uses `name.expr->getPos()`).
+                    let dpos = self.expr_pos(de);
                     self.compile_expr(de);
-                    self.emit(Op::SelectDyn, pos);
+                    self.emit(Op::SelectDyn, dpos);
                     self.bump(-1);
                 } else {
                     self.emit(Op::Select(an.symbol.0), pos);
                 }
             }
-            self.emit(Op::Force, pos);
+            match self.static_attr_path_text(&attrpath) {
+                Some(text) => {
+                    self.prog.texts.push(text);
+                    let t = (self.prog.texts.len() - 1) as u32;
+                    self.emit(Op::SelectForce(t), pos);
+                }
+                // Paths with dynamic components: no attribute frame for now.
+                None => self.emit(Op::Force, pos),
+            }
         }
+    }
+
+    /// The `showAttrSelectionPath` string for an all-static attr path
+    /// (dotted symbol names). Returns `None` if any component is dynamic.
+    fn static_attr_path_text(&self, attrpath: &[AttrName]) -> Option<Vec<u8>> {
+        let mut out: Vec<u8> = Vec::new();
+        for (i, an) in attrpath.iter().enumerate() {
+            if an.expr.is_some() {
+                return None;
+            }
+            if i > 0 {
+                out.push(b'.');
+            }
+            out.extend_from_slice(self.symbols.resolve(an.symbol));
+        }
+        Some(out)
     }
 
     fn emit_jump_sel(&mut self, sym: Symbol, pos: PosIdx) -> usize {
@@ -745,12 +822,32 @@ impl<'a> Compiler<'a> {
 
     // ---------------- lambdas ----------------
 
+    /// Port of `ExprLambda::setName`: when a lambda is bound directly to an
+    /// attr/let name, it (and its curried body chain) takes that name.
+    fn register_lambda_name(&mut self, e: ExprId, sym: Symbol) {
+        let mut cur = e;
+        loop {
+            match self.exprs.get(cur) {
+                Expr::Lambda(l) => {
+                    self.lambda_names.insert(cur.0, sym);
+                    cur = l.body;
+                }
+                _ => break,
+            }
+        }
+    }
+
     fn compile_lambda(&mut self, id: ExprId) -> u32 {
         let l = match self.exprs.get(id) {
             Expr::Lambda(l) => l,
             _ => unreachable!(),
         };
-        let (pos, name, arg) = (l.pos, l.name, l.arg);
+        let (pos, mut name, arg) = (l.pos, l.name, l.arg);
+        if !name.is_set() {
+            if let Some(s) = self.lambda_names.get(&id.0) {
+                name = *s;
+            }
+        }
         let formals = l.formals.clone();
         let body = l.body;
 
@@ -851,6 +948,11 @@ impl<'a> Compiler<'a> {
     }
 
     fn fill_bindings(&mut self, names: &[(Symbol, AttrDef)], owner: u32, start: u32) {
+        for (sym, def) in names {
+            if matches!(def.kind, AttrDefKind::Plain | AttrDefKind::InheritedFrom) {
+                self.register_lambda_name(def.e, *sym);
+            }
+        }
         for (i, (sym, def)) in names.iter().enumerate() {
             let slot = start + i as u32;
             match def.kind {
@@ -906,6 +1008,12 @@ impl<'a> Compiler<'a> {
         };
         self.prog.attrs_descs.push(desc);
         let desc_id = (self.prog.attrs_descs.len() - 1) as u32;
+
+        for (sym, def) in &names {
+            if matches!(def.kind, AttrDefKind::Plain | AttrDefKind::InheritedFrom) {
+                self.register_lambda_name(def.e, *sym);
+            }
+        }
 
         if recursive {
             let has_overrides = names.iter().any(|(s, _)| {

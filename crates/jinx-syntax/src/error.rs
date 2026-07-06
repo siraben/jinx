@@ -43,6 +43,121 @@ impl ParseError {
     }
 }
 
+/// A single trace frame for [`render_error`], in C++ print order
+/// (outermost first). `text` is the raw hint bytes; `pos` may be [`NO_POS`].
+pub struct RenderFrame {
+    pub pos: PosIdx,
+    pub text: Vec<u8>,
+    /// `TracePrint::Always` — printed even when the trace is truncated.
+    pub always: bool,
+}
+
+/// Port of `printPosMaybe`: append `<indent>at <pos>:` plus the source
+/// excerpt (when available) to `out`. Returns whether a position was shown.
+fn print_pos_maybe(out: &mut Vec<u8>, indent: &[u8], pos: PosIdx, positions: &PosTable) -> bool {
+    if let (Some(p), Some(origin)) = (positions.lookup(pos), positions.origin_of(pos)) {
+        out.extend_from_slice(indent);
+        out.extend_from_slice(format!("at {p}:").as_bytes());
+        out.extend_from_slice(&code_lines(origin, p.line, p.column));
+        out.push(b'\n');
+        true
+    } else {
+        false
+    }
+}
+
+/// Full port of `showErrorInfo` for the `error:` level with `--show-trace`
+/// always on: renders trace frames (with C++ dedup / "duplicate frames
+/// omitted" semantics) followed by the final error message and position.
+///
+/// `frames` are in print order (outermost first). `msg` is the base error
+/// message; `suffix` is appended verbatim after the position block (used for
+/// "Did you mean …?").
+pub fn render_error(
+    msg: &[u8],
+    pos: PosIdx,
+    frames: &[RenderFrame],
+    suffix: &[u8],
+    show_trace: bool,
+    positions: &PosTable,
+) -> Vec<u8> {
+    let mut oss: Vec<u8> = Vec::new();
+
+    // Filter out empty-hint frames up front (C++ `continue`s on them).
+    let frames: Vec<&RenderFrame> = frames.iter().filter(|f| !f.text.is_empty()).collect();
+
+    if !frames.is_empty() {
+        let mut seen: std::collections::HashSet<(u32, Vec<u8>)> = std::collections::HashSet::new();
+        let mut skipped: Vec<&RenderFrame> = Vec::new();
+        let mut count: usize = 0;
+        let mut truncate = false;
+
+        // Appends a frame; returns 1 if it carried a position (which counts
+        // as an extra trace toward the truncation limit), else 0.
+        let print_trace = |out: &mut Vec<u8>, f: &RenderFrame| -> usize {
+            out.push(b'\n');
+            out.extend_from_slice("… ".as_bytes());
+            out.extend_from_slice(&f.text);
+            out.push(b'\n');
+            usize::from(print_pos_maybe(out, b"  ", f.pos, positions))
+        };
+
+        let flush_skipped =
+            |out: &mut Vec<u8>, skipped: &mut Vec<&RenderFrame>, count: &mut usize| {
+                if !skipped.is_empty() {
+                    if skipped.len() <= 5 {
+                        for f in skipped.iter() {
+                            *count += 1;
+                            *count += print_trace(out, f);
+                        }
+                    } else {
+                        out.push(b'\n');
+                        out.extend_from_slice(
+                            format!("({} duplicate frames omitted)", skipped.len()).as_bytes(),
+                        );
+                        out.push(b'\n');
+                    }
+                    skipped.clear();
+                }
+            };
+
+        for f in &frames {
+            if !show_trace && count > 3 {
+                truncate = true;
+            }
+            if !truncate || f.always {
+                let key = (f.pos.0, f.text.clone());
+                if seen.contains(&key) {
+                    skipped.push(f);
+                    continue;
+                }
+                seen.insert(key);
+                flush_skipped(&mut oss, &mut skipped, &mut count);
+                count += 1;
+                count += print_trace(&mut oss, f);
+            }
+        }
+        flush_skipped(&mut oss, &mut skipped, &mut count);
+
+        if truncate {
+            oss.push(b'\n');
+            oss.extend_from_slice(
+                b"(stack trace truncated; use '--show-trace' to show the full, detailed trace)",
+            );
+            oss.push(b'\n');
+        }
+
+        oss.extend_from_slice(b"\nerror: ");
+    }
+
+    oss.extend_from_slice(msg);
+    oss.push(b'\n');
+    print_pos_maybe(&mut oss, b"", pos, positions);
+    oss.extend_from_slice(suffix);
+
+    filter_ansi_escapes(&indent(b"error: ", b"       ", chomp(&oss)))
+}
+
 fn code_lines(origin: &Origin, line: u32, column: u32) -> Vec<u8> {
     let lines = split_lines(origin.source());
     let line = line as usize;

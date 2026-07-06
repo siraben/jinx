@@ -96,22 +96,21 @@ pub fn print_attribute_name(out: &mut Vec<u8>, name: &[u8]) {
 
 pub fn deep_force(vm: &mut VM, cell: VRef) -> Result<(), ErrId> {
     let mut seen: HashSet<usize> = HashSet::new();
-    deep_force_rec(vm, cell, &mut seen, 0)
+    deep_force_rec(vm, cell, &mut seen)
 }
 
-fn deep_force_rec(
-    vm: &mut VM,
-    cell: VRef,
-    seen: &mut HashSet<usize>,
-    depth: usize,
-) -> Result<(), ErrId> {
-    if depth > vm.max_call_depth {
-        return Err(vm.new_err(
-            ErrKind::StackOverflow,
-            "stack overflow; max-call-depth exceeded",
-            NO_POS,
-        ));
-    }
+fn deep_force_rec(vm: &mut VM, cell: VRef, seen: &mut HashSet<usize>) -> Result<(), ErrId> {
+    // C++ `forceValueDeep` accounts each level against the shared call-depth
+    // counter (via `addCallDepth`), so a genuine stack overflow surfaces at
+    // the same place — and with the same position — as function-call depth.
+    vm.depth_check(NO_POS)?;
+    vm.call_depth += 1;
+    let r = deep_force_body(vm, cell, seen);
+    vm.call_depth -= 1;
+    r
+}
+
+fn deep_force_body(vm: &mut VM, cell: VRef, seen: &mut HashSet<usize>) -> Result<(), ErrId> {
     if !seen.insert(cell.as_ptr() as usize) {
         return Ok(());
     }
@@ -120,7 +119,7 @@ fn deep_force_rec(
     match v.tag() {
         Tag::Attrs => {
             for a in attrs_entries(&v) {
-                deep_force_rec(vm, a.val, seen, depth + 1).map_err(|e| {
+                deep_force_rec(vm, a.val, seen).map_err(|e| {
                     let name =
                         String::from_utf8_lossy(vm.symbols.resolve(Symbol(a.sym))).into_owned();
                     vm.add_trace(
@@ -134,7 +133,7 @@ fn deep_force_rec(
         }
         Tag::List => {
             for (i, &el) in list_elems(&v).iter().enumerate() {
-                deep_force_rec(vm, el, seen, depth + 1).map_err(|e| {
+                deep_force_rec(vm, el, seen).map_err(|e| {
                     vm.add_trace(
                         e,
                         NO_POS,
