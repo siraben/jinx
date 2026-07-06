@@ -171,6 +171,8 @@ pub struct VM {
     pub ctx_intern: FxHashMap<Vec<u8>, u32>,
     /// Enabled experimental features (from nix.conf / --extra-experimental-features).
     pub experimental: crate::context::ExperimentalFeatures,
+    /// Compiled-regex cache (`regexCache` in C++), keyed on the pattern bytes.
+    pub regex_cache: FxHashMap<Vec<u8>, std::rc::Rc<crate::regex::Regex>>,
     /// hashDerivationModulo memo (`drvHashes` in C++).
     pub drv_hashes: jinx_store::derivation::DrvHashes,
     /// Derivations produced by `derivationStrict` this run, so that later
@@ -213,6 +215,7 @@ impl VM {
             ctx_elems: Vec::new(),
             ctx_intern: FxHashMap::default(),
             experimental: crate::context::ExperimentalFeatures::default(),
+            regex_cache: FxHashMap::default(),
             drv_hashes: jinx_store::derivation::DrvHashes::default(),
             built_drvs: FxHashMap::default(),
             apply_prog: None,

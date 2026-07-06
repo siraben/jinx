@@ -5,9 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-jinx-eval.workspace = true
 jinx-fetch.workspace = true
 jinx-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-bstr.workspace = true
+regex.workspace = true

@@ -96,10 +96,8 @@ const UNIMPLEMENTED: &[(&str, u8)] = &[
     ("__filterSource", 2),
     ("__forceLazyFetcherAttr", 1),
     ("__importNative", 2),
-    ("__match", 2),
     ("__outputOf", 2),
     ("__path", 1),
-    ("__split", 2),
     ("__storePath", 1),
     ("__toFile", 2),
     ("__toXML", 1),
@@ -201,6 +199,8 @@ pub fn register_globals(vm: &mut VM) {
         Reg { name: "__appendContext", arity: 2, func: prim_append_context },
         Reg { name: "derivationStrict", arity: 1, func: prim_derivation_strict },
         Reg { name: "placeholder", arity: 1, func: prim_placeholder },
+        Reg { name: "__match", arity: 2, func: prim_match },
+        Reg { name: "__split", arity: 2, func: prim_split },
         Reg { name: "__getContext", arity: 1, func: prim_get_context },
         Reg { name: "__hasContext", arity: 1, func: prim_has_context },
     ];
@@ -1846,6 +1846,120 @@ fn derivation_strict_internal(
     result.sort_by_key(|a| a.sym);
     result.dedup_by_key(|a| a.sym);
     let v = vm.new_bindings_value(&result);
+    vm.temp_end(scope);
+    Ok(v)
+}
+
+// ---------------------------------------------------------------------
+// regex: match / split
+// ---------------------------------------------------------------------
+
+fn get_regex(
+    vm: &mut VM,
+    re: &[u8],
+    pos: PosIdx,
+) -> Result<std::rc::Rc<crate::regex::Regex>, ErrId> {
+    if let Some(r) = vm.regex_cache.get(re) {
+        return Ok(r.clone());
+    }
+    match crate::regex::Regex::compile(re) {
+        Ok(r) => {
+            let rc = std::rc::Rc::new(r);
+            vm.regex_cache.insert(re.to_vec(), rc.clone());
+            Ok(rc)
+        }
+        Err(_) => Err(vm.new_err(
+            ErrKind::Eval,
+            format!(
+                "invalid regular expression '{}'",
+                String::from_utf8_lossy(re)
+            ),
+            pos,
+        )),
+    }
+}
+
+fn prim_match(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    let re = vm.force_string_no_ctx(
+        args[0],
+        pos,
+        "while evaluating the first argument passed to builtins.match",
+    )?;
+    // Subject string: context allowed but discarded.
+    let s = vm.force_string(
+        args[1],
+        pos,
+        "while evaluating the second argument passed to builtins.match",
+    )?;
+    let rx = get_regex(vm, &re, pos)?;
+    match rx.match_full(&s) {
+        None => Ok(Value::null()),
+        Some(groups) => {
+            let scope = vm.temp_scope();
+            let mut cells: Vec<VRef> = Vec::with_capacity(groups.len());
+            for g in &groups {
+                let c = match g {
+                    Some((a, b)) => {
+                        let sv = mk_string(vm, &s[*a..*b]);
+                        temp_cell(vm, sv)
+                    }
+                    None => vm.null_cell,
+                };
+                cells.push(c);
+            }
+            let v = vm.new_list_value(&cells);
+            vm.temp_end(scope);
+            Ok(v)
+        }
+    }
+}
+
+fn prim_split(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    let re = vm.force_string_no_ctx(
+        args[0],
+        pos,
+        "while evaluating the first argument passed to builtins.split",
+    )?;
+    let s = vm.force_string(
+        args[1],
+        pos,
+        "while evaluating the second argument passed to builtins.split",
+    )?;
+    let rx = get_regex(vm, &re, pos)?;
+    let matches = rx.find_iter(&s);
+    if matches.is_empty() {
+        // Return [ str ] preserving the original value (and its context).
+        return Ok(vm.new_list_value(&[args[1]]));
+    }
+    let scope = vm.temp_scope();
+    let mut cells: Vec<VRef> = Vec::with_capacity(2 * matches.len() + 1);
+    let mut last = 0usize;
+    for (mi, m) in matches.iter().enumerate() {
+        // Non-matching prefix segment.
+        let seg = mk_string(vm, &s[last..m.start]);
+        cells.push(temp_cell(vm, seg));
+        // Capture-group sublist.
+        let mut groups: Vec<VRef> = Vec::with_capacity(m.groups.len());
+        for g in &m.groups {
+            let c = match g {
+                Some((a, b)) => {
+                    let sv = mk_string(vm, &s[*a..*b]);
+                    temp_cell(vm, sv)
+                }
+                None => vm.null_cell,
+            };
+            groups.push(c);
+        }
+        let lv = vm.new_list_value(&groups);
+        cells.push(temp_cell(vm, lv));
+        last = m.end;
+        // Trailing suffix after the last match.
+        if mi + 1 == matches.len() {
+            let seg = mk_string(vm, &s[last..]);
+            cells.push(temp_cell(vm, seg));
+        }
+    }
+    let v = vm.new_list_value(&cells);
     vm.temp_end(scope);
     Ok(v)
 }
