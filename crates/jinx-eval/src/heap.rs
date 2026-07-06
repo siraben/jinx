@@ -337,6 +337,16 @@ impl Marker<'_> {
         }
     }
 
+    /// Mark a value held by-copy in VM structures (frames, constants): its
+    /// payload data object (if any) is marked directly, without needing the
+    /// value to live in a heap cell.
+    #[inline]
+    pub fn mark_value(&mut self, v: &Value) {
+        if v.has_heap_payload() {
+            self.mark_data(v.ptr());
+        }
+    }
+
     /// Mark a data object (header pointer) live; trace its outgoing cells.
     fn mark_data(&mut self, p: *mut u64) {
         if p.is_null() {

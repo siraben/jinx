@@ -159,9 +159,23 @@ impl<'p> Env<'p> {
 }
 
 pub fn bind_vars(exprs: &Exprs, root: ExprId, symbols: &mut SymbolTable) -> Result<(), ParseError> {
+    bind_vars_extra(exprs, root, symbols, &[])
+}
+
+/// `bind_vars` with additional global names (used by `scopedImport`, whose
+/// scope attrs extend the static base environment).
+pub fn bind_vars_extra(
+    exprs: &Exprs,
+    root: ExprId,
+    symbols: &mut SymbolTable,
+    extra: &[Symbol],
+) -> Result<(), ParseError> {
     let mut base_vars = FxHashSet::default();
     for g in GLOBALS {
         base_vars.insert(symbols.create(g.as_bytes()));
+    }
+    for &s in extra {
+        base_vars.insert(s);
     }
     let base = Env {
         up: None,
