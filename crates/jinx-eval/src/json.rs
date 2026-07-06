@@ -91,7 +91,23 @@ fn json_string(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
 }
 
+/// Public wrapper for JSON string escaping (used to build `__json`).
+pub fn json_string_pub(out: &mut Vec<u8>, s: &[u8]) {
+    json_string(out, s);
+}
+
 pub fn to_json(vm: &mut VM, cell: VRef, pos: PosIdx, out: &mut Vec<u8>) -> Result<(), ErrId> {
+    let mut ctx = Vec::new();
+    to_json_ctx(vm, cell, pos, out, &mut ctx)
+}
+
+pub fn to_json_ctx(
+    vm: &mut VM,
+    cell: VRef,
+    pos: PosIdx,
+    out: &mut Vec<u8>,
+    ctx: &mut Vec<u32>,
+) -> Result<(), ErrId> {
     vm.force(cell, pos)?;
     let v = val(cell);
     match v.tag() {
@@ -100,15 +116,22 @@ pub fn to_json(vm: &mut VM, cell: VRef, pos: PosIdx, out: &mut Vec<u8>) -> Resul
         Tag::True => out.extend_from_slice(b"true"),
         Tag::False => out.extend_from_slice(b"false"),
         Tag::Null => out.extend_from_slice(b"null"),
-        Tag::String => json_string(out, str_bytes(&v)),
+        Tag::String => {
+            json_string(out, str_bytes(&v));
+            for id in vm.read_str_ctx(&v) {
+                if !ctx.contains(&id) {
+                    ctx.push(id);
+                }
+            }
+        }
         Tag::Path => {
             // C++ copies the path to the store here (copyToStore=true).
-            let e = vm.new_err(
-                ErrKind::Eval,
-                "cannot copy paths to the Nix store in jinx M2 (builtins.toJSON of a path)",
-                pos,
-            );
-            return Err(e);
+            let path = crate::vm::path_bytes(&v).to_vec();
+            let (printed, id) = vm.copy_path_to_store(&path, pos)?;
+            json_string(out, &printed);
+            if !ctx.contains(&id) {
+                ctx.push(id);
+            }
         }
         Tag::Attrs => {
             // __toString / outPath handling.
@@ -117,7 +140,7 @@ pub fn to_json(vm: &mut VM, cell: VRef, pos: PosIdx, out: &mut Vec<u8>) -> Resul
                 let rc = vm.alloc_cell(r);
                 let scope = vm.temp_scope();
                 vm.temp_roots.push(rc);
-                let (s, _) = vm.coerce_to_string(
+                let (s, sctx) = vm.coerce_to_string(
                     rc,
                     pos,
                     "while evaluating the result of the `__toString` attribute",
@@ -127,10 +150,15 @@ pub fn to_json(vm: &mut VM, cell: VRef, pos: PosIdx, out: &mut Vec<u8>) -> Resul
                 )?;
                 vm.temp_end(scope);
                 json_string(out, &s);
+                for id in sctx {
+                    if !ctx.contains(&id) {
+                        ctx.push(id);
+                    }
+                }
                 return Ok(());
             }
             if let Some(op) = crate::vm::attrs_get(&v, vm.syms.out_path) {
-                return to_json(vm, op.val, PosIdx(op.pos), out);
+                return to_json_ctx(vm, op.val, PosIdx(op.pos), out, ctx);
             }
             let mut sorted: Vec<(Vec<u8>, VRef, u32)> = attrs_entries(&v)
                 .iter()
@@ -144,7 +172,7 @@ pub fn to_json(vm: &mut VM, cell: VRef, pos: PosIdx, out: &mut Vec<u8>) -> Resul
                 }
                 json_string(out, name);
                 out.push(b':');
-                to_json(vm, *vc, PosIdx(*apos), out).map_err(|e| {
+                to_json_ctx(vm, *vc, PosIdx(*apos), out, ctx).map_err(|e| {
                     vm.add_trace(
                         e,
                         PosIdx(*apos),
@@ -164,7 +192,7 @@ pub fn to_json(vm: &mut VM, cell: VRef, pos: PosIdx, out: &mut Vec<u8>) -> Resul
                 if i > 0 {
                     out.push(b',');
                 }
-                to_json(vm, el, pos, out).map_err(|e| {
+                to_json_ctx(vm, el, pos, out, ctx).map_err(|e| {
                     vm.add_trace(
                         e,
                         pos,

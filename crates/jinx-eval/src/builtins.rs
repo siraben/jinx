@@ -84,16 +84,12 @@ fn unimplemented(vm: &mut VM, def: &'static PrimOpDef, _args: &[VRef], pos: PosI
 }
 
 const UNIMPLEMENTED: &[(&str, u8)] = &[
-    ("derivationStrict", 1),
     ("fetchFinalTree", 1),
     ("fetchGit", 1),
     ("fetchMercurial", 1),
     ("fetchTarball", 1),
     ("fetchTree", 1),
     ("fromTOML", 1),
-    ("placeholder", 1),
-    ("__addDrvOutputDependencies", 1),
-    ("__appendContext", 2),
     ("__exec", 1),
     ("__fetchClosure", 1),
     ("__fetchurl", 1),
@@ -107,7 +103,6 @@ const UNIMPLEMENTED: &[(&str, u8)] = &[
     ("__storePath", 1),
     ("__toFile", 2),
     ("__toXML", 1),
-    ("__unsafeDiscardOutputDependency", 1),
     // flakes (experimental): present in `builtins` so failures are clearly
     // "not implemented" rather than "attribute missing".
     ("parseFlakeRef", 1),
@@ -201,6 +196,11 @@ pub fn register_globals(vm: &mut VM) {
         Reg { name: "__hashFile", arity: 2, func: prim_hash_file },
         Reg { name: "__convertHash", arity: 1, func: prim_convert_hash },
         Reg { name: "__unsafeDiscardStringContext", arity: 1, func: prim_discard_context },
+        Reg { name: "__unsafeDiscardOutputDependency", arity: 1, func: prim_discard_output_dependency },
+        Reg { name: "__addDrvOutputDependencies", arity: 1, func: prim_add_drv_output_dependencies },
+        Reg { name: "__appendContext", arity: 2, func: prim_append_context },
+        Reg { name: "derivationStrict", arity: 1, func: prim_derivation_strict },
+        Reg { name: "placeholder", arity: 1, func: prim_placeholder },
         Reg { name: "__getContext", arity: 1, func: prim_get_context },
         Reg { name: "__hasContext", arity: 1, func: prim_has_context },
     ];
@@ -1039,12 +1039,85 @@ fn prim_discard_context(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
 }
 
 fn prim_get_context(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    use crate::context::ContextElem;
+    use std::collections::{BTreeMap, BTreeSet};
     vm.force_string(
         args[0],
         pos,
         "while evaluating the argument passed to builtins.getContext",
     )?;
-    Ok(vm.new_bindings_value(&[]))
+    #[derive(Default)]
+    struct Info {
+        path: bool,
+        all_outputs: bool,
+        outputs: BTreeSet<Vec<u8>>,
+    }
+    // Keyed by store-path base name (C++ orders a std::map<StorePath,...>).
+    let mut infos: BTreeMap<Vec<u8>, Info> = BTreeMap::new();
+    for id in vm.read_str_ctx(&val(args[0])) {
+        match vm.ctx_elem(id) {
+            ContextElem::Opaque { path } => infos.entry(path).or_default().path = true,
+            ContextElem::DrvDeep { drv_path } => {
+                infos.entry(drv_path).or_default().all_outputs = true
+            }
+            ContextElem::Built { drv_path, output } => {
+                infos.entry(drv_path).or_default().outputs.insert(output);
+            }
+        }
+    }
+    let store = vm.store();
+    let scope = vm.temp_scope();
+    let mut entries: Vec<Attr> = Vec::with_capacity(infos.len());
+    for (base, info) in &infos {
+        // Inner attrset { allOutputs?; outputs?; path?; }.
+        let mut inner: Vec<Attr> = Vec::new();
+        if info.all_outputs {
+            inner.push(Attr {
+                sym: vm.symbols.create(b"allOutputs").0,
+                pos: 0,
+                val: vm.true_cell,
+            });
+        }
+        if !info.outputs.is_empty() {
+            let mut outs: Vec<VRef> = Vec::with_capacity(info.outputs.len());
+            for o in &info.outputs {
+                let sv = mk_string(vm, o);
+                outs.push(temp_cell(vm, sv));
+            }
+            let lv = vm.new_list_value(&outs);
+            inner.push(Attr {
+                sym: vm.symbols.create(b"outputs").0,
+                pos: 0,
+                val: temp_cell(vm, lv),
+            });
+        }
+        if info.path {
+            inner.push(Attr {
+                sym: vm.symbols.create(b"path").0,
+                pos: 0,
+                val: vm.true_cell,
+            });
+        }
+        inner.sort_by_key(|a| a.sym);
+        let iv = vm.new_bindings_value(&inner);
+        let ic = temp_cell(vm, iv);
+        // `base` is a store-path base name; reconstruct the full path key.
+        let sp = match jinx_store::store_path::StorePath::new(&String::from_utf8_lossy(base)) {
+            Ok(sp) => sp,
+            Err(_) => continue,
+        };
+        let key = store.print_store_path(&sp);
+        entries.push(Attr {
+            sym: vm.symbols.create(key.as_bytes()).0,
+            pos: 0,
+            val: ic,
+        });
+    }
+    entries.sort_by_key(|a| a.sym);
+    entries.dedup_by_key(|a| a.sym);
+    let v = vm.new_bindings_value(&entries);
+    vm.temp_end(scope);
+    Ok(v)
 }
 
 fn prim_has_context(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
@@ -1054,6 +1127,803 @@ fn prim_has_context(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: Pos
         "while evaluating the argument passed to builtins.hasContext",
     )?;
     Ok(Value::bool(!str_ctx(&val(args[0])).is_null()))
+}
+
+/// isDerivation on a store-path string: ends in `.drv`.
+fn ctx_is_derivation(name: &[u8]) -> bool {
+    name.ends_with(b".drv")
+}
+
+fn prim_append_context(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    use crate::context::ContextElem;
+    vm.force_string(
+        args[0],
+        pos,
+        "while evaluating the first argument passed to builtins.appendContext",
+    )?;
+    let orig = str_bytes(&val(args[0])).to_vec();
+    let mut ids = vm.read_str_ctx(&val(args[0]));
+    vm.force_attrs(
+        args[1],
+        pos,
+        "while evaluating the second argument passed to builtins.appendContext",
+    )?;
+    let store = vm.store();
+    let entries = attrs_entries(&val(args[1])).to_vec();
+    for a in &entries {
+        let name = vm.symbols.resolve(Symbol(a.sym)).to_vec();
+        let name_str = String::from_utf8_lossy(&name).into_owned();
+        let sp = match store.parse_store_path(&name_str) {
+            Ok(sp) => sp,
+            Err(_) => {
+                let e = vm.new_err(
+                    ErrKind::Eval,
+                    format!("context key '{name_str}' is not a store path"),
+                    PosIdx(a.pos),
+                );
+                return Err(e);
+            }
+        };
+        let base = sp.to_string().as_bytes().to_vec();
+        vm.force_attrs(a.val, PosIdx(a.pos), "while evaluating the value of a string context")?;
+        let av = val(a.val);
+        if let Some(pa) = attrs_get(&av, vm.symbols.create(b"path")) {
+            let b = vm.force_bool(
+                pa.val,
+                PosIdx(pa.pos),
+                "while evaluating the `path` attribute of a string context",
+            )?;
+            if b {
+                ids.push(vm.intern_elem(&ContextElem::Opaque { path: base.clone() }));
+            }
+        }
+        let av = val(a.val);
+        if let Some(aa) = attrs_get(&av, vm.symbols.create(b"allOutputs")) {
+            let b = vm.force_bool(
+                aa.val,
+                PosIdx(aa.pos),
+                "while evaluating the `allOutputs` attribute of a string context",
+            )?;
+            if b {
+                if !ctx_is_derivation(&base) {
+                    let e = vm.new_err(
+                        ErrKind::Eval,
+                        format!(
+                            "tried to add all-outputs context of {name_str}, which is not a derivation, to a string"
+                        ),
+                        PosIdx(a.pos),
+                    );
+                    return Err(e);
+                }
+                ids.push(vm.intern_elem(&ContextElem::DrvDeep {
+                    drv_path: base.clone(),
+                }));
+            }
+        }
+        let av = val(a.val);
+        if let Some(oa) = attrs_get(&av, vm.symbols.create(b"outputs")) {
+            vm.force_list(
+                oa.val,
+                PosIdx(oa.pos),
+                "while evaluating the `outputs` attribute of a string context",
+            )?;
+            let outs = list_elems(&val(oa.val)).to_vec();
+            if !outs.is_empty() && !ctx_is_derivation(&base) {
+                let e = vm.new_err(
+                    ErrKind::Eval,
+                    format!(
+                        "tried to add derivation output context of {name_str}, which is not a derivation, to a string"
+                    ),
+                    PosIdx(a.pos),
+                );
+                return Err(e);
+            }
+            for o in &outs {
+                let out = vm.force_string_no_ctx(
+                    *o,
+                    PosIdx(oa.pos),
+                    "while evaluating an output name within a string context",
+                )?;
+                ids.push(vm.intern_elem(&ContextElem::Built {
+                    drv_path: base.clone(),
+                    output: out,
+                }));
+            }
+        }
+    }
+    Ok(vm.new_string_ctx(&orig, &dedup_ids(&ids)))
+}
+
+fn prim_discard_output_dependency(
+    vm: &mut VM,
+    _d: &'static PrimOpDef,
+    args: &[VRef],
+    pos: PosIdx,
+) -> R {
+    use crate::context::ContextElem;
+    let (s, ids) = vm.coerce_to_string(
+        args[0],
+        pos,
+        "while evaluating the argument passed to builtins.unsafeDiscardOutputDependency",
+        false,
+        false,
+        true,
+    )?;
+    let mut out: Vec<u32> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let e = vm.ctx_elem(id);
+        let ne = match e {
+            ContextElem::DrvDeep { drv_path } => ContextElem::Opaque { path: drv_path },
+            other => other,
+        };
+        out.push(vm.intern_elem(&ne));
+    }
+    Ok(vm.new_string_ctx(&s, &dedup_ids(&out)))
+}
+
+fn prim_add_drv_output_dependencies(
+    vm: &mut VM,
+    _d: &'static PrimOpDef,
+    args: &[VRef],
+    pos: PosIdx,
+) -> R {
+    use crate::context::ContextElem;
+    let (s, ids) = vm.coerce_to_string(
+        args[0],
+        pos,
+        "while evaluating the argument passed to builtins.addDrvOutputDependencies",
+        false,
+        false,
+        true,
+    )?;
+    if ids.len() != 1 {
+        let e = vm.new_err(
+            ErrKind::Eval,
+            format!(
+                "context of string '{}' must have exactly one element, but has {}",
+                String::from_utf8_lossy(&s),
+                ids.len()
+            ),
+            pos,
+        );
+        return Err(e);
+    }
+    let store = vm.store();
+    let ne = match vm.ctx_elem(ids[0]) {
+        ContextElem::Opaque { path } => {
+            if !ctx_is_derivation(&path) {
+                let printed = jinx_store::store_path::StorePath::new(&String::from_utf8_lossy(&path))
+                    .map(|sp| store.print_store_path(&sp))
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&path).into_owned());
+                let e = vm.new_err(
+                    ErrKind::Eval,
+                    format!("path '{printed}' is not a derivation"),
+                    pos,
+                );
+                return Err(e);
+            }
+            ContextElem::DrvDeep { drv_path: path }
+        }
+        ContextElem::Built { output, .. } => {
+            let e = vm.new_err(
+                ErrKind::Eval,
+                format!(
+                    "`addDrvOutputDependencies` can only act on derivations, not on a derivation output such as '{}'",
+                    String::from_utf8_lossy(&output)
+                ),
+                pos,
+            );
+            return Err(e);
+        }
+        deep @ ContextElem::DrvDeep { .. } => deep,
+    };
+    let id = vm.intern_elem(&ne);
+    Ok(vm.new_string_ctx(&s, &[id]))
+}
+
+/// Deduplicate context ids preserving first-seen order.
+fn dedup_ids(ids: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// derivationStrict / placeholder
+// ---------------------------------------------------------------------
+
+/// `hashPlaceholder(name)` = `/` + nix32(sha256("nix-output:" + name)).
+fn hash_placeholder(output_name: &[u8]) -> Vec<u8> {
+    let mut clear = b"nix-output:".to_vec();
+    clear.extend_from_slice(output_name);
+    let h = hash_string(HashAlgorithm::Sha256, &clear);
+    let mut out = vec![b'/'];
+    out.extend_from_slice(h.to_string(HashFormat::Nix32, false).as_bytes());
+    out
+}
+
+fn prim_placeholder(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    let name = vm.force_string_no_ctx(
+        args[0],
+        pos,
+        "while evaluating the first argument passed to builtins.placeholder",
+    )?;
+    Ok(mk_string(vm, &hash_placeholder(&name)))
+}
+
+fn prim_derivation_strict(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    vm.force_attrs(
+        args[0],
+        pos,
+        "while evaluating the argument passed to builtins.derivationStrict",
+    )?;
+    let av = val(args[0]);
+    let name_attr = match attrs_get(&av, vm.syms.name) {
+        Some(a) => a,
+        None => {
+            let e = vm.new_err(
+                ErrKind::Type,
+                "attribute 'name' missing",
+                pos,
+            );
+            vm.add_trace(e, pos, "in the attrset passed as argument to builtins.derivationStrict");
+            return Err(e);
+        }
+    };
+    let name_pos = PosIdx(name_attr.pos);
+    let drv_name = vm.force_string_no_ctx(
+        name_attr.val,
+        pos,
+        "while evaluating the `name` attribute passed to builtins.derivationStrict",
+    )?;
+    let r = derivation_strict_internal(vm, &drv_name, args[0], pos);
+    r.map_err(|e| {
+        let loc = vm
+            .positions
+            .lookup(name_pos)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "«none»".to_string());
+        vm.add_trace(
+            e,
+            NO_POS,
+            format!(
+                "while evaluating derivation '{}'\n  whose name attribute is located at {}",
+                String::from_utf8_lossy(&drv_name),
+                loc
+            ),
+        );
+        e
+    })
+}
+
+fn derivation_strict_internal(
+    vm: &mut VM,
+    drv_name: &[u8],
+    attrs_cell: VRef,
+    pos: PosIdx,
+) -> R {
+    use jinx_store::derivation::{
+        hash_derivation_modulo, Derivation, DerivationOutput, DrvError, DrvHashModulo,
+    };
+    use jinx_store::store_path::{
+        ContentAddress, ContentAddressMethod, FileIngestionMethod, StorePath,
+    };
+
+    let drv_name_s = String::from_utf8_lossy(drv_name).into_owned();
+    // checkDerivationName.
+    if let Err(e) = jinx_store::store_path::check_name(&drv_name_s) {
+        return Err(vm.new_err(
+            ErrKind::Eval,
+            format!("invalid derivation name: {}. Please pass a different 'name'.", e.0),
+            pos,
+        ));
+    }
+
+    // Special control attributes.
+    let av = val(attrs_cell);
+    let structured = match attrs_get(&av, vm.symbols.create(b"__structuredAttrs")) {
+        Some(a) => vm.force_bool(
+            a.val,
+            pos,
+            "while evaluating the `__structuredAttrs` attribute passed to builtins.derivationStrict",
+        )?,
+        None => false,
+    };
+    let av = val(attrs_cell);
+    let ignore_nulls = match attrs_get(&av, vm.symbols.create(b"__ignoreNulls")) {
+        Some(a) => vm.force_bool(
+            a.val,
+            pos,
+            "while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict",
+        )?,
+        None => false,
+    };
+
+    let mut drv = Derivation::default();
+    drv.name = drv_name_s.clone();
+    let mut context: Vec<u32> = Vec::new();
+    let mut content_addressed = false;
+    let mut is_impure = false;
+    let mut output_hash: Option<Vec<u8>> = None;
+    let mut output_hash_algo: Option<jinx_store::hash::HashAlgorithm> = None;
+    let mut ingestion_method: Option<ContentAddressMethod> = None;
+    let mut outputs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    outputs.insert("out".to_string());
+    // Collected structuredAttrs JSON members (key -> serialized JSON bytes).
+    let mut json_members: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    // Iterate attrs in lexicographic (symbol string) order.
+    let entries = attrs_entries(&val(attrs_cell)).to_vec();
+    let mut ordered: Vec<(Vec<u8>, Attr)> = entries
+        .iter()
+        .map(|a| (vm.symbols.resolve(Symbol(a.sym)).to_vec(), *a))
+        .collect();
+    ordered.sort_by(|x, y| x.0.cmp(&y.0));
+
+    let ign = vm.symbols.create(b"__ignoreNulls");
+    for (key, a) in &ordered {
+        if a.sym == ign.0 {
+            continue;
+        }
+        let apos = PosIdx(a.pos);
+        // __ignoreNulls: drop null-valued attrs entirely.
+        if ignore_nulls {
+            vm.force(a.val, apos)?;
+            if val(a.val).tag() == Tag::Null {
+                continue;
+            }
+        }
+        match key.as_slice() {
+            b"__structuredAttrs" => continue,
+            b"__contentAddressed" => {
+                content_addressed = vm.force_bool(
+                    a.val,
+                    apos,
+                    "while evaluating the `__contentAddressed` attribute passed to builtins.derivationStrict",
+                )?;
+                if content_addressed && !vm.experimental.ca_derivations {
+                    return Err(vm.new_err(
+                        ErrKind::Eval,
+                        "experimental Nix feature 'ca-derivations' is disabled; add '--extra-experimental-features ca-derivations' to enable it",
+                        pos,
+                    ));
+                }
+                continue;
+            }
+            b"__impure" => {
+                is_impure = vm.force_bool(
+                    a.val,
+                    apos,
+                    "while evaluating the `__impure` attribute passed to builtins.derivationStrict",
+                )?;
+                if is_impure && !vm.experimental.impure_derivations {
+                    return Err(vm.new_err(
+                        ErrKind::Eval,
+                        "experimental Nix feature 'impure-derivations' is disabled; add '--extra-experimental-features impure-derivations' to enable it",
+                        pos,
+                    ));
+                }
+                continue;
+            }
+            b"args" => {
+                vm.force_list(
+                    a.val,
+                    apos,
+                    "while evaluating the `args` attribute passed to builtins.derivationStrict",
+                )?;
+                let elems = list_elems(&val(a.val)).to_vec();
+                for el in &elems {
+                    let (s, cids) = vm.coerce_to_string(
+                        *el,
+                        apos,
+                        "while evaluating an element of the argument list",
+                        true,
+                        true,
+                        true,
+                    )?;
+                    merge_ctx(&mut context, &cids);
+                    drv.args.push(s.into());
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        // A regular attribute.
+        if structured {
+            // Serialize the value into the structuredAttrs JSON.
+            let mut jbuf = Vec::new();
+            crate::json::to_json_ctx(vm, a.val, apos, &mut jbuf, &mut context)?;
+            json_members.push((key.clone(), jbuf));
+            // Warn that structuredAttrs disables these attributes.
+            if let b"allowedReferences" | b"allowedRequisites" | b"disallowedReferences"
+            | b"disallowedRequisites" | b"maxSize" | b"maxClosureSize" = key.as_slice()
+            {
+                let ks = String::from_utf8_lossy(key);
+                emit_warning(&format!(
+                    "In a derivation named '{drv_name_s}', 'structuredAttrs' disables the effect of the derivation attribute '{ks}'; use 'outputChecks.<output>.{ks}' instead"
+                ));
+            }
+            // Also extract typed fields.
+            match key.as_slice() {
+                b"builder" => {
+                    let (s, cids) = coerce_str_ctx(vm, a.val, apos)?;
+                    merge_ctx(&mut context, &cids);
+                    drv.builder = s.into();
+                }
+                b"system" => {
+                    drv.platform =
+                        vm.force_string_no_ctx(a.val, apos, "")?.into();
+                }
+                b"outputHash" => {
+                    output_hash = Some(vm.force_string_no_ctx(a.val, apos, "")?);
+                }
+                b"outputHashAlgo" => {
+                    let s = vm.force_string_no_ctx(a.val, apos, "")?;
+                    output_hash_algo =
+                        jinx_store::hash::HashAlgorithm::parse_opt(&String::from_utf8_lossy(&s));
+                }
+                b"outputHashMode" => {
+                    let s = vm.force_string_no_ctx(a.val, apos, "")?;
+                    ingestion_method = Some(handle_hash_mode(vm, &s, pos)?);
+                }
+                b"outputs" => {
+                    vm.force_list(a.val, apos, "")?;
+                    let elems = list_elems(&val(a.val)).to_vec();
+                    let mut ss: Vec<Vec<u8>> = Vec::new();
+                    for el in &elems {
+                        ss.push(vm.force_string_no_ctx(*el, apos, "")?);
+                    }
+                    handle_outputs(vm, &ss, &mut outputs, pos)?;
+                }
+                _ => {}
+            }
+        } else {
+            let (s, cids) = vm.coerce_to_string(a.val, apos, "", true, true, true)?;
+            merge_ctx(&mut context, &cids);
+            if key.as_slice() == b"__json" {
+                drv.env.insert(b"__json".as_slice().into(), s.clone().into());
+            } else {
+                drv.env.insert(key.as_slice().into(), s.clone().into());
+                match key.as_slice() {
+                    b"builder" => drv.builder = s.into(),
+                    b"system" => drv.platform = s.into(),
+                    b"outputHash" => output_hash = Some(s),
+                    b"outputHashAlgo" => {
+                        output_hash_algo = jinx_store::hash::HashAlgorithm::parse_opt(
+                            &String::from_utf8_lossy(&s),
+                        )
+                    }
+                    b"outputHashMode" => ingestion_method = Some(handle_hash_mode(vm, &s, pos)?),
+                    b"outputs" => {
+                        let ss: Vec<Vec<u8>> = s
+                            .split(|c| c.is_ascii_whitespace())
+                            .filter(|x| !x.is_empty())
+                            .map(|x| x.to_vec())
+                            .collect();
+                        handle_outputs(vm, &ss, &mut outputs, pos)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Finish structuredAttrs: build the __json env var.
+    if structured {
+        json_members.sort_by(|x, y| x.0.cmp(&y.0));
+        let mut jbuf = vec![b'{'];
+        for (i, (k, v)) in json_members.iter().enumerate() {
+            if i > 0 {
+                jbuf.push(b',');
+            }
+            crate::json::json_string_pub(&mut jbuf, k);
+            jbuf.push(b':');
+            jbuf.extend_from_slice(v);
+        }
+        jbuf.push(b'}');
+        drv.env.insert(b"__json".as_slice().into(), jbuf.into());
+    }
+
+    // Context -> inputs. Context paths are store-path base names.
+    let store = vm.store();
+    let sp_from_base = |b: &[u8]| StorePath::new(&String::from_utf8_lossy(b));
+    for id in &context {
+        match vm.ctx_elem(*id) {
+            crate::context::ContextElem::Built { drv_path, output } => {
+                if let Ok(sp) = sp_from_base(&drv_path) {
+                    drv.input_drvs
+                        .map
+                        .entry(sp)
+                        .or_default()
+                        .value
+                        .insert(String::from_utf8_lossy(&output).into_owned());
+                }
+            }
+            crate::context::ContextElem::Opaque { path } => {
+                if let Ok(sp) = sp_from_base(&path) {
+                    drv.input_srcs.insert(sp);
+                }
+            }
+            crate::context::ContextElem::DrvDeep { drv_path } => {
+                if let Ok(sp) = sp_from_base(&drv_path) {
+                    // Depend on all outputs of the referenced derivation.
+                    if let Some(d) = vm.built_drvs.get(&sp).cloned() {
+                        drv.input_srcs.insert(sp.clone());
+                        let outs: std::collections::BTreeSet<String> =
+                            d.outputs.keys().cloned().collect();
+                        drv.input_drvs.map.entry(sp).or_default().value = outs;
+                    } else {
+                        drv.input_srcs.insert(sp);
+                    }
+                }
+            }
+        }
+    }
+
+    // Required attributes.
+    if drv.builder.is_empty() {
+        return Err(vm.new_err(ErrKind::Eval, "required attribute 'builder' missing", pos));
+    }
+    if drv.platform.is_empty() {
+        return Err(vm.new_err(ErrKind::Eval, "required attribute 'system' missing", pos));
+    }
+    if drv_name.ends_with(b".drv")
+        && !(ingestion_method == Some(ContentAddressMethod::Text)
+            && outputs.len() == 1
+            && outputs.iter().next().map(|s| s.as_str()) == Some("out"))
+    {
+        return Err(vm.new_err(
+            ErrKind::Eval,
+            "derivation names are allowed to end in '.drv' only if they produce a single derivation file",
+            pos,
+        ));
+    }
+
+    // Output computation.
+    if let Some(oh) = &output_hash {
+        // Fixed-output.
+        if outputs.len() != 1 || outputs.iter().next().map(|s| s.as_str()) != Some("out") {
+            return Err(vm.new_err(
+                ErrKind::Eval,
+                "multiple outputs are not supported in fixed-output derivations",
+                pos,
+            ));
+        }
+        let h = jinx_store::hash::Hash::parse_any(&String::from_utf8_lossy(oh), output_hash_algo)
+            .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?;
+        let method = ingestion_method.unwrap_or(ContentAddressMethod::Flat);
+        let ca = ContentAddress { method, hash: h };
+        let dof = DerivationOutput::CAFixed { ca: ca.clone() };
+        let p = dof
+            .path(&store, &drv_name_s, "out")
+            .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?
+            .expect("CAFixed path");
+        drv.env
+            .insert(b"out".as_slice().into(), store.print_store_path(&p).into_bytes().into());
+        drv.outputs.insert("out".to_string(), dof);
+        let _ = FileIngestionMethod::Flat;
+    } else if content_addressed || is_impure {
+        if content_addressed && is_impure {
+            return Err(vm.new_err(
+                ErrKind::Eval,
+                "derivation cannot be both content-addressed and impure",
+                pos,
+            ));
+        }
+        let ha = output_hash_algo.unwrap_or(jinx_store::hash::HashAlgorithm::Sha256);
+        let method = ingestion_method.unwrap_or(ContentAddressMethod::NixArchive);
+        for o in &outputs {
+            drv.env
+                .insert(o.as_bytes().into(), hash_placeholder(o.as_bytes()).into());
+            drv.outputs.insert(
+                o.clone(),
+                if is_impure {
+                    DerivationOutput::Impure {
+                        method,
+                        hash_algo: ha,
+                    }
+                } else {
+                    DerivationOutput::CAFloating {
+                        method,
+                        hash_algo: ha,
+                    }
+                },
+            );
+        }
+    } else {
+        // Input-addressed: two-pass.
+        for o in &outputs {
+            drv.env.insert(o.as_bytes().into(), Vec::new().into());
+            drv.outputs.insert(o.clone(), DerivationOutput::Deferred);
+        }
+        // Compute hashDerivationModulo with masked outputs.
+        let mut memo = std::mem::take(&mut vm.drv_hashes);
+        let built = std::mem::take(&mut vm.built_drvs);
+        let hash_res = {
+            let mut resolver = |p: &StorePath| -> Result<Derivation, DrvError> {
+                built
+                    .get(p)
+                    .cloned()
+                    .ok_or_else(|| DrvError(format!("derivation '{}' is not known", p.to_string())))
+            };
+            hash_derivation_modulo(&store, &mut memo, &mut resolver, &drv, true)
+        };
+        vm.drv_hashes = memo;
+        vm.built_drvs = built;
+        let modulo = hash_res.map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?;
+        let drv_hash = match modulo {
+            DrvHashModulo::DrvHash(h) => h,
+            // Deferred: leave outputs as Deferred (dynamic deps). Not exercised.
+            _ => {
+                return Err(vm.new_err(
+                    ErrKind::Eval,
+                    "jinx: deferred/dynamic derivation outputs are not supported",
+                    pos,
+                ))
+            }
+        };
+        for o in &outputs {
+            let p = store
+                .make_output_path(o, &drv_hash, &drv_name_s)
+                .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?;
+            drv.env
+                .insert(o.as_bytes().into(), store.print_store_path(&p).into_bytes().into());
+            drv.outputs
+                .insert(o.clone(), DerivationOutput::InputAddressed { path: p });
+        }
+    }
+
+    // drvPath (readonly: compute, never write).
+    let drv_path = drv
+        .compute_store_path(&store)
+        .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?;
+
+    // Register the derivation's hash and body for later resolution.
+    {
+        let mut memo = std::mem::take(&mut vm.drv_hashes);
+        let built = std::mem::take(&mut vm.built_drvs);
+        let h = {
+            let mut resolver = |p: &StorePath| -> Result<Derivation, DrvError> {
+                built
+                    .get(p)
+                    .cloned()
+                    .ok_or_else(|| DrvError(format!("derivation '{}' is not known", p.to_string())))
+            };
+            hash_derivation_modulo(&store, &mut memo, &mut resolver, &drv, false)
+        };
+        vm.drv_hashes = memo;
+        vm.built_drvs = built;
+        if let Ok(h) = h {
+            vm.drv_hashes.insert(drv_path.clone(), h);
+        }
+    }
+    vm.built_drvs.insert(drv_path.clone(), drv.clone());
+
+    // Build the result attrset.
+    let drv_path_s = store.print_store_path(&drv_path);
+    let drv_base = drv_path.to_string().as_bytes().to_vec();
+    let scope = vm.temp_scope();
+    let mut result: Vec<Attr> = Vec::with_capacity(1 + drv.outputs.len());
+    // drvPath attr.
+    let dp_ctx = vm.intern_elem(&crate::context::ContextElem::DrvDeep {
+        drv_path: drv_base.clone(),
+    });
+    let dp_val = vm.new_string_ctx(drv_path_s.as_bytes(), &[dp_ctx]);
+    result.push(Attr {
+        sym: vm.syms.drv_path.0,
+        pos: 0,
+        val: temp_cell(vm, dp_val),
+    });
+    // Output attrs.
+    let out_infos: Vec<(String, Vec<u8>)> = drv
+        .outputs
+        .iter()
+        .map(|(name, o)| {
+            let s = match o.path(&store, &drv_name_s, name) {
+                Ok(Some(p)) => store.print_store_path(&p).into_bytes(),
+                _ => hash_placeholder(name.as_bytes()),
+            };
+            (name.clone(), s)
+        })
+        .collect();
+    for (name, s) in &out_infos {
+        let oc = vm.intern_elem(&crate::context::ContextElem::Built {
+            drv_path: drv_base.clone(),
+            output: name.as_bytes().to_vec(),
+        });
+        let ov = vm.new_string_ctx(s, &[oc]);
+        result.push(Attr {
+            sym: vm.symbols.create(name.as_bytes()).0,
+            pos: 0,
+            val: temp_cell(vm, ov),
+        });
+    }
+    result.sort_by_key(|a| a.sym);
+    result.dedup_by_key(|a| a.sym);
+    let v = vm.new_bindings_value(&result);
+    vm.temp_end(scope);
+    Ok(v)
+}
+
+fn emit_warning(msg: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "warning: {msg}");
+}
+
+fn merge_ctx(dst: &mut Vec<u32>, src: &[u32]) {
+    for &id in src {
+        if !dst.contains(&id) {
+            dst.push(id);
+        }
+    }
+}
+
+fn coerce_str_ctx(vm: &mut VM, cell: VRef, pos: PosIdx) -> Result<(Vec<u8>, Vec<u32>), ErrId> {
+    vm.coerce_to_string(cell, pos, "", true, true, true)
+}
+
+fn handle_hash_mode(
+    vm: &mut VM,
+    s: &[u8],
+    pos: PosIdx,
+) -> Result<jinx_store::store_path::ContentAddressMethod, ErrId> {
+    use jinx_store::store_path::ContentAddressMethod as M;
+    let m = match s {
+        b"recursive" | b"nar" => M::NixArchive,
+        b"flat" => M::Flat,
+        b"text" => M::Text,
+        b"git" => M::Git,
+        _ => {
+            return Err(vm.new_err(
+                ErrKind::Eval,
+                format!(
+                    "invalid value '{}' for 'outputHashMode' attribute",
+                    String::from_utf8_lossy(s)
+                ),
+                pos,
+            ))
+        }
+    };
+    Ok(m)
+}
+
+fn handle_outputs(
+    vm: &mut VM,
+    ss: &[Vec<u8>],
+    outputs: &mut std::collections::BTreeSet<String>,
+    pos: PosIdx,
+) -> Result<(), ErrId> {
+    outputs.clear();
+    for j in ss {
+        let name = String::from_utf8_lossy(j).into_owned();
+        if name == "drvPath" {
+            return Err(vm.new_err(
+                ErrKind::Eval,
+                "invalid derivation output name 'drvPath'",
+                pos,
+            ));
+        }
+        if !outputs.insert(name.clone()) {
+            return Err(vm.new_err(
+                ErrKind::Eval,
+                format!("duplicate derivation output '{name}'"),
+                pos,
+            ));
+        }
+    }
+    if outputs.is_empty() {
+        return Err(vm.new_err(
+            ErrKind::Eval,
+            "derivation cannot have an empty set of outputs",
+            pos,
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -2549,8 +3419,9 @@ fn prim_convert_hash(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: Po
 
 fn prim_to_json(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
     let mut out = Vec::new();
-    crate::json::to_json(vm, args[0], pos, &mut out)?;
-    Ok(mk_string(vm, &out))
+    let mut ctx = Vec::new();
+    crate::json::to_json_ctx(vm, args[0], pos, &mut out, &mut ctx)?;
+    Ok(mk_string_ctx(vm, &out, &ctx))
 }
 
 fn prim_from_json(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {

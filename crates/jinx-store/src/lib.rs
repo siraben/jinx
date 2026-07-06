@@ -12,7 +12,10 @@
 //!   `hashDerivationModulo` (`derivations.cc`)
 //! - [`nar`]: NAR serializer and hasher (`archive.cc`)
 //! - [`wire`]: daemon protocol framing primitives (`serialise.cc`)
+//! - [`daemon`]: the worker-protocol client (`worker-protocol.cc`,
+//!   `remote-store.cc`, `uds-remote-store.cc`)
 
+pub mod daemon;
 pub mod derivation;
 pub mod hash;
 pub mod nar;

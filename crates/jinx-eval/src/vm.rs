@@ -164,8 +164,20 @@ pub struct VM {
     pub current_system: Vec<u8>,
     pub store_dir: Vec<u8>,
     pub pure_eval: bool,
-    /// String context element table (M3 plumbing; unused producers in M2).
+    /// String context element table: `ctx_elems[id]` is the wire encoding of
+    /// a `NixStringContextElem` (e.g. `<basename>`, `=<drv>`, `!<out>!<drv>`).
     pub ctx_elems: Vec<Vec<u8>>,
+    /// Dedup map for [`VM::intern_ctx`].
+    pub ctx_intern: FxHashMap<Vec<u8>, u32>,
+    /// Enabled experimental features (from nix.conf / --extra-experimental-features).
+    pub experimental: crate::context::ExperimentalFeatures,
+    /// hashDerivationModulo memo (`drvHashes` in C++).
+    pub drv_hashes: jinx_store::derivation::DrvHashes,
+    /// Derivations produced by `derivationStrict` this run, so that later
+    /// derivations depending on them can be resolved (stands in for reading
+    /// `.drv` files from a store).
+    pub built_drvs:
+        FxHashMap<jinx_store::store_path::StorePath, jinx_store::derivation::Derivation>,
     /// Synthetic apply chunks for lazy applications (set at registration).
     pub apply_prog: Option<&'static crate::chunk::Program>,
 }
@@ -199,6 +211,10 @@ impl VM {
             store_dir: b"/nix/store".to_vec(),
             pure_eval: false,
             ctx_elems: Vec::new(),
+            ctx_intern: FxHashMap::default(),
+            experimental: crate::context::ExperimentalFeatures::default(),
+            drv_hashes: jinx_store::derivation::DrvHashes::default(),
+            built_drvs: FxHashMap::default(),
             apply_prog: None,
         }
     }
@@ -1107,6 +1123,56 @@ impl VM {
         self.heap.new_ctx(ids)
     }
 
+    /// Intern a context-element wire encoding, returning its id.
+    pub fn intern_ctx(&mut self, enc: Vec<u8>) -> u32 {
+        if let Some(&id) = self.ctx_intern.get(&enc) {
+            return id;
+        }
+        let id = self.ctx_elems.len() as u32;
+        self.ctx_elems.push(enc.clone());
+        self.ctx_intern.insert(enc, id);
+        id
+    }
+
+    /// Intern a decoded context element.
+    pub fn intern_elem(&mut self, e: &crate::context::ContextElem) -> u32 {
+        self.intern_ctx(e.encode())
+    }
+
+    /// The wire encoding of context element `id`.
+    pub fn ctx_enc(&self, id: u32) -> &[u8] {
+        &self.ctx_elems[id as usize]
+    }
+
+    /// Decode context element `id`.
+    pub fn ctx_elem(&self, id: u32) -> crate::context::ContextElem {
+        crate::context::ContextElem::parse(self.ctx_enc(id))
+    }
+
+    /// A `StoreDir` for the current store directory.
+    pub fn store(&self) -> jinx_store::store_path::StoreDir {
+        jinx_store::store_path::StoreDir::new(String::from_utf8_lossy(&self.store_dir).into_owned())
+    }
+
+    /// Read the context-element ids of a string value (empty if none).
+    pub fn read_str_ctx(&self, v: &Value) -> Vec<u32> {
+        let cp = str_ctx(v);
+        if cp.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: ctx objects hold u32 ids.
+        unsafe {
+            let len = value::header_len(*cp);
+            std::slice::from_raw_parts(cp.add(1) as *const u32, len).to_vec()
+        }
+    }
+
+    /// Build a string value carrying context ids.
+    pub fn new_string_ctx(&mut self, bytes: &[u8], ids: &[u32]) -> Value {
+        let cp = self.make_ctx(ids);
+        self.new_string_value(bytes, cp)
+    }
+
     // ---------------- thunks / with ----------------
 
     fn make_thunk(&mut self, fi: usize, cid: u32, tag: Tag) -> VRef {
@@ -1538,6 +1604,60 @@ impl VM {
     // ---------------- coercion ----------------
 
     /// Port of EvalState::coerceToString. Returns bytes + context ids.
+    /// Port of `copyPathToStore` under the readonly/dummy store: NAR-hash the
+    /// path and compute its `source` store path (never writing), returning the
+    /// printed store path plus an interned `Opaque` context id.
+    pub fn copy_path_to_store(
+        &mut self,
+        path: &[u8],
+        pos: PosIdx,
+    ) -> Result<(Vec<u8>, u32), ErrId> {
+        use jinx_store::hash::HashAlgorithm;
+        use jinx_store::store_path::{FileIngestionMethod, FixedOutputInfo, StoreReferences};
+        use std::os::unix::ffi::OsStrExt;
+        if path.ends_with(b".drv") {
+            let e = self.new_err(
+                ErrKind::Eval,
+                "file names are not allowed to end in '.drv'",
+                pos,
+            );
+            return Err(e);
+        }
+        let os = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+        let (hash, _sz) = match jinx_store::nar::hash_path(os, HashAlgorithm::Sha256) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!(
+                    "getting attributes of path '{}': {}",
+                    String::from_utf8_lossy(path),
+                    e
+                );
+                return Err(self.new_err(ErrKind::Eval, msg, pos));
+            }
+        };
+        let base = match path.iter().rposition(|&c| c == b'/') {
+            Some(i) => &path[i + 1..],
+            None => path,
+        };
+        let name = String::from_utf8_lossy(base).into_owned();
+        let store = self.store();
+        let sp = store
+            .make_fixed_output_path(
+                &name,
+                &FixedOutputInfo {
+                    method: FileIngestionMethod::NixArchive,
+                    hash,
+                    references: StoreReferences::default(),
+                },
+            )
+            .map_err(|e| self.new_err(ErrKind::Eval, e.0, pos))?;
+        let printed = store.print_store_path(&sp).into_bytes();
+        let id = self.intern_elem(&crate::context::ContextElem::Opaque {
+            path: sp.to_string().as_bytes().to_vec(),
+        });
+        Ok((printed, id))
+    }
+
     pub fn coerce_to_string(
         &mut self,
         cell: VRef,
@@ -1582,16 +1702,14 @@ impl VM {
             }
             Tag::Path => {
                 if copy_to_store {
-                    let e = self.new_err(
-                        ErrKind::Eval,
-                        format!(
-                            "cannot copy '{}' to the Nix store: store operations are not implemented in jinx M2",
-                            String::from_utf8_lossy(path_bytes(&v))
-                        ),
-                        pos,
-                    );
-                    self.add_trace(e, pos, ctx);
-                    Err(e)
+                    let path = path_bytes(&v).to_vec();
+                    match self.copy_path_to_store(&path, pos) {
+                        Ok((printed, id)) => Ok((printed, vec![id])),
+                        Err(e) => {
+                            self.add_trace(e, pos, ctx);
+                            Err(e)
+                        }
+                    }
                 } else {
                     // canonicalizePath=false preserves literal trailing
                     // slashes; our path payload is stored as-is either way.
