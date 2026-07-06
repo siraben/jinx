@@ -13,3 +13,4 @@ pub mod print;
 pub mod regex;
 pub mod value;
 pub mod vm;
+pub mod xml;

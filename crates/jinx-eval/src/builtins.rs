@@ -96,10 +96,8 @@ const UNIMPLEMENTED: &[(&str, u8)] = &[
     ("__forceLazyFetcherAttr", 1),
     ("__importNative", 2),
     ("__outputOf", 2),
-    ("__path", 1),
     ("__storePath", 1),
     ("__toFile", 2),
-    ("__toXML", 1),
     // flakes (experimental): present in `builtins` so failures are clearly
     // "not implemented" rather than "attribute missing".
     ("getFlake", 1),
@@ -199,6 +197,8 @@ pub fn register_globals(vm: &mut VM) {
         Reg { name: "__match", arity: 2, func: prim_match },
         Reg { name: "__split", arity: 2, func: prim_split },
         Reg { name: "fromTOML", arity: 1, func: prim_from_toml },
+        Reg { name: "__toXML", arity: 1, func: prim_to_xml },
+        Reg { name: "__path", arity: 1, func: prim_path },
         Reg { name: "parseFlakeRef", arity: 1, func: prim_parse_flake_ref },
         Reg { name: "flakeRefToString", arity: 1, func: prim_flake_ref_to_string },
         Reg { name: "__getContext", arity: 1, func: prim_get_context },
@@ -1848,6 +1848,156 @@ fn derivation_strict_internal(
     let v = vm.new_bindings_value(&result);
     vm.temp_end(scope);
     Ok(v)
+}
+
+fn prim_path(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    use jinx_store::hash::{Hash, HashAlgorithm};
+    use jinx_store::store_path::{
+        ContentAddressMethod, ContentAddressWithReferences, FileIngestionMethod, FixedOutputInfo,
+        StoreReferences,
+    };
+    vm.force_attrs(
+        args[0],
+        pos,
+        "while evaluating the argument passed to 'builtins.path'",
+    )?;
+    let entries = attrs_entries(&val(args[0])).to_vec();
+    let mut path_bytes_opt: Option<Vec<u8>> = None;
+    let mut name: Option<Vec<u8>> = None;
+    let mut method = FileIngestionMethod::NixArchive;
+    let mut expected_hash: Option<Hash> = None;
+    let mut context: Vec<u32> = Vec::new();
+    for a in &entries {
+        let key = vm.symbols.resolve(Symbol(a.sym)).to_vec();
+        match key.as_slice() {
+            b"path" => {
+                let (s, cids) = vm.coerce_to_string(
+                    a.val,
+                    PosIdx(a.pos),
+                    "while evaluating the 'path' attribute passed to 'builtins.path'",
+                    false,
+                    false,
+                    true,
+                )?;
+                merge_ctx(&mut context, &cids);
+                path_bytes_opt = Some(s);
+            }
+            b"name" => {
+                name = Some(vm.force_string_no_ctx(
+                    a.val,
+                    PosIdx(a.pos),
+                    "while evaluating the `name` attribute passed to builtins.path",
+                )?);
+            }
+            b"filter" => {
+                force_fun(
+                    vm,
+                    a.val,
+                    PosIdx(a.pos),
+                    "while evaluating the `filter` parameter passed to builtins.path",
+                )?;
+            }
+            b"recursive" => {
+                method = if vm.force_bool(
+                    a.val,
+                    PosIdx(a.pos),
+                    "while evaluating the `recursive` attribute passed to builtins.path",
+                )? {
+                    FileIngestionMethod::NixArchive
+                } else {
+                    FileIngestionMethod::Flat
+                };
+            }
+            b"sha256" => {
+                let s = vm.force_string_no_ctx(
+                    a.val,
+                    PosIdx(a.pos),
+                    "while evaluating the `sha256` attribute passed to builtins.path",
+                )?;
+                expected_hash = Some(
+                    Hash::parse_any(&String::from_utf8_lossy(&s), Some(HashAlgorithm::Sha256))
+                        .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?,
+                );
+            }
+            _ => {
+                return Err(vm.new_err(
+                    ErrKind::Eval,
+                    format!(
+                        "unsupported argument '{}' to 'builtins.path'",
+                        String::from_utf8_lossy(&key)
+                    ),
+                    PosIdx(a.pos),
+                ));
+            }
+        }
+    }
+    let path = match path_bytes_opt {
+        Some(p) => p,
+        None => {
+            return Err(vm.new_err(
+                ErrKind::Eval,
+                "missing required 'path' attribute in the first argument to 'builtins.path'",
+                pos,
+            ))
+        }
+    };
+    let name = name.unwrap_or_else(|| {
+        match path.iter().rposition(|&c| c == b'/') {
+            Some(i) => path[i + 1..].to_vec(),
+            None => path.clone(),
+        }
+    });
+    let name_s = String::from_utf8_lossy(&name).into_owned();
+    let store = vm.store();
+    let sp = if let Some(h) = expected_hash {
+        let ca = ContentAddressWithReferences::Fixed(FixedOutputInfo {
+            method,
+            hash: h,
+            references: StoreReferences::default(),
+        });
+        store
+            .make_fixed_output_path_from_ca(&name_s, &ca)
+            .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?
+    } else {
+        // No expected hash: hash the (unfiltered) path content.
+        use std::os::unix::ffi::OsStrExt;
+        let os = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
+        let algo = HashAlgorithm::Sha256;
+        let hash = match method {
+            FileIngestionMethod::Flat => {
+                let data = std::fs::read(os)
+                    .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), pos))?;
+                hash_string(algo, &data)
+            }
+            _ => {
+                jinx_store::nar::hash_path(os, algo)
+                    .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), pos))?
+                    .0
+            }
+        };
+        let _ = ContentAddressMethod::Flat;
+        store
+            .make_fixed_output_path(
+                &name_s,
+                &FixedOutputInfo {
+                    method,
+                    hash,
+                    references: StoreReferences::default(),
+                },
+            )
+            .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?
+    };
+    let printed = store.print_store_path(&sp);
+    let id = vm.intern_elem(&crate::context::ContextElem::Opaque {
+        path: sp.to_string().as_bytes().to_vec(),
+    });
+    Ok(vm.new_string_ctx(printed.as_bytes(), &[id]))
+}
+
+fn prim_to_xml(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    let _ = pos;
+    let (out, ctx) = crate::xml::prim_to_xml_impl(vm, args[0])?;
+    Ok(mk_string_ctx(vm, &out, &ctx))
 }
 
 // ---------------------------------------------------------------------

@@ -42,6 +42,8 @@ struct Options {
     pure_eval: bool,
     /// Experimental features requested on the command line.
     experimental: Vec<String>,
+    /// XML output source locations (`--no-location` clears this).
+    location: bool,
 }
 
 fn parse_lint_level(v: &str) -> Result<LintLevel, String> {
@@ -71,6 +73,7 @@ fn parse_args() -> Result<Options, String> {
         lint_short: LintLevel::Allow,
         pure_eval: false,
         experimental: vec![],
+        location: true,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -88,7 +91,7 @@ fn parse_args() -> Result<Options, String> {
             "--strict" => opts.strict = true,
             "--xml" => opts.xml = true,
             "--json" => opts.json = true,
-            "--no-location" => {}
+            "--no-location" => opts.location = false,
             "--expr" | "-E" => opts.from_args = true,
             "--attr" | "-A" => {
                 let v = need(&args, &mut i, a)?;
@@ -181,8 +184,8 @@ fn run(opts: Options) -> ExitCode {
         eprintln!("error: only --parse and --eval are supported in this milestone");
         return ExitCode::FAILURE;
     }
-    if opts.xml || opts.json {
-        eprintln!("error: --xml/--json output is not implemented in jinx yet");
+    if opts.json {
+        eprintln!("error: --json output is not implemented in jinx yet");
         return ExitCode::FAILURE;
     }
     run_eval(opts)
@@ -470,18 +473,28 @@ fn run_eval(opts: Options) -> ExitCode {
         } else {
             v
         };
-        if opts.strict {
+        if opts.strict && !opts.xml {
             if let Err(e) = print::deep_force(&mut vm, v) {
                 report_err(&vm, e);
                 return ExitCode::FAILURE;
             }
         }
         let mut out = Vec::new();
-        if let Err(e) = print::print_ambiguous(&mut vm, v, &mut out) {
-            report_err(&vm, e);
-            return ExitCode::FAILURE;
+        if opts.xml {
+            let mut ctx = Vec::new();
+            if let Err(e) =
+                jinx_eval::xml::value_to_xml(&mut vm, v, opts.strict, opts.location, &mut out, &mut ctx)
+            {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+        } else {
+            if let Err(e) = print::print_ambiguous(&mut vm, v, &mut out) {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+            out.push(b'\n');
         }
-        out.push(b'\n');
         let mut lock = stdout.lock();
         let _ = lock.write_all(&out);
         let _ = lock.flush();
