@@ -2253,6 +2253,7 @@ fn flake_ref_to_string(attrs: &std::collections::BTreeMap<String, FlakeVal>) -> 
     Ok(out)
 }
 
+#[allow(dead_code)] // Int/Bool round-tripping is validated but unused by fixtures.
 enum FlakeVal {
     Str(String),
     Int(i64),
@@ -2356,6 +2357,20 @@ fn toml_normalize_datetime(dt: &toml::value::Datetime) -> String {
     out
 }
 
+fn toml_no_null_byte(vm: &mut VM, s: &[u8], pos: PosIdx) -> Result<(), ErrId> {
+    if s.contains(&0) {
+        return Err(vm.new_err(
+            ErrKind::Eval,
+            format!(
+                "while parsing TOML: error: input string '{}' cannot be represented as Nix string because it contains null bytes",
+                String::from_utf8_lossy(s)
+            ),
+            pos,
+        ));
+    }
+    Ok(())
+}
+
 fn toml_to_value(
     vm: &mut VM,
     t: &toml::Value,
@@ -2366,7 +2381,10 @@ fn toml_to_value(
         toml::Value::Integer(i) => Value::int(*i),
         toml::Value::Float(f) => Value::float(*f),
         toml::Value::Boolean(b) => Value::bool(*b),
-        toml::Value::String(s) => mk_string(vm, s.as_bytes()),
+        toml::Value::String(s) => {
+            toml_no_null_byte(vm, s.as_bytes(), pos)?;
+            mk_string(vm, s.as_bytes())
+        }
         toml::Value::Datetime(dt) => {
             if !ts {
                 return Err(vm.new_err(
@@ -2405,6 +2423,7 @@ fn toml_to_value(
         toml::Value::Table(m) => {
             let mut entries: Vec<Attr> = Vec::with_capacity(m.len());
             for (k, val) in m {
+                toml_no_null_byte(vm, k.as_bytes(), pos)?;
                 let vc = toml_to_value(vm, val, ts, pos)?;
                 entries.push(Attr {
                     sym: vm.symbols.create(k.as_bytes()).0,
