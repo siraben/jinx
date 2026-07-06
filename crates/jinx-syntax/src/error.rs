@@ -1,16 +1,19 @@
 //! Parse errors and their rendering, byte-compatible with Nix's
-//! `showErrorInfo` (libutil/error.cc) for the non-terminal (no ANSI) case.
+//! `showErrorInfo` (libutil/error.cc) plus the logger's
+//! `filterANSIEscapes` pass (libutil/terminal.cc) for the non-terminal
+//! case.
 
 use crate::pos::{split_lines, Origin, PosIdx, PosTable};
 
 #[derive(Debug)]
 pub struct ParseError {
-    pub msg: String,
+    /// Raw message bytes (Nix messages can embed arbitrary source bytes).
+    pub msg: Vec<u8>,
     pub pos: PosIdx,
 }
 
 impl ParseError {
-    pub fn new(msg: impl Into<String>, pos: PosIdx) -> Self {
+    pub fn new(msg: impl Into<Vec<u8>>, pos: PosIdx) -> Self {
         ParseError {
             msg: msg.into(),
             pos,
@@ -19,70 +22,190 @@ impl ParseError {
 
     /// Render as `error: ...` with position and source excerpt, exactly as
     /// Nix prints it to a non-terminal stderr (no trailing newline; the
-    /// caller appends one, like Nix's logger).
-    pub fn render(&self, positions: &PosTable) -> String {
+    /// caller appends one, like Nix's logger). This includes the logger's
+    /// `filterANSIEscapes` pass (tab expansion etc.).
+    pub fn render(&self, positions: &PosTable) -> Vec<u8> {
         // Build the equivalent of the `oss` stream in showErrorInfo.
-        let mut oss = String::new();
-        oss.push_str(&self.msg);
-        oss.push('\n');
-        if let (Some(pos), Some(origin)) = (positions.lookup(self.pos), positions.origin_of(self.pos))
+        let mut oss: Vec<u8> = Vec::new();
+        oss.extend_from_slice(&self.msg);
+        oss.push(b'\n');
+        if let (Some(pos), Some(origin)) =
+            (positions.lookup(self.pos), positions.origin_of(self.pos))
         {
             // printPosMaybe: "at <pos>:" then code lines
-            oss.push_str(&format!("at {pos}:"));
-            oss.push_str(&code_lines(origin, pos.line, pos.column));
-            oss.push('\n');
+            oss.extend_from_slice(format!("at {pos}:").as_bytes());
+            oss.extend_from_slice(&code_lines(origin, pos.line, pos.column));
+            oss.push(b'\n');
         }
-        // out << indent("error: ", "       ", chomp(oss))
-        indent("error: ", "       ", chomp(&oss))
+        // out << indent("error: ", "       ", chomp(oss));
+        // the logger then applies filterANSIEscapes to the whole message.
+        filter_ansi_escapes(&indent(b"error: ", b"       ", chomp(&oss)))
     }
 }
 
-fn code_lines(origin: &Origin, line: u32, column: u32) -> String {
+fn code_lines(origin: &Origin, line: u32, column: u32) -> Vec<u8> {
     let lines = split_lines(origin.source());
     let line = line as usize;
-    let mut out = String::new();
-    let get = |n: usize| -> Option<String> {
+    let mut out: Vec<u8> = Vec::new();
+    let get = |n: usize| -> Option<&[u8]> {
         if n >= 1 && n <= lines.len() {
-            Some(String::from_utf8_lossy(lines[n - 1]).into_owned())
+            Some(lines[n - 1])
         } else {
             None
         }
     };
+    fn push_line(out: &mut Vec<u8>, n: usize, text: &[u8]) {
+        out.extend_from_slice(format!("\n {n:>5}| ").as_bytes());
+        out.extend_from_slice(text);
+    }
     if line > 1 {
         if let Some(prev) = get(line - 1) {
-            out.push_str(&format!("\n {:>5}| {}", line - 1, prev));
+            push_line(&mut out, line - 1, prev);
         }
     }
     if let Some(err) = get(line) {
-        out.push_str(&format!("\n {line:>5}| {err}"));
+        push_line(&mut out, line, err);
         if column > 0 {
-            out.push_str(&format!(
-                "\n      |{}^",
-                " ".repeat(column as usize)
-            ));
+            out.extend_from_slice(b"\n      |");
+            out.extend_from_slice(&vec![b' '; column as usize]);
+            out.push(b'^');
         }
     }
     if let Some(next) = get(line + 1) {
-        out.push_str(&format!("\n {:>5}| {}", line + 1, next));
+        push_line(&mut out, line + 1, next);
     }
     out
 }
 
 /// Nix's `chomp`: strip trailing whitespace.
-fn chomp(s: &str) -> &str {
-    s.trim_end_matches([' ', '\t', '\n', '\r'])
+fn chomp(s: &[u8]) -> &[u8] {
+    let mut end = s.len();
+    while end > 0 && matches!(s[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Nix's `indent(indentFirst, indentRest, s)`: prefix each line, chomping
 /// each resulting line.
-fn indent(first: &str, rest: &str, s: &str) -> String {
-    let mut out = String::new();
-    for (i, line) in s.split('\n').enumerate() {
+fn indent(first: &[u8], rest: &[u8], s: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for (i, line) in s.split(|&c| c == b'\n').enumerate() {
         if i > 0 {
-            out.push('\n');
+            out.push(b'\n');
         }
-        let prefixed = format!("{}{}", if i == 0 { first } else { rest }, line);
-        out.push_str(chomp(&prefixed));
+        let mut prefixed: Vec<u8> = Vec::with_capacity(line.len() + 8);
+        prefixed.extend_from_slice(if i == 0 { first } else { rest });
+        prefixed.extend_from_slice(line);
+        out.extend_from_slice(chomp(&prefixed));
     }
     out
+}
+
+/// Port of `charWidthUTF8Helper` (terminal.cc): (display width, bytes).
+fn char_width_utf8(s: &[u8]) -> (usize, usize) {
+    let c = s[0];
+    let (mut ch, bytes, max): (u32, usize, u32) = if c & 0x80 == 0 {
+        (c as u32, 1, 1 << 7)
+    } else if c & 0xe0 == 0xc0 {
+        ((c & 0x1f) as u32, 2, 1 << 11)
+    } else if c & 0xf0 == 0xe0 {
+        ((c & 0x0f) as u32, 3, 1 << 16)
+    } else if c & 0xf8 == 0xf0 {
+        ((c & 0x07) as u32, 4, 0x110000)
+    } else {
+        return (1, 1); // invalid UTF-8 start byte
+    };
+    for i in 1..bytes {
+        if i < s.len() && s[i] & 0xc0 == 0x80 {
+            ch = (ch << 6) | (s[i] & 0x3f) as u32;
+        } else {
+            return (i, i); // invalid encoding: one column per byte
+        }
+    }
+    let mut width = bytes; // in case of overlong encoding
+    if ch < max {
+        width = char::from_u32(ch).map(char_display_width).unwrap_or(0);
+    }
+    (width, bytes)
+}
+
+/// Approximation of widechar_wcwidth with Nix's adjustments
+/// (ambiguous -> 1, widened-in-9 -> 2, negative -> 0).
+fn char_display_width(c: char) -> usize {
+    let cp = c as u32;
+    if cp < 0x20 || (0x7f..0xa0).contains(&cp) {
+        return 0; // control characters
+    }
+    // Wide ranges (East Asian Wide / Fullwidth), close enough to
+    // widechar_width for the characters that can plausibly appear here.
+    let wide = matches!(cp,
+        0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF |
+        0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF |
+        0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 |
+        0x1F300..=0x1F64F | 0x1F900..=0x1F9FF | 0x20000..=0x2FFFD | 0x30000..=0x3FFFD);
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+/// Port of `filterANSIEscapes(s, filterAll = true)` (terminal.cc): strip
+/// escape sequences, expand tabs (against a width counter that is *not*
+/// reset at newlines), drop `\r` and `\a`.
+pub fn filter_ansi_escapes(s: &[u8]) -> Vec<u8> {
+    let mut t: Vec<u8> = Vec::with_capacity(s.len());
+    let mut w: usize = 0;
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i];
+        if c == 0x1b {
+            // ESC sequence: skip (filterAll drops even SGR)
+            i += 1;
+            if i < s.len() && s[i] == b'[' {
+                i += 1;
+                while i < s.len() && (0x30..=0x3f).contains(&s[i]) {
+                    i += 1;
+                }
+                while i < s.len() && (0x20..=0x2f).contains(&s[i]) {
+                    i += 1;
+                }
+                if i < s.len() && (0x40..=0x7e).contains(&s[i]) {
+                    i += 1;
+                }
+            } else if i < s.len() && s[i] == b']' {
+                i += 1;
+                while i < s.len() && s[i] != 0x1b && s[i] != 0x07 {
+                    i += 1;
+                }
+                if i < s.len() {
+                    let v = s[i];
+                    i += 1;
+                    if i < s.len() && v == 0x1b && s[i] == b'\\' {
+                        i += 1;
+                    }
+                }
+            } else if i < s.len() && (0x40..=0x5f).contains(&s[i]) {
+                i += 1;
+            }
+        } else if c == b'\t' {
+            loop {
+                w += 1;
+                t.push(b' ');
+                if w.is_multiple_of(8) {
+                    break;
+                }
+            }
+            i += 1;
+        } else if c == b'\r' || c == 0x07 {
+            i += 1;
+        } else {
+            let (cw, bytes) = char_width_utf8(&s[i..]);
+            w += cw;
+            t.extend_from_slice(&s[i..i + bytes]);
+            i += bytes;
+        }
+    }
+    t
 }

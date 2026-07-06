@@ -122,6 +122,10 @@ pub struct Lexer<'a> {
     stack: Vec<State>,
     last_begin: u32,
     last_end: u32,
+    /// Location before the last matched rule (ParserLocation::stash), used
+    /// by rules that rewind with yyless(0) + unstash.
+    stash_begin: u32,
+    stash_end: u32,
     origin: OriginId,
 }
 
@@ -145,6 +149,8 @@ impl<'a> Lexer<'a> {
             stack: vec![State::Initial],
             last_begin: 0,
             last_end: 0,
+            stash_begin: 0,
+            stash_end: 0,
             origin,
         }
     }
@@ -163,6 +169,8 @@ impl<'a> Lexer<'a> {
 
     /// YY_USER_ACTION: advance the location over `len` consumed bytes.
     fn adjust_loc(&mut self, len: usize) {
+        self.stash_begin = self.last_begin;
+        self.stash_end = self.last_end;
         self.last_begin = self.last_end;
         self.last_end += len as u32;
     }
@@ -250,7 +258,7 @@ impl<'a> Lexer<'a> {
             }
 
             let mut best: Option<(usize, usize, Rule)> = None; // (len, order, rule)
-            let mut consider = |len: usize, order: usize, rule: Rule, best: &mut Option<(usize, usize, Rule)>| {
+            let consider = |len: usize, order: usize, rule: Rule, best: &mut Option<(usize, usize, Rule)>| {
                 if len == 0 {
                     return;
                 }
@@ -576,7 +584,7 @@ impl<'a> Lexer<'a> {
         // Competing fixed rules (longest wins; main rule first on ties).
         let mut best_len = main_len;
         let mut best_rule = if main_len > 0 { 0 } else { usize::MAX }; // 0 = main
-        let mut consider = |len: usize, rule: usize, best_len: &mut usize, best_rule: &mut usize| {
+        let consider = |len: usize, rule: usize, best_len: &mut usize, best_rule: &mut usize| {
             if len > *best_len {
                 *best_len = len;
                 *best_rule = rule;
@@ -672,8 +680,14 @@ impl<'a> Lexer<'a> {
             ));
         }
         // <INPATH>{ANY} / <<EOF>>: end of path; re-scan the char in the
-        // enclosing context (yyless(0) + loc unstash).
+        // enclosing context (yyless(0) + loc unstash). At EOF no user
+        // action ran, so the unstash reverts the location to the one
+        // *before* the last matched rule (affecting a later EOF report).
         self.pop();
+        if p >= len {
+            self.last_begin = self.stash_begin;
+            self.last_end = self.stash_end;
+        }
         Ok(Token {
             kind: TokKind::PathEnd,
             text: vec![],

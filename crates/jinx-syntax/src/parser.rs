@@ -25,7 +25,7 @@ pub fn parse(
     positions: &mut PosTable,
     base_path: &str,
     home: Option<&str>,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<Vec<u8>>,
 ) -> Result<ExprId, ParseError> {
     let mut p = Parser {
         lexer: Lexer::new(source, origin),
@@ -71,7 +71,7 @@ struct Parser<'a> {
     origin: OriginId,
     base_path: String,
     home: Option<String>,
-    warnings: &'a mut Vec<String>,
+    warnings: &'a mut Vec<Vec<u8>>,
 }
 
 impl<'a> Parser<'a> {
@@ -115,15 +115,6 @@ impl<'a> Parser<'a> {
 
     fn is_char(t: &Token, c: u8) -> bool {
         matches!(t.kind, TokKind::Char(x) if x == c)
-    }
-
-    fn expect_char(&mut self, c: u8, expecting: &[&str]) -> Result<Token, ParseError> {
-        let t = self.peek()?.clone();
-        if Self::is_char(&t, c) {
-            self.next()
-        } else {
-            Err(self.err_unexpected(&t, expecting))
-        }
     }
 
     // ---------- expr_function ----------
@@ -1142,30 +1133,26 @@ impl<'a> Parser<'a> {
 
     // ---------- addAttr (parser-state.hh) ----------
 
-    fn dup_attr_sym(&self, sym: Symbol, pos: PosIdx, prev_pos: PosIdx) -> ParseError {
-        let name = crate::show::print_identifier_str(self.symbols.resolve(sym));
+    fn dup_attr_msg(&self, shown: &[u8], pos: PosIdx, prev_pos: PosIdx) -> ParseError {
         let prev = self
             .positions
             .lookup(prev_pos)
             .map(|p| p.to_string())
             .unwrap_or_else(|| "«none»".into());
-        ParseError::new(
-            format!("attribute '{name}' already defined at {prev}"),
-            pos,
-        )
+        let mut msg: Vec<u8> = b"attribute '".to_vec();
+        msg.extend_from_slice(shown);
+        msg.extend_from_slice(format!("' already defined at {prev}").as_bytes());
+        ParseError::new(msg, pos)
+    }
+
+    fn dup_attr_sym(&self, sym: Symbol, pos: PosIdx, prev_pos: PosIdx) -> ParseError {
+        let name = crate::show::print_identifier_str(self.symbols.resolve(sym));
+        self.dup_attr_msg(&name, pos, prev_pos)
     }
 
     fn dup_attr_path(&self, path: &[AttrName], pos: PosIdx, prev_pos: PosIdx) -> ParseError {
         let shown = crate::show::show_attr_selection_path(self.exprs, self.symbols, path);
-        let prev = self
-            .positions
-            .lookup(prev_pos)
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "«none»".into());
-        ParseError::new(
-            format!("attribute '{shown}' already defined at {prev}"),
-            pos,
-        )
+        self.dup_attr_msg(&shown, pos, prev_pos)
     }
 
     fn add_attr(
@@ -1468,17 +1455,11 @@ impl<'a> Parser<'a> {
         }
         if let Some((name, dpos)) = duplicate {
             let name = crate::show::print_identifier_str(self.symbols.resolve(Symbol(name)));
-            return Err(ParseError::new(
-                format!("duplicate formal function argument '{name}'"),
-                PosIdx(dpos),
-            ));
+            return Err(ParseError::new(dup_formal_msg(&name), PosIdx(dpos)));
         }
         if arg.is_set() && formals.formals.iter().any(|f| f.name == arg) {
             let name = crate::show::print_identifier_str(self.symbols.resolve(arg));
-            return Err(ParseError::new(
-                format!("duplicate formal function argument '{name}'"),
-                pos,
-            ));
+            return Err(ParseError::new(dup_formal_msg(&name), pos));
         }
         Ok(())
     }
@@ -1507,22 +1488,25 @@ impl<'a> Parser<'a> {
         };
         let begin_off = self.positions.offset_of(pos).unwrap_or(0) as usize;
         let end_off = self.positions.offset_of(end).unwrap_or(0) as usize;
-        let snippet = if begin_off <= end_off && end_off <= self.src.len() {
-            String::from_utf8_lossy(&self.src[begin_off..end_off]).into_owned()
+        let snippet: &[u8] = if begin_off <= end_off && end_off <= self.src.len() {
+            &self.src[begin_off..end_off]
         } else {
-            "could not read expression".into()
+            b"could not read expression"
         };
         let at = self
             .positions
             .lookup(pos)
             .map(|p| p.to_string())
             .unwrap_or_else(|| "«none»".into());
-        self.warnings.push(format!(
-            "warning: at {at}: This expression uses `or` as an identifier in a way that will change in a future Nix release.\n\
-             Wrap this entire expression in parentheses to preserve its current meaning:\n    \
-             ({snippet})\n\
-             Give feedback at https://github.com/NixOS/nix/pull/11121"
-        ));
+        let mut w: Vec<u8> = format!(
+            "warning: at {at}: This expression uses `or` as an identifier in a way that will \
+             change in a future Nix release.\nWrap this entire expression in parentheses to \
+             preserve its current meaning:\n    ("
+        )
+        .into_bytes();
+        w.extend_from_slice(snippet);
+        w.extend_from_slice(b")\nGive feedback at https://github.com/NixOS/nix/pull/11121");
+        self.warnings.push(w);
     }
 
     #[allow(non_snake_case)]
@@ -1630,4 +1614,11 @@ fn push_seg<'x>(segs: &mut Vec<&'x [u8]>, seg: &'x [u8]) {
         }
         s => segs.push(s),
     }
+}
+
+fn dup_formal_msg(name: &[u8]) -> Vec<u8> {
+    let mut msg: Vec<u8> = b"duplicate formal function argument '".to_vec();
+    msg.extend_from_slice(name);
+    msg.push(b'\'');
+    msg
 }

@@ -34,7 +34,7 @@ pub fn parse_and_bind(
     base_path: &str,
     home: Option<&str>,
     positions: &mut PosTable,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<Vec<u8>>,
 ) -> Result<ParseResult, ParseError> {
     let mut symbols = SymbolTable::new();
     let origin_id = positions.add_origin(origin, source.len());

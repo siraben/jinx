@@ -72,7 +72,7 @@ fn main() -> ExitCode {
         &mut warnings,
     );
     for w in &warnings {
-        eprintln!("{w}");
+        write_stderr_line(&jinx_syntax::error::filter_ansi_escapes(w));
     }
     match result {
         Ok(res) => {
@@ -85,8 +85,15 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("{}", e.render(&positions));
+            write_stderr_line(&e.render(&positions));
             ExitCode::FAILURE
         }
     }
+}
+
+fn write_stderr_line(bytes: &[u8]) {
+    let stderr = std::io::stderr();
+    let mut lock = stderr.lock();
+    let _ = lock.write_all(bytes);
+    let _ = lock.write_all(b"\n");
 }

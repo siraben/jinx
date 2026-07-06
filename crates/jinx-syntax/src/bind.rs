@@ -188,7 +188,10 @@ fn bind(
             let (found, saw_with) = env.lookup(*name);
             if !found && !saw_with {
                 let n = crate::show::print_identifier_str(symbols.resolve(*name));
-                return Err(ParseError::new(format!("undefined variable '{n}'"), *pos));
+                let mut msg: Vec<u8> = b"undefined variable '".to_vec();
+                msg.extend_from_slice(&n);
+                msg.push(b'\'');
+                return Err(ParseError::new(msg, *pos));
             }
             Ok(())
         }

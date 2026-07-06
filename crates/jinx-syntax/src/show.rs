@@ -62,10 +62,10 @@ pub fn print_identifier(out: &mut Vec<u8>, s: &[u8]) {
     }
 }
 
-pub fn print_identifier_str(s: &[u8]) -> String {
+pub fn print_identifier_str(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     print_identifier(&mut out, s);
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// nixexpr.cc showAttrSelectionPath
@@ -73,7 +73,7 @@ pub fn show_attr_selection_path(
     exprs: &Exprs,
     symbols: &SymbolTable,
     path: &[AttrName],
-) -> String {
+) -> Vec<u8> {
     let mut out = Vec::new();
     for (i, an) in path.iter().enumerate() {
         if i > 0 {
@@ -87,7 +87,7 @@ pub fn show_attr_selection_path(
             out.extend_from_slice(b"}\"");
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// C++ `std::ostream << double` (defaultfloat, precision 6), i.e. printf %g.
@@ -139,7 +139,7 @@ fn show_expr(exprs: &Exprs, symbols: &SymbolTable, id: ExprId, out: &mut Vec<u8>
             out.push(b'(');
             show_expr(exprs, symbols, *e, out);
             out.extend_from_slice(b").");
-            out.extend_from_slice(show_attr_selection_path(exprs, symbols, attrpath).as_bytes());
+            out.extend_from_slice(&show_attr_selection_path(exprs, symbols, attrpath));
             if let Some(def) = def {
                 out.extend_from_slice(b" or (");
                 show_expr(exprs, symbols, *def, out);
@@ -150,7 +150,7 @@ fn show_expr(exprs: &Exprs, symbols: &SymbolTable, id: ExprId, out: &mut Vec<u8>
             out.extend_from_slice(b"((");
             show_expr(exprs, symbols, *e, out);
             out.extend_from_slice(b") ? ");
-            out.extend_from_slice(show_attr_selection_path(exprs, symbols, attrpath).as_bytes());
+            out.extend_from_slice(&show_attr_selection_path(exprs, symbols, attrpath));
             out.push(b')');
         }
         Expr::Attrs(a) => {
