@@ -40,6 +40,8 @@ struct Options {
     lint_abs: LintLevel,
     lint_short: LintLevel,
     pure_eval: bool,
+    /// Experimental features requested on the command line.
+    experimental: Vec<String>,
 }
 
 fn parse_lint_level(v: &str) -> Result<LintLevel, String> {
@@ -68,6 +70,7 @@ fn parse_args() -> Result<Options, String> {
         lint_abs: LintLevel::Allow,
         lint_short: LintLevel::Allow,
         pure_eval: false,
+        experimental: vec![],
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -109,12 +112,23 @@ fn parse_args() -> Result<Options, String> {
             "--pure-eval" => opts.pure_eval = true,
             "--show-trace" | "--no-show-trace" | "--read-write-mode" | "--dry-run"
             | "--indirect" => {}
-            "--extra-experimental-features" | "--experimental-features" | "--option"
-            | "--add-root" => {
-                let _ = need(&args, &mut i, a)?;
-                if a == "--option" {
-                    let _ = need(&args, &mut i, a)?;
+            "--extra-experimental-features" | "--experimental-features" => {
+                let v = need(&args, &mut i, a)?;
+                for f in v.split_whitespace() {
+                    opts.experimental.push(f.to_string());
                 }
+            }
+            "--option" => {
+                let n = need(&args, &mut i, a)?;
+                let v = need(&args, &mut i, a)?;
+                if n == "experimental-features" || n == "extra-experimental-features" {
+                    for f in v.split_whitespace() {
+                        opts.experimental.push(f.to_string());
+                    }
+                }
+            }
+            "--add-root" => {
+                let _ = need(&args, &mut i, a)?;
             }
             "--max-call-depth" => {
                 let _ = need(&args, &mut i, a)?;
@@ -262,6 +276,50 @@ fn abs_path(p: &str) -> Vec<u8> {
     }
 }
 
+/// Collect experimental features from the nix.conf pointed to by NIX_CONF_DIR
+/// (following `include`/`!include` directives), reading
+/// `experimental-features` and `extra-experimental-features`.
+fn nix_conf_experimental_features() -> Vec<String> {
+    let mut out = Vec::new();
+    let dir = match std::env::var("NIX_CONF_DIR") {
+        Ok(d) => std::path::PathBuf::from(d),
+        Err(_) => return out,
+    };
+    fn read_conf(path: &std::path::Path, out: &mut Vec<String>, depth: usize) {
+        if depth > 10 {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let base = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("include ") {
+                read_conf(&base.join(rest.trim()), out, depth + 1);
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("!include ") {
+                read_conf(&base.join(rest.trim()), out, depth + 1);
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                if k == "experimental-features" || k == "extra-experimental-features" {
+                    for f in v.split_whitespace() {
+                        out.push(f.to_string());
+                    }
+                }
+            }
+        }
+    }
+    read_conf(&dir.join("nix.conf"), &mut out, 0);
+    out
+}
+
 fn run_eval(opts: Options) -> ExitCode {
     let symbols = SymbolTable::new();
     let positions = PosTable::new();
@@ -271,6 +329,12 @@ fn run_eval(opts: Options) -> ExitCode {
         vm.store_dir = sd.into_bytes();
     }
     vm.pure_eval = opts.pure_eval;
+    for f in nix_conf_experimental_features() {
+        vm.experimental.enable(&f);
+    }
+    for f in &opts.experimental {
+        vm.experimental.enable(f);
+    }
 
     // Search path: -I entries first, then NIX_PATH.
     for e in &opts.include_paths {

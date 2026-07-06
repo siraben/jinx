@@ -89,7 +89,6 @@ const UNIMPLEMENTED: &[(&str, u8)] = &[
     ("fetchMercurial", 1),
     ("fetchTarball", 1),
     ("fetchTree", 1),
-    ("fromTOML", 1),
     ("__exec", 1),
     ("__fetchClosure", 1),
     ("__fetchurl", 1),
@@ -201,6 +200,7 @@ pub fn register_globals(vm: &mut VM) {
         Reg { name: "placeholder", arity: 1, func: prim_placeholder },
         Reg { name: "__match", arity: 2, func: prim_match },
         Reg { name: "__split", arity: 2, func: prim_split },
+        Reg { name: "fromTOML", arity: 1, func: prim_from_toml },
         Reg { name: "__getContext", arity: 1, func: prim_get_context },
         Reg { name: "__hasContext", arity: 1, func: prim_has_context },
     ];
@@ -1848,6 +1848,155 @@ fn derivation_strict_internal(
     let v = vm.new_bindings_value(&result);
     vm.temp_end(scope);
     Ok(v)
+}
+
+// ---------------------------------------------------------------------
+// fromTOML
+// ---------------------------------------------------------------------
+
+fn toml_subsecond(n: u32) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    let s = format!("{n:09}");
+    let nanos_part = n % 1000;
+    let micros_part = (n / 1000) % 1000;
+    let prec = if nanos_part != 0 {
+        9
+    } else if micros_part != 0 {
+        6
+    } else {
+        3
+    };
+    s[..prec].to_string()
+}
+
+fn toml_normalize_datetime(dt: &toml::value::Datetime) -> String {
+    use toml::value::Offset;
+    let mut out = String::new();
+    if let Some(d) = &dt.date {
+        out += &format!("{:04}-{:02}-{:02}", d.year, d.month, d.day);
+    }
+    if dt.date.is_some() && dt.time.is_some() {
+        out.push('T');
+    }
+    if let Some(t) = &dt.time {
+        out += &format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second);
+        let sub = toml_subsecond(t.nanosecond);
+        if !sub.is_empty() {
+            out.push('.');
+            out += &sub;
+        }
+    }
+    if let Some(off) = &dt.offset {
+        match off {
+            Offset::Z => out.push('Z'),
+            Offset::Custom { minutes } => {
+                let sign = if *minutes < 0 { '-' } else { '+' };
+                let m = minutes.unsigned_abs();
+                out += &format!("{sign}{:02}:{:02}", m / 60, m % 60);
+            }
+        }
+    }
+    out
+}
+
+fn toml_to_value(
+    vm: &mut VM,
+    t: &toml::Value,
+    ts: bool,
+    pos: PosIdx,
+) -> Result<VRef, ErrId> {
+    let v = match t {
+        toml::Value::Integer(i) => Value::int(*i),
+        toml::Value::Float(f) => Value::float(*f),
+        toml::Value::Boolean(b) => Value::bool(*b),
+        toml::Value::String(s) => mk_string(vm, s.as_bytes()),
+        toml::Value::Datetime(dt) => {
+            if !ts {
+                return Err(vm.new_err(
+                    ErrKind::Eval,
+                    "while parsing TOML: Dates and times are not supported",
+                    pos,
+                ));
+            }
+            let norm = toml_normalize_datetime(dt);
+            let tv = mk_string(vm, b"timestamp");
+            let tc = temp_cell(vm, tv);
+            let vv = mk_string(vm, norm.as_bytes());
+            let vc = temp_cell(vm, vv);
+            let mut entries = [
+                Attr {
+                    sym: vm.symbols.create(b"_type").0,
+                    pos: 0,
+                    val: tc,
+                },
+                Attr {
+                    sym: vm.symbols.create(b"value").0,
+                    pos: 0,
+                    val: vc,
+                },
+            ];
+            entries.sort_by_key(|a| a.sym);
+            vm.new_bindings_value(&entries)
+        }
+        toml::Value::Array(a) => {
+            let mut cells: Vec<VRef> = Vec::with_capacity(a.len());
+            for el in a {
+                cells.push(toml_to_value(vm, el, ts, pos)?);
+            }
+            vm.new_list_value(&cells)
+        }
+        toml::Value::Table(m) => {
+            let mut entries: Vec<Attr> = Vec::with_capacity(m.len());
+            for (k, val) in m {
+                let vc = toml_to_value(vm, val, ts, pos)?;
+                entries.push(Attr {
+                    sym: vm.symbols.create(k.as_bytes()).0,
+                    pos: 0,
+                    val: vc,
+                });
+            }
+            entries.sort_by_key(|a| a.sym);
+            entries.dedup_by_key(|a| a.sym);
+            vm.new_bindings_value(&entries)
+        }
+    };
+    Ok(temp_cell(vm, v))
+}
+
+fn prim_from_toml(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    let s = vm.force_string_no_ctx(
+        args[0],
+        pos,
+        "while evaluating the argument passed to builtins.fromTOML",
+    )?;
+    let text = match std::str::from_utf8(&s) {
+        Ok(t) => t,
+        Err(_) => {
+            return Err(vm.new_err(
+                ErrKind::Eval,
+                "while parsing TOML: invalid UTF-8",
+                pos,
+            ))
+        }
+    };
+    let parsed: toml::Value = match toml::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(vm.new_err(
+                ErrKind::Eval,
+                format!("while parsing TOML: {}", e.message()),
+                pos,
+            ))
+        }
+    };
+    let ts = vm.experimental.parse_toml_timestamps;
+    let scope = vm.temp_scope();
+    let r = toml_to_value(vm, &parsed, ts, pos);
+    let out = r.map(val);
+    vm.temp_end(scope);
+    out
 }
 
 // ---------------------------------------------------------------------

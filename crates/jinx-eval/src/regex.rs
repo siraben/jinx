@@ -222,6 +222,11 @@ enum Node {
         node: Box<Node>,
         min: u32,
         max: Option<u32>,
+        /// Capture-group indices nested within `node`. At the start of each
+        /// iteration these are reset to `None`, so a subgroup that did not
+        /// participate in the *last* iteration ends up unset (matching the
+        /// oracle, e.g. `((a)|(b))+` on "ab" gives group 2 = null).
+        groups: Vec<usize>,
     },
     /// A capturing group with its 1-based index.
     Group { idx: usize, node: Box<Node> },
@@ -327,10 +332,13 @@ impl<'a> Parser<'a> {
                     Some(b'*') | Some(b'+') | Some(b'?') | Some(b'{') => return Err(RegexError),
                     _ => {}
                 }
+                let mut groups = Vec::new();
+                collect_groups(&atom, &mut groups);
                 Ok(Node::Repeat {
                     node: Box::new(atom),
                     min,
                     max,
+                    groups,
                 })
             }
         }
@@ -585,6 +593,23 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Collect the capture-group indices appearing anywhere within `node`.
+fn collect_groups(node: &Node, out: &mut Vec<usize>) {
+    match node {
+        Node::Byte(_) | Node::Any | Node::Class(_) | Node::Start | Node::End => {}
+        Node::Concat(xs) | Node::Alt(xs) => {
+            for x in xs {
+                collect_groups(x, out);
+            }
+        }
+        Node::Repeat { node, .. } => collect_groups(node, out),
+        Node::Group { idx, node } => {
+            out.push(*idx);
+            collect_groups(node, out);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // POSIX character-class predicates (C/ASCII locale; bytes >= 128 are in no
 // class).
@@ -644,6 +669,7 @@ enum Cont<'c> {
         node: &'c Node,
         min: u32,
         max: Option<u32>,
+        groups: &'c [usize],
         count: u32,
         iter_start: usize,
         k: &'c Cont<'c>,
@@ -720,8 +746,13 @@ impl<'a> Search<'a> {
                 let k2 = Cont::CloseGroup(*idx, pos, k);
                 self.go(inner, pos, &k2);
             }
-            Node::Repeat { node, min, max } => {
-                self.repeat(node, *min, *max, 0, pos, k);
+            Node::Repeat {
+                node,
+                min,
+                max,
+                groups,
+            } => {
+                self.repeat(node, *min, *max, groups, 0, pos, k);
             }
         }
     }
@@ -747,6 +778,7 @@ impl<'a> Search<'a> {
                 node,
                 min,
                 max,
+                groups,
                 count,
                 iter_start,
                 k,
@@ -755,12 +787,12 @@ impl<'a> Search<'a> {
                     // The iteration matched empty. Do not loop forever; only
                     // keep iterating (with no progress) to satisfy `min`.
                     if count + 1 < *min {
-                        self.repeat(node, *min, *max, count + 1, pos, k);
+                        self.repeat(node, *min, *max, groups, count + 1, pos, k);
                     } else {
                         self.cont(k, pos);
                     }
                 } else {
-                    self.repeat(node, *min, *max, count + 1, pos, k);
+                    self.repeat(node, *min, *max, groups, count + 1, pos, k);
                 }
             }
         }
@@ -771,6 +803,7 @@ impl<'a> Search<'a> {
         node: &'c Node,
         min: u32,
         max: Option<u32>,
+        groups: &'c [usize],
         count: u32,
         pos: usize,
         k: &Cont<'c>,
@@ -779,15 +812,25 @@ impl<'a> Search<'a> {
         // Greedy: try one more iteration before stopping, so the first path
         // found in DFS order is the one with the most repetitions.
         if can_more {
+            // Reset capture slots nested in the repeated node at the start of
+            // this iteration, so subgroups reflect only the last iteration.
+            let saved: Vec<Option<(usize, usize)>> = groups.iter().map(|&g| self.caps[g]).collect();
+            for &g in groups {
+                self.caps[g] = None;
+            }
             let k2 = Cont::RepeatIter {
                 node,
                 min,
                 max,
+                groups,
                 count,
                 iter_start: pos,
                 k,
             };
             self.go(node, pos, &k2);
+            for (i, &g) in groups.iter().enumerate() {
+                self.caps[g] = saved[i];
+            }
         }
         if count >= min {
             self.cont(k, pos);
@@ -1088,6 +1131,12 @@ mod tests {
         // last iteration capture
         assert_eq!(match_groups("(a|b)*", "abab"), Some(vec![some("b")]));
         assert_eq!(match_groups("x*", ""), Some(vec![]));
+        // subgroups nested in a repeated group reset each iteration
+        assert_eq!(
+            match_groups("((a)|(b))+", "ab"),
+            Some(vec![some("b"), None, some("b")])
+        );
+        assert_eq!(match_groups("(a?)*", "aa"), Some(vec![some("")]));
     }
 
     #[test]

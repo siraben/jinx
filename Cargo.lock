@@ -547,10 +547,9 @@ dependencies = [
 name = "jinx-flake"
 version = "0.1.0"
 dependencies = [
- "bstr",
- "jinx-eval",
  "jinx-fetch",
  "jinx-store",
+ "regex",
  "serde",
  "serde_json",
 ]

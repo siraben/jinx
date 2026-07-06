@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "flakes": [
+    {
+      "from": { "type": "indirect", "id": "nixpkgs" },
+      "to": { "type": "github", "owner": "NixOS", "repo": "nixpkgs" }
+    },
+    {
+      "from": { "type": "indirect", "id": "flake-utils" },
+      "to": { "type": "github", "owner": "numtide", "repo": "flake-utils", "dir": "sub" }
+    },
+    {
+      "exact": true,
+      "from": { "type": "indirect", "id": "pinned" },
+      "to": { "type": "github", "owner": "NixOS", "repo": "nixpkgs", "rev": "0000000000000000000000000000000000000000" }
+    }
+  ]
+}
