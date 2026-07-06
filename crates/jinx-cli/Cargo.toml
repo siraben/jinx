@@ -1,0 +1,23 @@
+[package]
+name = "jinx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jinx"
+path = "src/main.rs"
+
+[dependencies]
+jinx-syntax.workspace = true
+jinx-eval.workspace = true
+jinx-store.workspace = true
+jinx-fetch.workspace = true
+jinx-flake.workspace = true
+jinx-jit = { workspace = true, optional = true }
+clap.workspace = true
+bstr.workspace = true
+
+[features]
+default = ["jit"]
+jit = ["dep:jinx-jit"]
