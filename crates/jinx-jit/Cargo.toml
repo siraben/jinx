@@ -1,0 +1,13 @@
+[package]
+name = "jinx-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jinx-eval.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-frontend.workspace = true
+cranelift-codegen.workspace = true
+target-lexicon = "0.13"

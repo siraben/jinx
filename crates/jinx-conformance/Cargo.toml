@@ -1,0 +1,16 @@
+[package]
+name = "jinx-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jinx-conformance"
+path = "src/main.rs"
+
+[dependencies]
+jinx-syntax.workspace = true
+jinx-eval.workspace = true
+rayon.workspace = true
+clap.workspace = true
+bstr.workspace = true
