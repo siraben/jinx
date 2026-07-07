@@ -69,7 +69,19 @@ pub fn get_flake(vm: &mut VM, flakeref_str: &str, pos: PosIdx) -> Result<VRef, E
         fetched.real_dir.clone(),
     );
 
-    call_flake(vm, &fetched, &subdir, pos)
+    // Read the flake's lock file (from the flake subdir), or synthesize a
+    // single-root lock for a lockfile-less flake (port of `readLockFile`).
+    let mut lock_path = fetched.real_dir.clone();
+    if !subdir.is_empty() {
+        lock_path.push(&subdir);
+    }
+    lock_path.push("flake.lock");
+    let lock_str = match std::fs::read_to_string(&lock_path) {
+        Ok(s) => s,
+        Err(_) => jinx_flake::LockFile::empty().to_json().to_string(),
+    };
+
+    call_flake(vm, &fetched, &subdir, &lock_str, pos)
 }
 
 /// Parse and (for indirect refs) registry-resolve a flakeref into locked input
@@ -85,7 +97,8 @@ fn resolve_flakeref(
     let mut attrs = fref.attrs.clone();
     let mut subdir = fref.subdir.clone();
 
-    // Registry resolution for indirect refs.
+    // Registry resolution for indirect refs. Registry-resolved `path:` targets
+    // stay path inputs (only *bare* CLI paths are promoted to git below).
     if maybe_get_str(&attrs, "type") == Some("indirect") {
         let registries = registry::default_registries();
         let (resolved, extra) = registry::lookup_in_registries(&attrs, &registries)
@@ -94,15 +107,18 @@ fn resolve_flakeref(
         if let Some(dir) = maybe_get_str(&extra, "dir") {
             subdir = dir.to_string();
         }
-        // A resolved indirect ref may itself carry a `dir`.
         if let Some(dir) = maybe_get_str(&attrs, "dir") {
             subdir = dir.to_string();
             attrs.remove("dir");
         }
+        return Ok((attrs, subdir));
     }
 
-    // Convert a bare local path inside a git checkout into a `git` input.
-    if maybe_get_str(&attrs, "type") == Some("path") {
+    // Convert a *bare* local path inside a git checkout into a `git` input
+    // (port of parsePathFlakeRefWithFragment's `.git` walk). Explicit `path:`
+    // URIs are left untouched.
+    let is_bare_path = !flakeref_str.starts_with("path:");
+    if is_bare_path && maybe_get_str(&attrs, "type") == Some("path") {
         if let Some(path) = maybe_get_str(&attrs, "path").map(|s| s.to_string()) {
             if let Some((root, sub)) = detect_git_root(&path) {
                 let mut g = Attrs::new();
@@ -355,7 +371,13 @@ fn format_git_date(secs: i64) -> String {
 }
 
 /// Evaluate `call-flake.nix` with (lockFileStr, overrides, fetchTreeFinal).
-fn call_flake(vm: &mut VM, f: &Fetched, subdir: &str, pos: PosIdx) -> Result<VRef, ErrId> {
+fn call_flake(
+    vm: &mut VM,
+    f: &Fetched,
+    subdir: &str,
+    lock_str: &str,
+    pos: PosIdx,
+) -> Result<VRef, ErrId> {
     let scope = vm.temp_scope();
 
     let source_info = build_source_info(vm, f);
@@ -375,8 +397,6 @@ fn call_flake(vm: &mut VM, f: &Fetched, subdir: &str, pos: PosIdx) -> Result<VRe
     let overrides = mk_attrs(vm, vec![(b"root".to_vec(), override_entry)]);
     vm.temp_roots.push(overrides);
 
-    // The single-root lock file (no declared inputs → one node).
-    let lock_str = jinx_flake::LockFile::empty().to_json().to_string();
     let lock_v = vm.new_string_value(lock_str.as_bytes(), std::ptr::null_mut());
     let lock_cell = root_cell(vm, lock_v);
 
