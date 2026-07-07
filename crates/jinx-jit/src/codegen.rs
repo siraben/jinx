@@ -685,10 +685,81 @@ fn translate_op(
 
         // ---- helper: selection ----
         Op::Select { sym, cache } => {
+            // Inline monomorphic-cache hit: subject already a WHNF attrset,
+            // same bindings object as last time at this site, and the cached
+            // slot still names `sym` (all re-checked, exactly like
+            // `VM::op_select`'s hit path). Anything else -> helper.
+            let cache_addr = &prog.select_caches[cache as usize]
+                as *const std::cell::Cell<jinx_eval::chunk::SelectCache>
+                as i64;
+            let cache_attrs_off =
+                std::mem::offset_of!(jinx_eval::chunk::SelectCache, attrs) as i32;
+            let cache_slot_off =
+                std::mem::offset_of!(jinx_eval::chunk::SelectCache, slot) as i32;
+            let attr_sym_off = std::mem::offset_of!(jinx_eval::value::Attr, sym) as i32;
+            let attr_pos_off = std::mem::offset_of!(jinx_eval::value::Attr, pos) as i32;
+            let attr_val_off = std::mem::offset_of!(jinx_eval::value::Attr, val) as i32;
+            let lsp_off = std::mem::offset_of!(jinx_eval::vm::VM, last_select_pos) as i32;
+
+            let slow = tr.b.create_block();
+            let nb = next();
+
+            let len = tr.load_len();
+            let ea = tr.slot_off(len, -1);
+            let cell = tr.b.ins().load(I64, tr.flags, ea, 0);
+            let tag = tr.tag_of(cell);
+            let is_attrs = tr.b.ins().icmp_imm(IntCC::Equal, tag, Tag::Attrs as i64);
+            let c1 = tr.b.create_block();
+            tr.b.ins().brif(is_attrs, c1, &[], slow, &[]);
+
+            // c1: same bindings object as cached?
+            tr.b.switch_to_block(c1);
+            let obj = tr.w1(cell);
+            let caddr = tr.b.ins().iconst(I64, cache_addr);
+            let cattrs = tr.b.ins().load(I64, tr.flags, caddr, cache_attrs_off);
+            let same = tr.b.ins().icmp(IntCC::Equal, obj, cattrs);
+            let c2 = tr.b.create_block();
+            tr.b.ins().brif(same, c2, &[], slow, &[]);
+
+            // c2: slot in range and still naming `sym`?
+            tr.b.switch_to_block(c2);
+            let slot = tr
+                .b
+                .ins()
+                .uload32(tr.flags, caddr, cache_slot_off);
+            let hdr = tr.b.ins().load(I64, tr.flags, obj, 0);
+            let blen = tr.b.ins().ushr_imm(hdr, 8);
+            let in_range = tr.b.ins().icmp(IntCC::UnsignedLessThan, slot, blen);
+            let c3 = tr.b.create_block();
+            tr.b.ins().brif(in_range, c3, &[], slow, &[]);
+
+            tr.b.switch_to_block(c3);
+            // entry address = obj + 8 (header) + slot * 16
+            let soff = tr.b.ins().ishl_imm(slot, 4);
+            let ebase = tr.b.ins().iadd_imm(obj, 8);
+            let entry = tr.b.ins().iadd(ebase, soff);
+            let esym = tr.b.ins().uload32(tr.flags, entry, attr_sym_off);
+            let want = tr.b.ins().iconst(I64, sym as i64);
+            let hit = tr.b.ins().icmp(IntCC::Equal, esym, want);
+            let c4 = tr.b.create_block();
+            tr.b.ins().brif(hit, c4, &[], slow, &[]);
+
+            // c4: replace TOS with the attr's value cell; record select pos.
+            tr.b.switch_to_block(c4);
+            let aval = tr.b.ins().load(I64, tr.flags, entry, attr_val_off);
+            tr.b.ins().store(tr.flags, aval, ea, 0);
+            let epos = tr.b.ins().load(I32, tr.flags, entry, attr_pos_off);
+            tr.b.ins().store(tr.flags, epos, tr.vm, lsp_off);
+            tr.b.ins().jump(nb, &[]);
+
+            // slow: the generic helper (fills the cache on success).
+            tr.b.switch_to_block(slow);
             let s = tr.iconst32(sym);
             let cc = tr.iconst32(cache);
             let p = tr.iconst32(pos);
-            erroring!("jinx_select", &[tr.vm, tr.fi, s, cc, p])
+            let st = tr.call("jinx_select", &[tr.vm, tr.fi, s, cc, p]);
+            tr.err_check(st, err_block, nb);
+            true
         }
         Op::SelectForce(t) => {
             let tt = tr.iconst32(t);
