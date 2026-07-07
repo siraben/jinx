@@ -597,19 +597,59 @@ fn translate_op(
             true
         }
         Op::ForceBool(c) => {
+            // Fast path: TOS already True/False -> the helper would be a
+            // no-op force + passing type check. tags True=2, False=1.
+            let len = tr.load_len();
+            let ea = tr.slot_off(len, -1);
+            let cell = tr.b.ins().load(I64, tr.flags, ea, 0);
+            let tag = tr.tag_of(cell);
+            let m1 = tr.b.ins().iadd_imm(tag, -(Tag::False as i64));
+            let is_bool =
+                tr.b.ins()
+                    .icmp_imm(IntCC::UnsignedLessThanOrEqual, m1, 1);
+            let slow = tr.b.create_block();
+            let nb = next();
+            tr.b.ins().brif(is_bool, nb, &[], slow, &[]);
+            tr.b.switch_to_block(slow);
             let p = tr.iconst32(pos);
             let cc = tr.iconst32(c);
-            erroring!("jinx_force_bool_top", &[tr.vm, p, cc])
+            let st = tr.call("jinx_force_bool_top", &[tr.vm, p, cc]);
+            tr.err_check(st, err_block, nb);
+            true
         }
         Op::ForceAttrs(c) => {
+            // Fast path: TOS already an attrset (force no-op, check passes).
+            let len = tr.load_len();
+            let ea = tr.slot_off(len, -1);
+            let cell = tr.b.ins().load(I64, tr.flags, ea, 0);
+            let tag = tr.tag_of(cell);
+            let is = tr.b.ins().icmp_imm(IntCC::Equal, tag, Tag::Attrs as i64);
+            let slow = tr.b.create_block();
+            let nb = next();
+            tr.b.ins().brif(is, nb, &[], slow, &[]);
+            tr.b.switch_to_block(slow);
             let p = tr.iconst32(pos);
             let cc = tr.iconst32(c);
-            erroring!("jinx_force_attrs_top", &[tr.vm, p, cc])
+            let st = tr.call("jinx_force_attrs_top", &[tr.vm, p, cc]);
+            tr.err_check(st, err_block, nb);
+            true
         }
         Op::ForceList(c) => {
+            // Fast path: TOS already a list.
+            let len = tr.load_len();
+            let ea = tr.slot_off(len, -1);
+            let cell = tr.b.ins().load(I64, tr.flags, ea, 0);
+            let tag = tr.tag_of(cell);
+            let is = tr.b.ins().icmp_imm(IntCC::Equal, tag, Tag::List as i64);
+            let slow = tr.b.create_block();
+            let nb = next();
+            tr.b.ins().brif(is, nb, &[], slow, &[]);
+            tr.b.switch_to_block(slow);
             let p = tr.iconst32(pos);
             let cc = tr.iconst32(c);
-            erroring!("jinx_force_list_top", &[tr.vm, p, cc])
+            let st = tr.call("jinx_force_list_top", &[tr.vm, p, cc]);
+            tr.err_check(st, err_block, nb);
+            true
         }
 
         // ---- helper: variables / allocation ----
@@ -762,8 +802,27 @@ fn translate_op(
             true
         }
         Op::SelectForce(t) => {
+            // Same WHNF fast path as Force (the helper only adds an error
+            // trace on failure; a WHNF TOS can't fail).
+            let len = tr.load_len();
+            let ea = tr.slot_off(len, -1);
+            let cell = tr.b.ins().load(I64, tr.flags, ea, 0);
+            let tag = tr.tag_of(cell);
+            let is_thunk = tr.b.ins().icmp_imm(IntCC::Equal, tag, Tag::Thunk as i64);
+            let is_bh_failed = tr.b.ins().icmp_imm(
+                IntCC::UnsignedGreaterThanOrEqual,
+                tag,
+                Tag::Blackhole as i64,
+            );
+            let need = tr.b.ins().bor(is_thunk, is_bh_failed);
+            let slow = tr.b.create_block();
+            let nb = next();
+            tr.b.ins().brif(need, slow, &[], nb, &[]);
+            tr.b.switch_to_block(slow);
             let tt = tr.iconst32(t);
-            erroring!("jinx_select_force", &[tr.vm, tr.fi, tt])
+            let st = tr.call("jinx_select_force", &[tr.vm, tr.fi, tt]);
+            tr.err_check(st, err_block, nb);
+            true
         }
         Op::SelectOr { sym, target } => {
             let s = tr.iconst32(sym);
