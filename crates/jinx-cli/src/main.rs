@@ -307,20 +307,47 @@ fn run(opts: Options) -> ExitCode {
 }
 
 fn run_parse(opts: &Options) -> ExitCode {
-    if !opts.read_stdin || !opts.files.is_empty() {
-        eprintln!("error: only '--parse -' is supported in this milestone");
+    let file = opts.files.first().cloned();
+    if !(opts.read_stdin && opts.files.is_empty()) && file.is_none() {
+        eprintln!("error: --parse expects a file or '-'");
         return ExitCode::FAILURE;
     }
-    let mut source = Vec::new();
-    if let Err(e) = std::io::stdin().read_to_end(&mut source) {
-        eprintln!("error: reading stdin: {e}");
-        return ExitCode::FAILURE;
-    }
-    let base_path = cwd_string();
     let home = std::env::var("HOME").ok();
     let mut positions = PosTable::new();
-    let origin = Origin::Stdin {
-        source: source.clone(),
+    let (source, origin, base_path) = if let Some(file) = file {
+        // File argument: origin is the (absolutized) path; relative path
+        // literals resolve against the file's directory, like nix-instantiate.
+        let path = if file.starts_with('/') {
+            PathBuf::from(&file)
+        } else {
+            PathBuf::from(cwd_string()).join(&file)
+        };
+        let source = match std::fs::read(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: opening file '{}': {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let base_path = path
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(cwd_string);
+        let origin = Origin::Path {
+            path: path.to_string_lossy().into_owned(),
+            source: source.clone(),
+        };
+        (source, origin, base_path)
+    } else {
+        let mut source = Vec::new();
+        if let Err(e) = std::io::stdin().read_to_end(&mut source) {
+            eprintln!("error: reading stdin: {e}");
+            return ExitCode::FAILURE;
+        }
+        let origin = Origin::Stdin {
+            source: source.clone(),
+        };
+        (source, origin, cwd_string())
     };
     let mut warnings = Vec::new();
     let result = parse_and_bind(
