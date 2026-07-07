@@ -251,7 +251,10 @@ pub fn register_globals(vm: &mut VM) {
         .unwrap_or(0);
     let ct = immortal::cell(Value::int(now));
     add_const(vm, "__currentTime", ct, &mut builtin_entries);
-    let nv = immortal::cell(immortal::string(b"2.36.0"));
+    // Match the oracle's version string. Must not compareVersions-newer than
+    // real nix (nixpkgs branches on builtins.nixVersion); a bare "2.36.0" would
+    // sort *after* the "…pre…" release the oracle reports.
+    let nv = immortal::cell(immortal::string(b"2.36.0pre20260706_cff1f11"));
     add_const(vm, "__nixVersion", nv, &mut builtin_entries);
     let lv = immortal::cell(Value::int(6));
     add_const(vm, "__langVersion", lv, &mut builtin_entries);
@@ -407,7 +410,14 @@ fn compare_values(vm: &mut VM, a: VRef, b: VRef, pos: PosIdx, ctx: &str) -> Resu
         (Tag::Int, Tag::Float) => return Ok((va.as_int() as f64) < vb.as_float()),
         _ => {}
     }
-    if va.tag() != vb.tag() {
+    // C++ compares `v1->type() != v2->type()`; `true` and `false` are both
+    // nBool (same type), so they take the "incomparable" branch below, not this
+    // one. jinx stores them as distinct tags, so normalize booleans here.
+    let norm = |t: Tag| match t {
+        Tag::True | Tag::False => Tag::True,
+        other => other,
+    };
+    if norm(va.tag()) != norm(vb.tag()) {
         let (pa, pb) = (
             print::print_value_err(vm, &va),
             print::print_value_err(vm, &vb),

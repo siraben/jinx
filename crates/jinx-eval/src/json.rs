@@ -348,7 +348,13 @@ pub fn from_json(vm: &mut VM, s: &[u8], pos: PosIdx) -> Result<Value, ErrId> {
                 String::from_utf8_lossy(s),
                 err
             );
-            return Err(vm.new_err(ErrKind::Eval, msg, pos));
+            // C++ prim_fromJSON catches only JSONParseError (a *parse* failure)
+            // and adds this frame; semantic errors from json_to_value (integer
+            // overflow, null bytes) are NOT wrapped. The base message stays
+            // serde's — nlohmann's exact wording isn't replicated.
+            let e = vm.new_err(ErrKind::Eval, msg, pos);
+            vm.add_trace(e, pos, "while decoding a JSON string");
+            return Err(e);
         }
     };
     json_to_value(vm, &parsed)

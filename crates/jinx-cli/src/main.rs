@@ -259,6 +259,10 @@ fn main() -> ExitCode {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: {e}");
+            // C++ Args::parseCmdline prints the help hint after any usage error
+            // (e.g. an unrecognised flag), using the program name as invoked.
+            let argv0 = std::env::args().next().unwrap_or_else(|| "nix-instantiate".to_string());
+            eprintln!("Try '{argv0} --help' for more information.");
             return ExitCode::FAILURE;
         }
     };
