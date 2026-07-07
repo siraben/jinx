@@ -734,13 +734,22 @@ fn run_eval(opts: Options) -> ExitCode {
             report_err(&vm, e);
             return ExitCode::FAILURE;
         }
-        // Top-level auto-call (autoCallFunction; a no-op unless the value is a
-        // lambda/functor whose arguments can be auto-supplied).
-        let v = match auto_call(&mut vm, &auto_args, v) {
-            Ok(c) => c,
-            Err(e) => {
-                report_err(&vm, e);
-                return ExitCode::FAILURE;
+        // Top-level auto-call. nix-instantiate.cc only auto-calls the final
+        // result when `--arg`/`--argstr` were given:
+        //   `if (autoArgs.empty()) vRes = v; else autoCallFunction(autoArgs,v,vRes)`.
+        // With no auto-args, a bare `{ x ? 1 }: x` must print as `<LAMBDA>`, not
+        // be silently applied with its defaults. The `-A`/findAlongAttrPath
+        // traversal auto-call stays (it happens inside find_along_attr_path),
+        // so `-A hello` still resolves.
+        let v = if opts.auto_args.is_empty() {
+            v
+        } else {
+            match auto_call(&mut vm, &auto_args, v) {
+                Ok(c) => c,
+                Err(e) => {
+                    report_err(&vm, e);
+                    return ExitCode::FAILURE;
+                }
             }
         };
         // Instantiate mode (no --eval): nix-instantiate collects derivations
