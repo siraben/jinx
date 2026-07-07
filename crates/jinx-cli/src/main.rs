@@ -135,7 +135,7 @@ fn parse_args() -> Result<Options, String> {
             "--trace-verbose" => opts.trace_verbose = true,
             "--abort-on-warn" => opts.abort_on_warn = true,
             "--no-abort-on-warn" => opts.abort_on_warn = false,
-            "--read-write-mode" | "--dry-run" | "--indirect" => {}
+            "--read-write-mode" | "--readonly-mode" | "--dry-run" | "--indirect" => {}
             "--extra-experimental-features" | "--experimental-features" => {
                 let v = need(&args, &mut i, a)?;
                 for f in v.split_whitespace() {
@@ -578,6 +578,7 @@ fn run_eval(opts: Options) -> ExitCode {
     };
 
     let stdout = std::io::stdout();
+    let mut printed_gc_warning = false;
     for ap in &attr_paths {
         let v = match find_along_attr_path(&mut vm, root, ap, &auto_args) {
             Ok(v) => v,
@@ -590,17 +591,14 @@ fn run_eval(opts: Options) -> ExitCode {
             report_err(&vm, e);
             return ExitCode::FAILURE;
         }
-        // Top-level auto-call when auto args were given.
-        let v = if !auto_args.is_empty() {
-            match auto_call(&mut vm, &auto_args, v) {
-                Ok(c) => c,
-                Err(e) => {
-                    report_err(&vm, e);
-                    return ExitCode::FAILURE;
-                }
+        // Top-level auto-call (autoCallFunction; a no-op unless the value is a
+        // lambda/functor whose arguments can be auto-supplied).
+        let v = match auto_call(&mut vm, &auto_args, v) {
+            Ok(c) => c,
+            Err(e) => {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
             }
-        } else {
-            v
         };
         // Instantiate mode (no --eval): nix-instantiate collects derivations
         // and validates each `drvPath`. jinx has no build backend, but the
@@ -611,6 +609,27 @@ fn run_eval(opts: Options) -> ExitCode {
                 report_err(&vm, e);
                 return ExitCode::FAILURE;
             }
+            // Collect derivations (port of `getDerivations`) and print each
+            // `drvPath`, like nix-instantiate's default mode.
+            let mut drv_paths: Vec<Vec<u8>> = Vec::new();
+            if let Err(e) = get_derivations(&mut vm, v, true, &mut drv_paths) {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+            // C++ prints the GC-root warning to stderr once per run in
+            // read-only/no-add-root mode (not captured by the gate's stdout).
+            if !printed_gc_warning {
+                write_stderr_line(
+                    b"warning: you did not specify '--add-root'; the result might be removed by the garbage collector",
+                );
+                printed_gc_warning = true;
+            }
+            let mut lock = stdout.lock();
+            for p in &drv_paths {
+                let _ = lock.write_all(p);
+                let _ = lock.write_all(b"\n");
+            }
+            let _ = lock.flush();
             continue;
         }
         if opts.strict && !opts.xml {
@@ -715,6 +734,73 @@ fn compile_expr_thunk(vm: &mut VM, source: &[u8]) -> Result<VRef, Vec<u8>> {
     Ok(vm.alloc_cell(v))
 }
 
+/// Port of `getDerivations` (get-drvs.cc): collect the `drvPath`s reachable
+/// from `v`. A derivation (`type == "derivation"`) yields its own drvPath;
+/// otherwise `v` is an attrset/list recursed into — at the top level always,
+/// nested only through attrs whose `recurseForDerivations == true`.
+fn get_derivations(
+    vm: &mut VM,
+    v: VRef,
+    top: bool,
+    out: &mut Vec<Vec<u8>>,
+) -> Result<(), ErrId> {
+    vm.force(v, NO_POS)?;
+    let vv = val(v);
+    match vv.tag() {
+        Tag::Attrs => {
+            let is_drv = matches!(attrs_get(&vv, vm.syms.type_), Some(a) if {
+                vm.force(a.val, NO_POS)?;
+                let tv = val(a.val);
+                tv.tag() == Tag::String && str_bytes(&tv) == b"derivation"
+            });
+            if is_drv {
+                if let Some(a) = attrs_get(&vv, vm.syms.drv_path) {
+                    let (s, _c) = vm.coerce_to_string(
+                        a.val,
+                        NO_POS,
+                        "while evaluating the 'drvPath' attribute of a derivation",
+                        false,
+                        false,
+                        false,
+                    )?;
+                    out.push(s);
+                }
+                return Ok(());
+            }
+            // Not a derivation: recurse at the top level, or when the set opts
+            // in via `recurseForDerivations = true`.
+            let recurse = top
+                || matches!(attrs_get(&vv, vm.symbols.create(b"recurseForDerivations")), Some(a) if {
+                    vm.force(a.val, NO_POS)?;
+                    val(a.val).tag() == Tag::True
+                });
+            if !recurse {
+                return Ok(());
+            }
+            // Attrs are stored sorted by symbol; C++ getDerivations orders by
+            // attribute name. Re-sort by name bytes to match.
+            let entries = jinx_eval::vm::attrs_entries(&vv).to_vec();
+            let mut named: Vec<(Vec<u8>, VRef)> = entries
+                .iter()
+                .map(|a| (vm.symbols.resolve(Symbol(a.sym)).to_vec(), a.val))
+                .collect();
+            named.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, cell) in named {
+                get_derivations(vm, cell, false, out)?;
+            }
+            Ok(())
+        }
+        Tag::List => {
+            let elems = list_elems(&vv).to_vec();
+            for e in elems {
+                get_derivations(vm, e, false, out)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Port of autoCallFunction.
 fn auto_call(vm: &mut VM, args: &[(Symbol, VRef)], fun: VRef) -> Result<VRef, ErrId> {
     vm.force(fun, NO_POS)?;
@@ -795,10 +881,10 @@ fn find_along_attr_path(
     }
     let mut v = root;
     for t in &tokens {
-        // Auto-call before each selection.
-        if !auto_args.is_empty() {
-            v = auto_call(vm, auto_args, v)?;
-        }
+        // Auto-call before each selection (C++ findAlongAttrPath always runs
+        // autoCallFunction; with no `--arg`s it still applies a lambda whose
+        // formals all have defaults / an ellipsis, e.g. nixpkgs' `import ./.`).
+        v = auto_call(vm, auto_args, v)?;
         vm.force(v, NO_POS)?;
         let cur = val(v);
         if let Ok(n) = t.parse::<usize>() {
