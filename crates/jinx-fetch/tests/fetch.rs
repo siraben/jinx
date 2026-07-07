@@ -27,10 +27,10 @@ use jinx_fetch::fetchers::Input;
 use jinx_store::hash::HashAlgorithm;
 use jinx_store::store_path::{FileIngestionMethod, FixedOutputInfo, StoreDir};
 
-/// Golden for the tree named `gtree`.
-const GOLDEN_GTREE: &str = "/nix/store/bg5rj219dqv4fijvhv410ybf59y1d8q6-gtree";
+/// Golden for the tree named `gtree` (from `nix-store --add` of the fixture).
+const GOLDEN_GTREE: &str = "/nix/store/2bz72j1dz95x9zrqydjq7bhpsfjdrysd-gtree";
 /// Golden for the same content named `source` (what a path input yields).
-const GOLDEN_SOURCE: &str = "/nix/store/ap6rq6cf3wh8pw8d7fhm1h03bcdvv8p0-source";
+const GOLDEN_SOURCE: &str = "/nix/store/rp2z2iw4jib5ak5ax6zxgzbsb02mjwx8-source";
 
 fn make_tree(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("jinx-fetch-test-{tag}-{}", std::process::id()));
