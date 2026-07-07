@@ -27,6 +27,7 @@ fn other_err(msg: String) -> io::Error {
 /// filter, case hack off). Regular files, directories (entries sorted by
 /// byte-wise name order) and symlinks are supported.
 pub fn dump_path(path: impl AsRef<Path>, sink: &mut impl Write) -> io::Result<()> {
+    crate::nar_stats::record_dump_call();
     wire::write_bytes(sink, NAR_VERSION_MAGIC_1)?;
     dump(path.as_ref(), sink, 0)
 }
@@ -61,6 +62,7 @@ fn dump(path: &Path, sink: &mut impl Write, depth: usize) -> io::Result<()> {
         }
         dump_contents(path, st.len(), sink)?;
     } else if ft.is_dir() {
+        crate::nar_stats::record_dir();
         wire::write_bytes(sink, b"type")?;
         wire::write_bytes(sink, b"directory")?;
 
@@ -88,6 +90,7 @@ fn dump(path: &Path, sink: &mut impl Write, depth: usize) -> io::Result<()> {
             wire::write_bytes(sink, b")")?;
         }
     } else if ft.is_symlink() {
+        crate::nar_stats::record_symlink();
         wire::write_bytes(sink, b"type")?;
         wire::write_bytes(sink, b"symlink")?;
         wire::write_bytes(sink, b"target")?;
@@ -126,6 +129,7 @@ pub fn dump_path_filtered<F>(
 where
     F: FnMut(&Path) -> io::Result<bool>,
 {
+    crate::nar_stats::record_dump_call();
     wire::write_bytes(sink, NAR_VERSION_MAGIC_1)?;
     dump_filtered(path.as_ref(), sink, 0, filter)
 }
@@ -163,6 +167,7 @@ where
         }
         dump_contents(path, st.len(), sink)?;
     } else if ft.is_dir() {
+        crate::nar_stats::record_dir();
         wire::write_bytes(sink, b"type")?;
         wire::write_bytes(sink, b"directory")?;
 
@@ -192,6 +197,7 @@ where
             wire::write_bytes(sink, b")")?;
         }
     } else if ft.is_symlink() {
+        crate::nar_stats::record_symlink();
         wire::write_bytes(sink, b"type")?;
         wire::write_bytes(sink, b"symlink")?;
         wire::write_bytes(sink, b"target")?;
@@ -217,6 +223,7 @@ where
 /// Port of `dumpContents`: `contents` tag, u64 size, raw bytes, zero
 /// padding to 8 bytes.
 fn dump_contents(path: &Path, size: u64, sink: &mut impl Write) -> io::Result<()> {
+    crate::nar_stats::record_file(size);
     wire::write_bytes(sink, b"contents")?;
     wire::write_u64(sink, size)?;
     let mut file = fs::File::open(path)?;
@@ -262,5 +269,7 @@ pub fn dump_path_to_vec(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 pub fn hash_path(path: impl AsRef<Path>, algo: HashAlgorithm) -> io::Result<(Hash, u64)> {
     let mut sink = HashSink::new(algo);
     dump_path(path, &mut sink)?;
-    Ok(sink.finish())
+    let (hash, sz) = sink.finish();
+    crate::nar_stats::record_nar_bytes(sz);
+    Ok((hash, sz))
 }

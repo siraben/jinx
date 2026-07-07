@@ -4580,10 +4580,12 @@ fn add_filtered_path(
         if let Some(entries) = vm.filtered_path_cache.get(key) {
             for (f, _hash, sp) in entries {
                 if filter_ident_eq(*f, filter) {
+                    jinx_store::nar_stats::record_cache_hit();
                     return Ok(sp.clone());
                 }
             }
         }
+        jinx_store::nar_stats::record_cache_miss();
     }
 
     // Build the content-address "dump": raw contents for Flat, a (filtered) NAR
@@ -4620,6 +4622,7 @@ fn add_filtered_path(
         }
     };
 
+    jinx_store::nar_stats::record_nar_bytes(dump.len() as u64);
     let hash = hash_string(HashAlgorithm::Sha256, &dump);
     let store = vm.store();
     let sp = store
