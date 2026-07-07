@@ -2346,6 +2346,79 @@ fn prim_flake_ref_to_string(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], 
 // fromTOML
 // ---------------------------------------------------------------------
 
+/// Reproduce toml11's `parse_dec_integer` out-of-range diagnostic (as embedded
+/// by C++ `builtins.fromTOML` under the pseudo-filename `fromTOML`). The `toml`
+/// crate only reports "number too large/small to fit in target type", so we
+/// re-scan the source for the first decimal integer literal that overflows a
+/// signed 64-bit range and rebuild toml11's multi-line, caret-annotated
+/// message. Returns the full `while parsing TOML: ...` text.
+fn toml_integer_overflow_message(src: &str) -> Option<String> {
+    for (li, line) in src.split('\n').enumerate() {
+        let bytes = line.as_bytes();
+        let n = bytes.len();
+        let mut i = 0;
+        while i < n {
+            let prev_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'.');
+            let starts_num = bytes[i].is_ascii_digit()
+                || ((bytes[i] == b'+' || bytes[i] == b'-')
+                    && i + 1 < n
+                    && bytes[i + 1].is_ascii_digit());
+            if prev_ok && starts_num {
+                let start = i;
+                let mut j = i;
+                if bytes[j] == b'+' || bytes[j] == b'-' {
+                    j += 1;
+                }
+                let digits_start = j;
+                while j < n && (bytes[j].is_ascii_digit() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                // Only bare decimal integers (not floats, hex/oct/bin, dates).
+                let is_other = j < n
+                    && matches!(bytes[j], b'.' | b'e' | b'E' | b'x' | b'o' | b'b' | b':' | b'-');
+                let has_digit = j > digits_start;
+                if has_digit && !is_other {
+                    let sign = &line[start..digits_start];
+                    let digits: String =
+                        line[digits_start..j].chars().filter(|&c| c != '_').collect();
+                    if let Ok(v) = format!("{sign}{digits}").parse::<i128>() {
+                        if v > i64::MAX as i128 || v < i64::MIN as i128 {
+                            let ln = li + 1;
+                            let lnstr = ln.to_string();
+                            let num_gutter = format!(" {lnstr} |");
+                            let sep_gutter = format!("{}|", " ".repeat(lnstr.len() + 2));
+                            // 1-based column just past the literal.
+                            let end_col = j + 1;
+                            let caret_pad = " ".repeat(end_col - 1);
+                            // toml11 colours its diagnostic (magenta bold) and
+                            // ends with an ANSI reset on its own line; C++ Nix
+                            // strips the escapes for a non-tty, leaving a
+                            // trailing blank line. Emit the same escapes so
+                            // jinx's `filter_ansi_escapes` reproduces it exactly.
+                            return Some(format!(
+                                "while parsing TOML: \x1b[35;1m[error] toml::parse_dec_integer: \
+                                 too large integer: current max digits = 2^63\n \
+                                 --> fromTOML\n\
+                                 {sep_gutter}\n\
+                                 {num_gutter} {line}\n\
+                                 {sep_gutter} {caret_pad}^-- must be < 2^63\n\
+                                 \x1b[0m"
+                            ));
+                        }
+                    }
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
 fn toml_subsecond(n: u32) -> String {
     if n == 0 {
         return String::new();
@@ -2501,11 +2574,18 @@ fn prim_from_toml(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
     let parsed: toml::Value = match toml::from_str(text) {
         Ok(v) => v,
         Err(e) => {
-            return Err(vm.new_err(
-                ErrKind::Eval,
-                format!("while parsing TOML: {}", e.message()),
-                pos,
-            ))
+            let msg = e.message();
+            // The `toml` crate collapses out-of-range integer literals to a
+            // terse Rust message; C++ Nix surfaces toml11's multi-line
+            // diagnostic. Re-synthesize it by locating the offending literal.
+            let full = if msg.contains("too large to fit") || msg.contains("too small to fit")
+            {
+                toml_integer_overflow_message(text)
+                    .unwrap_or_else(|| format!("while parsing TOML: {msg}"))
+            } else {
+                format!("while parsing TOML: {msg}")
+            };
+            return Err(vm.new_err(ErrKind::Eval, full, pos));
         }
     };
     let ts = vm.experimental.parse_toml_timestamps;
