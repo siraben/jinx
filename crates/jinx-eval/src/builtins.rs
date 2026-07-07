@@ -1001,7 +1001,11 @@ fn prim_replace_strings(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
         "while evaluating the third argument passed to builtins.replaceStrings",
     )?;
     let mut out: Vec<u8> = Vec::new();
-    let mut ctx: Vec<u32> = Vec::new();
+    // C++ threads the *original* string's full context through `context` first
+    // (forceString(args[2], context, …)), then merges each used replacement's
+    // context. The whole original context is retained regardless of which parts
+    // are replaced.
+    let mut ctx: Vec<u32> = vm.read_str_ctx(&val(args[2]));
     let mut p = 0usize;
     while p <= s.len() {
         let mut found = false;
