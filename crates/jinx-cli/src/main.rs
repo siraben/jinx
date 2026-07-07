@@ -182,6 +182,19 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn main() -> ExitCode {
+    // `nix eval` personality: `jinx eval <flags> <installable>`. The default
+    // (no `eval` subcommand) stays nix-instantiate-compatible for the
+    // conformance runner.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.first().map(|s| s.as_str()) == Some("eval") {
+        let sub: Vec<String> = raw_args[1..].to_vec();
+        let child = std::thread::Builder::new()
+            .stack_size(1 << 29)
+            .spawn(move || run_nix_eval(sub))
+            .expect("spawn eval thread");
+        return child.join().unwrap_or(ExitCode::FAILURE);
+    }
+
     let opts = match parse_args() {
         Ok(o) => o,
         Err(e) => {
@@ -1076,4 +1089,270 @@ fn write_stderr_line(bytes: &[u8]) {
     let mut lock = stderr.lock();
     let _ = lock.write_all(bytes);
     let _ = lock.write_all(b"\n");
+}
+
+// ---------------- `nix eval` personality ----------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum EvalOut {
+    Plain,
+    Raw,
+    Json,
+}
+
+/// Port of `nix eval` (`src/nix/eval.cc`) sufficient for flake installables.
+fn run_nix_eval(args: Vec<String>) -> ExitCode {
+    let mut out_mode = EvalOut::Plain;
+    let mut impure = false;
+    let mut experimental: Vec<String> = nix_conf_experimental_features();
+    let mut apply: Option<String> = None;
+    let mut installable: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "--raw" => out_mode = EvalOut::Raw,
+            "--json" => out_mode = EvalOut::Json,
+            "--impure" => impure = true,
+            "--no-eval-cache" | "--read-only" => {}
+            "--apply" => {
+                i += 1;
+                apply = args.get(i).cloned();
+            }
+            "--extra-experimental-features" | "--experimental-features" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    for f in v.split_whitespace() {
+                        experimental.push(f.to_string());
+                    }
+                }
+            }
+            "--option" => {
+                let n = args.get(i + 1).cloned().unwrap_or_default();
+                let v = args.get(i + 2).cloned().unwrap_or_default();
+                i += 2;
+                if n == "experimental-features" || n == "extra-experimental-features" {
+                    for f in v.split_whitespace() {
+                        experimental.push(f.to_string());
+                    }
+                }
+            }
+            s if s.starts_with('-') && s != "-" => {
+                // Ignore unknown flags that take no argument (best-effort).
+            }
+            s => {
+                if installable.is_none() {
+                    installable = Some(s.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Experimental-feature gating (`nix eval` requires nix-command).
+    if !experimental.iter().any(|f| f == "nix-command") {
+        write_stderr_line(b"error: experimental Nix feature 'nix-command' is disabled; add '--extra-experimental-features nix-command' to enable it");
+        return ExitCode::FAILURE;
+    }
+
+    let Some(installable) = installable else {
+        write_stderr_line(b"error: nix eval requires an installable argument");
+        return ExitCode::FAILURE;
+    };
+
+    // Split `flakeref#attrpath`.
+    let (flakeref, attr_path) = match installable.split_once('#') {
+        Some((fr, ap)) => (fr.to_string(), ap.to_string()),
+        None => (installable.clone(), String::new()),
+    };
+
+    let symbols = SymbolTable::new();
+    let positions = PosTable::new();
+    let mut vm = VM::new(symbols, positions);
+    vm.current_system = current_system();
+    if let Ok(sd) = std::env::var("NIX_STORE_DIR") {
+        vm.store_dir = sd.into_bytes();
+    }
+    vm.pure_eval = !impure;
+    for f in &experimental {
+        vm.experimental.enable(f);
+    }
+    builtins::register_globals(&mut vm);
+
+    // Resolve the flake to its `result` attrset.
+    let flake_ref_abs = expand_flakeref(&flakeref);
+    let flake = match jinx_eval::flake::get_flake(&mut vm, &flake_ref_abs, NO_POS) {
+        Ok(c) => c,
+        Err(e) => {
+            report_err(&vm, e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Attribute-path resolution: try the default prefixes then the bare path
+    // (port of InstallableFlake::getActualAttrPaths for `nix eval`).
+    let sys = String::from_utf8_lossy(&current_system()).into_owned();
+    let candidates: Vec<String> = if attr_path.is_empty() {
+        vec![String::new()]
+    } else {
+        vec![
+            format!("packages.{sys}.{attr_path}"),
+            format!("legacyPackages.{sys}.{attr_path}"),
+            attr_path.clone(),
+        ]
+    };
+
+    let mut value: Option<VRef> = None;
+    for cand in &candidates {
+        match navigate_attr_path(&mut vm, flake, cand) {
+            Ok(Some(v)) => {
+                value = Some(v);
+                break;
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let Some(mut value) = value else {
+        let quoted: Vec<String> = candidates.iter().map(|c| format!("'{c}'")).collect();
+        let list = match quoted.len() {
+            1 => quoted[0].clone(),
+            _ => format!("{} or {}", quoted[..quoted.len() - 1].join(", "), quoted[quoted.len() - 1]),
+        };
+        write_stderr_line(
+            format!("error: flake '{flake_ref_abs}' does not provide attribute {list}").as_bytes(),
+        );
+        return ExitCode::FAILURE;
+    };
+
+    if let Err(e) = vm.force(value, NO_POS) {
+        report_err(&vm, e);
+        return ExitCode::FAILURE;
+    }
+
+    // `--apply f`: apply a function to the value.
+    if let Some(expr) = &apply {
+        match compile_expr_thunk(&mut vm, expr.as_bytes()) {
+            Ok(fun) => {
+                vm.temp_roots.push(fun);
+                match vm.call_function(fun, &[value], NO_POS) {
+                    Ok(r) => {
+                        let c = vm.alloc_cell(r);
+                        vm.temp_roots.push(c);
+                        value = c;
+                        if let Err(e) = vm.force(value, NO_POS) {
+                            report_err(&vm, e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    Err(e) => {
+                        report_err(&vm, e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            Err(rendered) => {
+                write_stderr_line(&rendered);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let stdout = std::io::stdout();
+    match out_mode {
+        EvalOut::Raw => {
+            let (s, _) = match vm.coerce_to_string(
+                value,
+                NO_POS,
+                "while generating the eval command output",
+                false,
+                false,
+                false,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    report_err(&vm, e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut lock = stdout.lock();
+            let _ = lock.write_all(&s);
+            let _ = lock.flush();
+        }
+        EvalOut::Json => {
+            let mut out = Vec::new();
+            if let Err(e) = jinx_eval::json::to_json(&mut vm, value, NO_POS, &mut out) {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+            out.push(b'\n');
+            let mut lock = stdout.lock();
+            let _ = lock.write_all(&out);
+            let _ = lock.flush();
+        }
+        EvalOut::Plain => {
+            if let Err(e) = print::deep_force(&mut vm, value) {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+            let mut out = Vec::new();
+            if let Err(e) = print::print_ambiguous(&mut vm, value, &mut out) {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+            out.push(b'\n');
+            let mut lock = stdout.lock();
+            let _ = lock.write_all(&out);
+            let _ = lock.flush();
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Expand a flakeref installable: `~` expansion and relative→absolute for
+/// bare local paths (so `./foo`/`~/x` become absolute flake refs).
+fn expand_flakeref(fr: &str) -> String {
+    let looks_pathy = fr.starts_with('.') || fr.starts_with('/') || fr.starts_with('~');
+    if !looks_pathy {
+        return fr.to_string();
+    }
+    let expanded = if let Some(rest) = fr.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(h) => format!("{h}/{rest}"),
+            Err(_) => fr.to_string(),
+        }
+    } else {
+        fr.to_string()
+    };
+    if expanded.starts_with('/') {
+        expanded
+    } else {
+        format!("{}/{}", cwd_string(), expanded)
+    }
+}
+
+/// Navigate a dotted attribute path from `root`. Returns `Ok(None)` if an
+/// attribute along the way is missing (so the caller can try the next
+/// candidate); other type errors propagate.
+fn navigate_attr_path(vm: &mut VM, root: VRef, attr_path: &str) -> Result<Option<VRef>, ErrId> {
+    let mut v = root;
+    if attr_path.is_empty() {
+        return Ok(Some(v));
+    }
+    for comp in attr_path.split('.') {
+        vm.force(v, NO_POS)?;
+        let cur = val(v);
+        if cur.tag() != Tag::Attrs {
+            return Ok(None);
+        }
+        let sym = vm.symbols.create(comp.as_bytes());
+        match attrs_get(&cur, sym) {
+            Some(a) => v = a.val,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(v))
 }
