@@ -661,10 +661,11 @@ impl VM {
     }
 
     pub fn force_attrs(&mut self, cell: VRef, pos: PosIdx, ctx: &str) -> Result<(), ErrId> {
-        self.force(cell, pos).map_err(|e| {
-            self.add_trace(e, pos, ctx);
-            e
-        })?;
+        // C++ forceAttrs (inline) does NOT wrap forceValue in a try/catch: the
+        // `ctx` frame is attached via `.withTrace(pos, ctx)` ONLY on the type
+        // mismatch. When forcing the value itself throws, that error propagates
+        // unwrapped (unlike forceInt/forceString, which do add ctx on any error).
+        self.force(cell, pos)?;
         let v = val(cell);
         if v.tag() != Tag::Attrs {
             // C++ forceAttrs uses `.withTrace(pos, ctx)` only — no position on
@@ -676,11 +677,28 @@ impl VM {
         Ok(())
     }
 
-    pub fn force_list(&mut self, cell: VRef, pos: PosIdx, ctx: &str) -> Result<(), ErrId> {
+    /// Port of `EvalState::evalAttrs` (eval.cc): like [`force_attrs`] but the
+    /// error context wraps the *whole evaluation* in a try/catch, so it is
+    /// attached on ANY error (a throw / infinite recursion), not only a type
+    /// mismatch. Used for the `//` operator's operands (`evalForUpdate`).
+    pub fn eval_attrs(&mut self, cell: VRef, pos: PosIdx, ctx: &str) -> Result<(), ErrId> {
         self.force(cell, pos).map_err(|e| {
             self.add_trace(e, pos, ctx);
             e
         })?;
+        let v = val(cell);
+        if v.tag() != Tag::Attrs {
+            let e = self.type_err(&v, "a set", NO_POS, None);
+            self.add_trace(e, pos, ctx);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    pub fn force_list(&mut self, cell: VRef, pos: PosIdx, ctx: &str) -> Result<(), ErrId> {
+        // See force_attrs: `ctx` is added only on the type mismatch, not when
+        // forcing the argument throws (C++ inline forceList).
+        self.force(cell, pos)?;
         let v = val(cell);
         if v.tag() != Tag::List {
             // C++ forceList uses `.withTrace(pos, ctx)` only — no position on
@@ -892,7 +910,15 @@ impl VM {
                 }
                 Op::ForceAttrs(ctx) => {
                     let c = *self.stack.last().unwrap();
-                    self.force_attrs(c, pos!(), CTX_STRINGS[ctx as usize])?;
+                    // The `//` operator's operands (ctx 9/10) use evalAttrs
+                    // semantics — the operand's error context is added on ANY
+                    // error. Every other ForceAttrs site (`with`, selection,
+                    // lambda arg) uses forceAttrs (type-mismatch only).
+                    if ctx == 9 || ctx == 10 {
+                        self.eval_attrs(c, pos!(), CTX_STRINGS[ctx as usize])?;
+                    } else {
+                        self.force_attrs(c, pos!(), CTX_STRINGS[ctx as usize])?;
+                    }
                 }
                 Op::ForceList(ctx) => {
                     let c = *self.stack.last().unwrap();

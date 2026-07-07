@@ -83,7 +83,16 @@ pub extern "C" fn jinx_force_bool_top(vm: *mut VM, pos: u32, ctx: u32) -> u64 {
 pub extern "C" fn jinx_force_attrs_top(vm: *mut VM, pos: u32, ctx: u32) -> u64 {
     let vm = vm!(vm);
     let c = *vm.stack.last().unwrap();
-    status(vm.force_attrs(c, PosIdx(pos), CTX_STRINGS[ctx as usize]))
+    // The `//` operands (ctx 9/10) use evalAttrs semantics (error context on
+    // any error); every other site uses forceAttrs (type-mismatch only).
+    // Mirrors the interpreter's Op::ForceAttrs handler.
+    let cs = CTX_STRINGS[ctx as usize];
+    let r = if ctx == 9 || ctx == 10 {
+        vm.eval_attrs(c, PosIdx(pos), cs)
+    } else {
+        vm.force_attrs(c, PosIdx(pos), cs)
+    };
+    status(r)
 }
 
 pub extern "C" fn jinx_force_list_top(vm: *mut VM, pos: u32, ctx: u32) -> u64 {
