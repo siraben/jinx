@@ -97,6 +97,8 @@ struct FnState {
     upvals: Vec<(Key, Cap)>,
     /// Simulated operand stack height.
     height: u32,
+    /// Peak `height` reached (recorded into `Chunk::max_height` for the JIT).
+    max_height: u32,
     /// Lexical `with` count within this chunk at the current point.
     with_local: u32,
 }
@@ -179,6 +181,7 @@ impl<'a> Compiler<'a> {
             locals: Vec::new(),
             upvals: Vec::new(),
             height: 0,
+            max_height: 0,
             with_local: 0,
         });
     }
@@ -186,6 +189,7 @@ impl<'a> Compiler<'a> {
     fn pop_state(&mut self) -> u32 {
         let mut st = self.states.pop().unwrap();
         st.chunk.captures = st.upvals.iter().map(|(_, c)| *c).collect();
+        st.chunk.max_height = st.max_height;
         self.prog.chunks[st.chunk_idx as usize] = st.chunk;
         st.chunk_idx
     }
@@ -229,6 +233,7 @@ impl<'a> Compiler<'a> {
     fn bump(&mut self, delta: i64) {
         let st = self.states.last_mut().unwrap();
         st.height = (st.height as i64 + delta) as u32;
+        st.max_height = st.max_height.max(st.height);
     }
 
     fn height(&self) -> u32 {
@@ -236,7 +241,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn set_height(&mut self, h: u32) {
-        self.states.last_mut().unwrap().height = h;
+        let st = self.states.last_mut().unwrap();
+        st.height = h;
+        st.max_height = st.max_height.max(h);
     }
 
     // ---------------- constants ----------------

@@ -141,7 +141,7 @@ pub struct Frame {
 }
 
 impl Frame {
-    fn upvals(&self) -> &'static [VRef] {
+    pub(crate) fn upvals(&self) -> &'static [VRef] {
         if matches!(self.data.tag(), Tag::Thunk | Tag::Closure) {
             thunk_code(&self.data).1
         } else {
@@ -756,7 +756,8 @@ impl VM {
     /// compiling it on demand once its invocation counter passes the
     /// threshold. Returns the native entry point if the chunk is (now)
     /// compiled, else `None` (interpret).
-    fn jit_dispatch(&mut self, chunk: &'static Chunk) -> Option<crate::jit::JitEntry> {
+    fn jit_dispatch(&mut self, code: &'static CodeRef) -> Option<crate::jit::JitEntry> {
+        let chunk = code.chunk();
         if let Some(e) = chunk.jit.compiled_entry() {
             // SAFETY: only real entry pointers are stored (not the sentinels).
             return Some(unsafe { std::mem::transmute::<*const (), crate::jit::JitEntry>(e) });
@@ -772,7 +773,7 @@ impl VM {
         // Take the hook out to satisfy the borrow checker (it borrows nothing
         // from `self`), compile, then restore it.
         let mut hook = self.jit.take();
-        let res = hook.as_mut().and_then(|h| h.compile(chunk));
+        let res = hook.as_mut().and_then(|h| h.compile(code));
         self.jit = hook;
         match res {
             Some(entry) => {
@@ -803,7 +804,8 @@ impl VM {
         let fi = self.frames.len() - 1;
         let chunk: &'static Chunk = self.frames[fi].code.chunk();
         if self.jit.is_some() {
-            if let Some(entry) = self.jit_dispatch(chunk) {
+            let code = self.frames[fi].code;
+            if let Some(entry) = self.jit_dispatch(code) {
                 return self.run_jit(entry, fi);
             }
         }
@@ -1174,7 +1176,7 @@ impl VM {
         }
     }
 
-    fn missing_attr_err(&mut self, attrs: &Value, sym: Symbol, pos: PosIdx) -> ErrId {
+    pub(crate) fn missing_attr_err(&mut self, attrs: &Value, sym: Symbol, pos: PosIdx) -> ErrId {
         let name = String::from_utf8_lossy(self.symbols.resolve(sym)).into_owned();
         let cands: Vec<String> = attrs_entries(attrs)
             .iter()
@@ -1188,7 +1190,7 @@ impl VM {
 
     // ---------------- ops with more logic ----------------
 
-    fn op_dyn_attr(&mut self, pos: PosIdx) -> Result<(), ErrId> {
+    pub(crate) fn op_dyn_attr(&mut self, pos: PosIdx) -> Result<(), ErrId> {
         let value = self.stack.pop().unwrap();
         let name = self.stack.pop().unwrap();
         self.force(name, pos)?;
@@ -1233,7 +1235,7 @@ impl VM {
         Ok(())
     }
 
-    fn op_rec_overrides(&mut self, fi: usize, rd: u32, _pos: PosIdx) -> Result<(), ErrId> {
+    pub(crate) fn op_rec_overrides(&mut self, fi: usize, rd: u32, _pos: PosIdx) -> Result<(), ErrId> {
         let prog = self.frames[fi].code.prog();
         let rdesc = &prog.rec_descs[rd as usize];
         let desc = &prog.attrs_descs[rdesc.attrs_desc as usize];
@@ -1272,7 +1274,7 @@ impl VM {
         Ok(())
     }
 
-    fn op_update(&mut self) -> Result<(), ErrId> {
+    pub(crate) fn op_update(&mut self) -> Result<(), ErrId> {
         let left = self.stack.pop().unwrap();
         let right = self.stack.pop().unwrap();
         let (lv, rv) = (val(left), val(right));
@@ -1306,7 +1308,7 @@ impl VM {
         Ok(())
     }
 
-    fn op_has_attr_path(&mut self, fi: usize, d: u32, pos: PosIdx) -> Result<(), ErrId> {
+    pub(crate) fn op_has_attr_path(&mut self, fi: usize, d: u32, pos: PosIdx) -> Result<(), ErrId> {
         let desc = &self.frames[fi].code.prog().haspath_descs[d as usize];
         let ndyn = desc.comps.iter().filter(|c| c.is_none()).count();
         let dyn_start = self.stack.len() - ndyn;
@@ -1343,7 +1345,7 @@ impl VM {
         Ok(())
     }
 
-    fn op_concat_strings(&mut self, fi: usize, d: u32) -> Result<(), ErrId> {
+    pub(crate) fn op_concat_strings(&mut self, fi: usize, d: u32) -> Result<(), ErrId> {
         let desc = &self.frames[fi].code.prog().concat_descs[d as usize];
         let n = desc.poss.len();
         let force_string = desc.force_string;
@@ -1542,7 +1544,7 @@ impl VM {
 
     // ---------------- thunks / with ----------------
 
-    fn make_thunk(&mut self, fi: usize, cid: u32, tag: Tag) -> VRef {
+    pub(crate) fn make_thunk(&mut self, fi: usize, cid: u32, tag: Tag) -> VRef {
         let prog = self.frames[fi].code.prog();
         let child: &Chunk = &prog.chunks[cid as usize];
         let cur_chunk = self.frames[fi].code.chunk();
@@ -1570,7 +1572,7 @@ impl VM {
         self.heap.alloc_value(v)
     }
 
-    fn resolve_with(&mut self, fi: usize, sym: Symbol, pos: PosIdx) -> Result<VRef, ErrId> {
+    pub(crate) fn resolve_with(&mut self, fi: usize, sym: Symbol, pos: PosIdx) -> Result<VRef, ErrId> {
         // Innermost first: local with entries (last pushed first), then the
         // captured prefix in reverse (it is stored outermost-first).
         let n_local = self.frames[fi].with_local.len();

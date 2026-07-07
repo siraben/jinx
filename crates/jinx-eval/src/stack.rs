@@ -86,6 +86,15 @@ impl Stack {
         }
     }
 
+    /// Ensure total capacity is at least `total` elements (used by the JIT at
+    /// frame entry so all of the frame's inline pushes are capacity-safe).
+    pub fn reserve_to(&mut self, total: usize) {
+        if total > self.cap {
+            let new_cap = total.max(self.cap * 2).max(8);
+            self.grow_to(new_cap);
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn grow_one(&mut self) {

@@ -12,7 +12,7 @@
 //! It operates on the *same* `vm.stack` / `vm.frames[fi]` as the interpreter,
 //! so falling back to the interpreter for an uncompilable chunk is trivial.
 
-use crate::chunk::Chunk;
+use crate::chunk::CodeRef;
 
 /// Signature of a compiled chunk entry point.
 pub type JitEntry = extern "C" fn(*mut crate::vm::VM, u64) -> u64;
@@ -23,8 +23,10 @@ pub const ERR_FLAG: u64 = 1u64 << 63;
 
 /// The Cranelift backend, installed into the VM when JIT is enabled.
 pub trait JitHook {
-    /// Compile `chunk` to a native entry point, or return `None` if it
-    /// contains an op the backend does not lower (the chunk is then marked
-    /// uncompilable and always interpreted).
-    fn compile(&mut self, chunk: &'static Chunk) -> Option<*const ()>;
+    /// Compile the chunk referenced by `code` to a native entry point, or
+    /// return `None` if it contains an op the backend does not lower (the
+    /// chunk is then marked uncompilable and always interpreted). `code`
+    /// gives access to both the `Chunk` and its owning `Program` (constants,
+    /// descriptor tables).
+    fn compile(&mut self, code: &'static CodeRef) -> Option<*const ()>;
 }

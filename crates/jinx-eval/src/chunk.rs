@@ -239,6 +239,10 @@ pub struct Chunk {
     pub name: Symbol,
     /// Lambda / chunk origin position.
     pub pos: PosIdx,
+    /// Peak operand-stack height above `locals_base` reached while running
+    /// this chunk. The JIT reserves this much stack once at entry so inline
+    /// pushes need no per-push capacity check.
+    pub max_height: u32,
     /// JIT tier-up state.
     pub jit: JitState,
 }
