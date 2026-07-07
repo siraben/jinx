@@ -14,7 +14,10 @@ use crate::mem::{BlockKind, BlockSpace, BLOCK_SIZE, GRANULE, LARGE_OBJECT_MIN};
 use crate::value::{self, Attr, ObjKind, Tag, VRef, Value, VALUE_SIZE};
 use std::ptr::NonNull;
 
-const DEFAULT_MIN_TRIGGER: usize = 256 << 20; // 256 MiB
+// 1 GiB: a nixpkgs `-A firefox` eval peaks ~700 MB; collecting at 256 MiB
+// cost a ~35 ms pause that freed almost nothing (measured round 2). ISO RSS
+// is unaffected (retained*2 growth passes 1 GiB anyway after the first GC).
+const DEFAULT_MIN_TRIGGER: usize = 1024 << 20; // 1 GiB
 const STRESS_TRIGGER: usize = 4 << 10;
 
 pub struct GcStats {
