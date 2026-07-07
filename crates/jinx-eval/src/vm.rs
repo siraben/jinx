@@ -164,6 +164,9 @@ pub struct VM {
     pub errors: Vec<EvalError>,
     pub globals: FxHashMap<Symbol, VRef>,
     pub file_cache: Vec<(std::path::PathBuf, VRef)>,
+    /// Index into `file_cache` keyed by resolved path (mirrors C++
+    /// `fileEvalCache` being a map). The Vec is retained for GC rooting.
+    pub file_cache_idx: FxHashMap<std::path::PathBuf, usize>,
     /// Port of C++ `EvalState::srcToStore` — memoize source-path -> store-path
     /// coercions (keyed by the source path bytes) so repeated `copyPathToStore`
     /// of the same path skips re-hashing the file/tree.
@@ -259,6 +262,7 @@ impl VM {
             errors: Vec::new(),
             globals: FxHashMap::default(),
             file_cache: Vec::new(),
+            file_cache_idx: FxHashMap::default(),
             src_to_store: FxHashMap::default(),
             call_depth: 0,
             max_call_depth: 10000,

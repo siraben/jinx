@@ -4902,12 +4902,8 @@ pub fn eval_file_traced(
     add_trace: bool,
 ) -> Result<VRef, ErrId> {
     let resolved = resolve_expr_path_vm(vm, path);
-    if let Some((_, cell)) = vm
-        .file_cache
-        .iter()
-        .find(|(p, _)| p == &resolved)
-    {
-        let cell = *cell;
+    if let Some(&i) = vm.file_cache_idx.get(&resolved) {
+        let cell = vm.file_cache[i].1;
         vm.force(cell, pos)?;
         return Ok(cell);
     }
@@ -4961,6 +4957,7 @@ pub fn eval_file_traced(
         }
         e
     })?;
+    vm.file_cache_idx.insert(resolved.clone(), vm.file_cache.len());
     vm.file_cache.push((resolved, cell));
     Ok(cell)
 }
