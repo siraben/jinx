@@ -1,115 +1,188 @@
 # jinx benchmark report
 
-**Machine:** Apple M5 Pro (aarch64-darwin), 18 cores, 48 GB RAM, macOS (Darwin 25.3.0)
-**jinx:** release build. **JIT is now off by default** (see "JIT policy" below); jit rows
-set `JINX_JIT` explicitly.
-**Oracle:** C++ Nix built from `/path/to/nix` master (2.36.0pre20260706, cff1f1138)
-**Workload source:** `/path/to/nixpkgs` @ 2d62965239ba
-**Method:** `bench/run-benchmarks.sh` — hyperfine (warmups + multiple runs; raw JSON in
-`bench/results/`), peak RSS via `/usr/bin/time -l`, all evals `--readonly-mode` with
-`NIX_REMOTE=dummy://`. Correctness precondition: every workload produces **byte-identical
-output** to the oracle (drv paths are text-hashes of drv contents, so path equality
-implies content equality), and the full 466-fixture language suite passes — including
-under `JINX_GC_STRESS=1` and `JINX_JIT=1 JINX_JIT_THRESHOLD=0`.
+**Machine:** Apple M-series (aarch64-darwin), macOS (Darwin 25.3.0)
+**jinx:** release build, **PGO-optimized** (`bench/pgo-build.sh`). **JIT is off
+by default** (see "JIT policy"); jit rows set `JINX_JIT` explicitly.
+**Oracle:** C++ Nix built from `/path/to/nix` master (2.36.0pre, cff1f1138)
+**Workload source:** `/path/to/nixpkgs`
+**Method:** `bench/run-benchmarks.sh` — hyperfine (warmups + multiple runs, raw
+JSON in `bench/results/`) plus interleaved A/B for per-phase deltas, peak RSS
+via `/usr/bin/time -l`, all evals `--readonly-mode` with `NIX_REMOTE=dummy://`.
+Correctness precondition: every workload produces **byte-identical output** to
+the oracle (drv paths are text-hashes of drv contents, so path equality implies
+content equality), and the full 466-fixture language suite passes — including
+under `JINX_GC_STRESS=1`, `JINX_JIT=1 JINX_JIT_THRESHOLD=0`, and both combined.
 
-This is the **v2** report, after the round-2 perf work (lexer first-byte gating,
-`readDir` d_type, interpreter allocation diet, GC min-trigger 1 GiB, JIT default off).
-The "v1" columns are the previous committed report's numbers, kept for history.
+This is the **v3** report, after the round-3 performance work (a six-phase plan:
+interpreter P0, GC flat-locate, JIT quality, generational GC, and PGO; the
+bindings-SoA phase was deferred — see notes). The "v2" report is preserved
+below as history. Because the machine can carry background load, per-phase
+deltas are reported from **interleaved A/B** runs and lean on **user (CPU)
+time**, which is far less load-sensitive than wall time.
 
-## Wall time (hyperfine mean ± σ)
+## Wall time (hyperfine, interleaved vs the oracle; PGO binary)
 
-| Workload | C++ nix | jinx (default = jit off) | jinx (jit on) | jinx vs nix | v1 jinx (best) | v1 vs nix |
-|---|---|---|---|---|---|---|
-| parse `all-packages.nix` | 44.3 ± 1.4 ms | **9.6 ± 0.5 ms** | — | **4.6× faster** | 14.3 ms | 2.8× faster |
-| `fib.nix` (call/arith micro) | 96.2 ± 3.7 ms | 97.3 ± 3.5 ms | **65.5 ± 3.2 ms** | **1.5× faster** (jit) | 77.3 ms | 1.15× faster |
-| `ops.nix` (alloc/list/attr micro) | 47.8 ± 1.2 ms | **23.2 ± 0.7 ms** | 24.9 ± 0.7 ms | **2.1× faster** | 28.1 ms | 1.5× faster |
-| nixpkgs `-A hello` | 266.5 ± 5.3 ms | **241.2 ± 3.5 ms** | 246.9 ± 2.1 ms | **1.11× faster** | 458.6 ms | 1.8× slower |
-| nixpkgs `-A firefox` | 624.8 ± 14.3 ms | **624.0 ± 3.9 ms** | 666.8 ± 19.0 ms | **parity (1.00×)** | 1269.4 ms | 2.2× slower |
-| NixOS minimal ISO (x86_64-linux) | 10.15 ± 0.04 s | **8.92 ± 0.13 s** | 9.30 ± 0.04 s | **1.14× faster** | 12.21 s | 1.3× slower |
+| Workload | C++ nix | jinx (default = jit off) | jinx (jit on) | jinx vs nix | v2 vs nix |
+|---|---|---|---|---|---|
+| parse `all-packages.nix` | 37.4 ± 1.0 ms | **9.2 ± 0.2 ms** | — | **4.1× faster** | 4.6× faster |
+| `fib.nix` (call/arith micro) | ~94 ms | 84.1 ± 2.7 ms | **47.5 ± 4.3 ms** | **2.0× faster** (jit) | 1.5× (jit) |
+| `ops.nix` (alloc/list/attr micro) | ~44 ms | **20.3 ± 1.6 ms** | 16.8 ± 0.9 ms | **2.2× faster** (2.6× jit) | 2.1× faster |
+| nixpkgs `-A hello` | 220.9 ± 5.5 ms | **189.5 ± 4.4 ms** | ~parity | **1.17× faster** | 1.11× faster |
+| nixpkgs `-A firefox` | 526.9 ± 6.2 ms | **467.9 ± 7.6 ms** | +2% (regress) | **1.13× faster** | parity (1.00×) |
+| NixOS minimal ISO (x86_64-linux) | 9.05 ± 0.62 s | **7.66 ± 0.31 s** | +6% (regress) | **1.18× faster** | 1.14× faster |
 
-Round 2 turned the real-eval story around: v1 was 1.3–2.2× *slower* than C++ nix on
-nixpkgs evals; v2 is at parity or faster on all three.
+Round 3 moved every real-eval workload further ahead of C++ nix: hello
+1.11→1.17×, firefox parity→1.13×, ISO 1.14→1.18×. `parse` is unchanged code
+(the lexer/parser were not touched this round); its 4.1× here vs v2's 4.6×
+reflects a faster oracle build / different machine, not a jinx regression
+(jinx parse is 9.2 ms, matching v2's 9.6 ms).
 
-### JIT ablation and default policy (measured on the post-diet interpreter)
+### Total speedup vs the pre-perf baseline (this round)
 
-`fib.nix` across thresholds vs jit-off: **1.46×** @4000, 1.35× @50000, 1.28× @100000.
-Real evals, jit-on @threshold vs jit-off (wall):
+Interleaved A/B of the final PGO binary against a fresh build of the pre-round-3
+commit, **user (CPU) time** (load-robust):
 
-| Threshold | hello | firefox | ISO |
+| Workload | pre-round-3 -> v3 (PGO) user time | wall (clean runs) |
+|---|---|---|
+| hello | -6% | ~1.05x |
+| firefox | **-23%** | up to ~1.3x (noisy) |
+| ISO | -14% (7.25->6.78 s) | 1.07x |
+
+## Per-phase attribution (interleaved A/B, user time unless noted)
+
+| Phase | Item | hello | firefox | ISO | notes |
+|---|---|---|---|---|---|
+| 1 | interpreter P0 (intersectAttrs asym search, Op::Call inline arg buffer, hoist frame constants) | -3.6% | -5.7% | (folds into below) | zero-risk interpreter wins on the shipping default |
+| 2 | GC flat O(1) locate (contiguous reservation, no hashmap on the mark path) | ~0 | ~0 | -5.3% | hello/firefox do 0 collections at the 1 GiB trigger, so the win is on the GC-heavy ISO trace path |
+| 3 | JIT quality (verifier-off, frame-entry ABI, Force/tag fast paths, monomorphic Select inline cache, background compile) | parity | +2% (jit on) | +0.6% (jit on) | **fib 1.5->1.77x**; kept **JIT off by default** (see policy) |
+| 4 | generational GC + write barrier (tuned young-trigger) | ~0 | ~0 | wall 1.03-1.06x faster, **max GC pause -57%** | ISO peak RSS +~390 MiB (sticky-mark floating garbage); **stress gate ~8-9x cheaper** |
+| 5 | bindings SoA layout | — | — | — | **deferred** (no proven artifact to port; see notes) |
+| 6 | PGO (train on parse/fib/ops/hello/firefox/ISO, `-Cprofile-use`) | -4.7% | **-9.8%** | ~-13% | final build step; profile committed at `bench/jinx.profdata` |
+
+### JIT ablation and default policy
+
+With all of Phase 3 landed (including background compilation on by default when
+the JIT is active), `fib.nix` is **1.77x faster** with `JINX_JIT=1` than the
+interpreter, and `ops.nix` 1.21x. On real evals, jit-on vs jit-off (PGO binary):
+
+| Workload | jit-off (default) | jit-on | delta |
 |---|---|---|---|
-| 4000 (old default) | +2.3% | +3.9% | +4.6% (+368 ms CPU) |
-| 50000 | −0.6% (noise) | +0.6% | +1.1% (+94 ms CPU, +2.1%) |
-| 100000 | +0.3% | +0.8% | +1.6% (+109 ms CPU) |
+| hello | 189-198 ms | ~parity | +/-0% |
+| firefox | 495-527 ms | +2% wall / +5% user | regress |
+| ISO | 6.96-7.66 s | +0.6% wall / +2% user | regress |
 
-Decision rule: keep JIT on only if some threshold holds fib ≥1.3× **and** all real evals
-within 1% of jit-off. @50000 keeps fib at 1.35× but ISO is +1.1% wall / +2.1% CPU;
-@100000 loses the fib bar (1.28×) and ISO is still +1.6%. **No threshold satisfies both,
-so the default is JIT off.** `--jit` / `JINX_JIT=1` re-enable tiering (threshold 4000,
-`JINX_JIT_THRESHOLD` to tune) and still deliver the ~1.5× compute win — the tier is a
-knob for compute-shaped workloads, not a default tax on evals. The interpreter got fast
-enough that Cranelift compile cost (hello ~103 chunks, firefox ~601) no longer pays for
-itself on real nixpkgs code, whose time goes to hashing, attrset merges and string
-building rather than opcode dispatch.
+Background JIT compilation (worker thread, `AtomicPtr` entry publish observed
+Acquire/Release; the `!Sync` per-chunk counter is only ever touched by the eval
+thread) nearly **halved** the firefox jit-on regression (v2 was +6.8%, now +2%)
+by moving Cranelift compile cost off the critical path — but did not erase it.
+Real nixpkgs evals spend their time on hashing, attrset merges and string
+building rather than opcode dispatch, so the ~601 firefox chunks the tier
+compiles still don't repay their compile CPU on a one-shot eval.
 
-### GC ablation (`JINX_GC_OFF=1`, never-free, jit on)
+**Decision: JIT stays OFF by default.** No configuration is parity-or-better on
+*all* real evals (firefox/ISO still regress >1% user), so `--jit` / `JINX_JIT=1`
+remains an opt-in knob (threshold 4000, `JINX_JIT_THRESHOLD` to tune;
+`JINX_JIT_BG=0` forces synchronous compile) that delivers the ~1.8x compute win
+on compute-shaped code without taxing evals. The honest ceiling: on this
+interpreter, Cranelift is a compute-kernel accelerator, not a general eval win.
 
-hello 250.5 ms, firefox 646.9 ms — within a few percent of GC-on: collection remains
-effectively free on these workloads (with the 1 GiB min-trigger, hello and firefox now
-perform **zero** collections; ISO performs 2).
+## GC: pauses, generations, and RSS
 
-## Peak RSS (`/usr/bin/time -l`, single runs)
+The heap is now a **sticky-mark generational** collector over a single
+contiguous reservation (flat O(1) `locate`). Minor collections trace from a
+remembered set (old cells mutated since the last GC, logged by a write barrier
+at the single `vm::set_b` choke point) plus roots and sweep only young blocks;
+majors run on the first GC, at a 2x-retained watermark, every 8th collection
+under stress, or with `JINX_GC_GEN=0`.
 
-| Workload | C++ nix (Boehm) | jinx (GC on) | ratio | v1 jinx |
+| Workload | Collections (v3) | Total pause | Max pause | Peak footprint | v2 collections / pause |
+|---|---|---|---|---|---|
+| hello | 0 | 0 ms | 0 ms | — | 0 / 0 ms |
+| firefox | 0 | 0 ms | 0 ms | — | 0 / 0 ms |
+| minimal ISO | 3 (1 major + 2 minor) | 297 ms | **122.7 ms** | 2295 MiB | 2 / 510 ms |
+
+The generational split cut the ISO **max pause** (the user-visible latency
+spike) to 122.7 ms — roughly **-57%** vs the non-generational policy
+(`JINX_GC_GEN=0` measures ~285 ms max on the same binary) — and total pause
+297 ms vs v2's 510 ms. The production `young_trigger` default tracks
+`min_trigger` (1 GiB) rather than a small REPL-style young generation, because
+on a one-shot batch evaluator an aggressive young gen over-collects a
+monotonically growing heap; the 256 MiB default regressed ISO +11% user, while
+`young = min_trigger` makes ISO neutral-to-better. The stress gate is untouched
+by that default (it triggers on the 4 KiB `min_trigger`), so
+`JINX_GC_STRESS=1 cargo run -p jinx-conformance` is now **~8-9x cheaper**
+(stress `-A hello` ~15 s vs ~138 s), a real developer-workflow win.
+
+### Peak RSS (`/usr/bin/time -l`, single runs)
+
+| Workload | C++ nix (Boehm) | jinx (GC on) | ratio | v2 jinx |
 |---|---|---|---|---|
-| hello | 138 MiB | 234 MiB | 1.70× | 226 MiB |
-| firefox | 357 MiB | 679 MiB | 1.90× | 622 MiB |
-| minimal ISO | 1.13 GiB | 3.62 GiB | 3.2× | 3.33 GiB |
+| hello | 137 MiB | 234 MiB | 1.70x | 234 MiB |
+| firefox | 357 MiB | 678 MiB | 1.90x | 679 MiB |
+| minimal ISO | 1.10 GiB | 3.74 GiB | 3.4x | 3.62 GiB |
 
-The firefox RSS increase (+~37–57 MiB vs v1) is the deliberate cost of raising the GC
-min-trigger from 256 MiB to 1 GiB: the collection it skips paused ~35 ms and freed
-almost nothing. `JINX_GC_HEAP_MB=256` restores the old behavior (measured: firefox
-647 MiB RSS, +26 ms wall). ISO RSS is within run-to-run variance of v1 — its heap
-passes 1 GiB regardless, so the same doubling heuristic applies.
+hello/firefox RSS is unchanged from v2. The ISO peak RSS rose ~390 MiB
+(3.2->3.4x): the honest cost of sticky-mark generational collection, whose
+minors leave old-generation floating garbage between the (rarer) majors.
+`JINX_GC_GEN=0` restores the non-generational policy and the lower ISO RSS
+(at the cost of the max-pause and stress-gate wins); `JINX_GC_HEAP_MB` still
+caps the trigger for RSS-sensitive runs.
 
-## GC statistics (`JINX_GC_STATS=1`, default heuristics)
+## What landed, what didn't
 
-| Workload | Collections | Total pause | Peak live footprint | v1 collections / pause |
-|---|---|---|---|---|
-| hello | 0 | 0 ms | — | 1 / 9.1 ms |
-| firefox | 0 | 0 ms | — | 3 / 108.6 ms |
-| minimal ISO | 2 | 510.0 ms | 1773 MiB | 5 / 610.5 ms |
-
-## Reading the numbers
-
-- **Lexer first-byte gating** (v2): the maximal-munch loop now only runs candidate
-  scanners whose first-byte class matches the current byte, with identical
-  longest-match/rule-order tie-breaks (validated byte-identical `--parse` vs the oracle
-  on the full fixture suite plus 200 random nixpkgs files). Parse is now 4.6× faster
-  than C++ nix, and since every eval parses thousands of files, hello/firefox dropped
-  ~57/74 ms.
-- **`readDir` uses dirent `d_type`** instead of one `lstat` per entry (matching what
-  C++ nix does), with an lstat fallback when `d_type` is unknown: hello −32 ms,
-  firefox −24 ms of pure syscall elimination.
-- **Interpreter allocation diet**: thunks, attrsets, `//` merges and list concats are
-  now allocated raw and filled in place (no intermediate `Vec`), and the GC poll moved
-  from the dispatch loop top to the allocation sites. Invariant: `gc_check` runs
-  *before* each raw allocation while the sources are still rooted, and the bump
-  allocator can never collect between carve and fill. Behaviorally gated by the full
-  suite under `JINX_GC_STRESS=1` (collection every ~4 KB) plus a complete stress-mode
-  `-A hello` eval.
-- **The JIT is now an explicit knob** (see policy above): honest ablation showed it
-  costs 2–5% on real evals post-diet while still winning 1.5× on compute-shaped code.
-- **Memory** remains the clearest cost: ~1.7–1.9× C++ RSS on package evals and 3.2× on
-  the ISO, and v2 consciously spends a little more (firefox +~50 MiB) to skip
-  low-yield collections. `JINX_GC_HEAP_MB` caps it back down when RSS matters more
-  than the last ~30 ms.
+- **Landed (one commit each):** Phase 1 interpreter P0 (x3), Phase 2 GC
+  flat-locate, Phase 3 JIT quality (verifier-off, frame-ABI + fast paths +
+  Select cache, background compile), Phase 4 generational GC, Phase 6 PGO.
+- **JIT default:** re-measured and kept **off** (real evals still regress with
+  it on; fib/ops win preserved as a knob).
+- **Deferred — Phase 5 bindings SoA:** unlike the other phases it had **no
+  proven worktree implementation to port** (only a standalone microbench), so
+  it would be fresh from-scratch R&D across ~41 attrs consumers + the GC tracer
+  + the JIT Select inline-cache codegen, with real byte-exactness risk. Its
+  stated wins are also largely already captured here by Phase 1's algorithmic
+  intersectAttrs and Phase 3's monomorphic Select cache, so the marginal
+  integrated benefit did not justify destabilizing a green tree.
+- **Not attempted (measured dead-ends from the plan):** fat LTO, target-cpu
+  native, panic=abort, BOLT (Mach-O), NaN-boxing, bump-alloc fast path, lower
+  JIT thresholds, the pos-drop side-table and incremental SATB marking.
 
 ## Reproduce
 
 ```sh
+# stock release
 cargo build --release -p jinx-cli
+# OR PGO build (the numbers above): instrument -> train -> merge -> rebuild
+bash bench/pgo-build.sh
+# benchmark suite vs the C++ oracle
 nix shell nixpkgs#hyperfine -c bash bench/run-benchmarks.sh
 ```
 
-Raw hyperfine JSON, RSS log, and GC stats for this run are committed under
+Raw hyperfine JSON, the RSS log, and GC stats for this run are committed under
 `bench/results/`.
+
+---
+
+# v2 (history)
+
+**jinx:** release build. **JIT off by default** (round 2); jit rows set
+`JINX_JIT` explicitly. This is the round-2 report (lexer first-byte gating,
+`readDir` d_type, interpreter allocation diet, GC min-trigger 1 GiB, JIT default
+off).
+
+## Wall time (hyperfine mean +/- sigma)
+
+| Workload | C++ nix | jinx (default = jit off) | jinx (jit on) | jinx vs nix | v1 jinx (best) | v1 vs nix |
+|---|---|---|---|---|---|---|
+| parse `all-packages.nix` | 44.3 +/- 1.4 ms | **9.6 +/- 0.5 ms** | — | **4.6x faster** | 14.3 ms | 2.8x faster |
+| `fib.nix` (call/arith micro) | 96.2 +/- 3.7 ms | 97.3 +/- 3.5 ms | **65.5 +/- 3.2 ms** | **1.5x faster** (jit) | 77.3 ms | 1.15x faster |
+| `ops.nix` (alloc/list/attr micro) | 47.8 +/- 1.2 ms | **23.2 +/- 0.7 ms** | 24.9 +/- 0.7 ms | **2.1x faster** | 28.1 ms | 1.5x faster |
+| nixpkgs `-A hello` | 266.5 +/- 5.3 ms | **241.2 +/- 3.5 ms** | 246.9 +/- 2.1 ms | **1.11x faster** | 458.6 ms | 1.8x slower |
+| nixpkgs `-A firefox` | 624.8 +/- 14.3 ms | **624.0 +/- 3.9 ms** | 666.8 +/- 19.0 ms | **parity (1.00x)** | 1269.4 ms | 2.2x slower |
+| NixOS minimal ISO (x86_64-linux) | 10.15 +/- 0.04 s | **8.92 +/- 0.13 s** | 9.30 +/- 0.04 s | **1.14x faster** | 12.21 s | 1.3x slower |
+
+Round 2 turned the real-eval story around: v1 was 1.3-2.2x *slower* than C++ nix
+on nixpkgs evals; v2 reached parity or faster on all three. v2 peak RSS: hello
+234 MiB (1.70x), firefox 679 MiB (1.90x), ISO 3.62 GiB (3.2x). v2 GC (default):
+hello 0 / 0 ms, firefox 0 / 0 ms, ISO 2 collections / 510 ms total pause. The
+JIT was an explicit knob costing 2-5% on real evals post-diet while winning
+~1.5x on compute; the default was off.

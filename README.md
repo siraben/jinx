@@ -25,9 +25,9 @@ aarch64-darwin.
 | NixOS minimal ISO eval (`nixos/release.nix -A iso_minimal.x86_64-linux`) | **byte-identical drv path** (full module system + x86_64-linux from-source bootstrap) |
 | Flakes | `jinx eval --raw /path/to/nixpkgs#hello.drvPath` == `nix eval`; `flake.lock` v5–7, path + git+file fetchers, registry; lock *generation* not implemented |
 | Store | real writes via `nix-daemon` (AddToStore/FramedSink at protocol 1.38): `.drv` files, `toFile`, `path`/`filterSource`; import-from-derivation triggers builds via `BuildPaths` |
-| GC | custom non-moving mark-sweep (32 KiB blocks, bump allocation, precise VM roots + conservative native/JIT stack scan); full suite passes with forced collections every ~4 KB |
-| JIT | Cranelift tier: all 40 opcodes lowered, entry-point tiering (**off by default** — a net regression on real nixpkgs evals; `--jit` / `JINX_JIT=1` enables it at threshold 4000 for compute-heavy code, ~1.4× on `fib`); full suite passes with **every chunk compiled**, alone and combined with GC stress |
-| Performance vs C++ Nix (see `bench/REPORT.md`) | parse **4.6× faster**; nixpkgs `-A hello` **1.11× faster**, `-A firefox` **parity**, NixOS minimal ISO **1.14× faster**; RSS 1.7–3.2× higher (GC tuned for pauses over footprint; `JINX_GC_HEAP_MB` to trade back) |
+| GC | custom non-moving **sticky-mark generational** mark-sweep (32 KiB blocks over one contiguous reservation with O(1) locate, precise VM roots + conservative native/JIT stack scan, write barrier at a single cell-mutation choke point); minor/major policy with `JINX_GC_GEN=0` escape hatch; full suite passes with forced collections every ~4 KB |
+| JIT | Cranelift tier: all 40 opcodes lowered, entry-point tiering with **background compilation** (worker thread, on by default when the JIT is active; `JINX_JIT_BG=0` for synchronous). Tiering is **off by default** — still a small regression on real nixpkgs evals; `--jit` / `JINX_JIT=1` enables it at threshold 4000 for compute-heavy code, **~1.8× on `fib`**; full suite passes with **every chunk compiled**, alone and combined with GC stress |
+| Performance vs C++ Nix (see `bench/REPORT.md`) | PGO build: parse **~4.1× faster**; nixpkgs `-A hello` **1.17× faster**, `-A firefox` **1.13× faster**, NixOS minimal ISO **1.18× faster**; RSS 1.7–3.4× higher (GC tuned for pauses over footprint; `JINX_GC_HEAP_MB` / `JINX_GC_GEN=0` to trade back) |
 
 ## Layout
 
@@ -59,8 +59,13 @@ cargo build --release -p jinx-cli
   --raw /path/to/nixpkgs#hello.drvPath
 ```
 
-Knobs: `--jit=on|off` / `JINX_JIT` / `JINX_JIT_THRESHOLD` (JIT off by default);
-`JINX_GC_OFF`, `JINX_GC_STRESS`, `JINX_GC_STATS`, `JINX_GC_HEAP_MB` (GC min-trigger 1 GiB).
+Knobs: `--jit=on|off` / `JINX_JIT` / `JINX_JIT_THRESHOLD` (JIT off by default),
+`JINX_JIT_BG=0` (disable background compilation); `JINX_GC_OFF`, `JINX_GC_STRESS`,
+`JINX_GC_STATS`, `JINX_GC_HEAP_MB` (GC min-trigger 1 GiB), `JINX_GC_GEN=0`
+(disable generational collection), `JINX_GC_YOUNG_MB` (young-gen trigger).
+
+For the benchmark numbers above, build with PGO: `bash bench/pgo-build.sh`
+(instrument → train → merge → rebuild; see `bench/REPORT.md`).
 
 ## Conformance & benchmarks
 
