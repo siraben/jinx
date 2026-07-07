@@ -2,6 +2,9 @@
 # M8 benchmark harness: jinx (jit on/off, gc on/off) vs C++ nix master oracle.
 # Usage: nix shell nixpkgs#hyperfine -c bash bench/run-benchmarks.sh [outdir]
 # Produces per-benchmark hyperfine JSON + peak-RSS table in $OUTDIR.
+# NOTE: jinx's default is now JIT OFF; every jit-sensitive row below sets
+# JINX_JIT explicitly, so the ablation is independent of the default. Rows
+# without JINX_JIT (parse, rss, gcstats) measure the shipping default.
 set -euo pipefail
 
 JINX_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

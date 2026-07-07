@@ -27,13 +27,17 @@ enum LintLevel {
 }
 
 /// Install and configure the Cranelift JIT on `vm` according to the `--jit`
-/// flag (if given) and the `JINX_JIT` / `JINX_JIT_THRESHOLD` env vars. JIT is on
-/// by default; `--jit=off` or `JINX_JIT=0` disables tiering (pure interpreter).
+/// flag (if given) and the `JINX_JIT` / `JINX_JIT_THRESHOLD` env vars. JIT is
+/// OFF by default: on the alloc-diet interpreter the tiering compile cost is a
+/// net regression on real nixpkgs evals (hello/firefox/ISO), and no threshold
+/// both stays within 1% of the interpreter on those evals and keeps the fib
+/// compute win (>=1.3x). `--jit` / `--jit=on` / `JINX_JIT=1` re-enable tiering
+/// for compute-heavy workloads; `JINX_JIT_THRESHOLD=n` tunes the call count.
 fn configure_jit(vm: &mut VM, flag: Option<bool>) {
     let enabled = flag.unwrap_or_else(|| {
         std::env::var_os("JINX_JIT")
             .map(|v| v != "0" && v != "off")
-            .unwrap_or(true)
+            .unwrap_or(false)
     });
     if !enabled {
         return;

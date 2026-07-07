@@ -20,7 +20,8 @@ aarch64-darwin.
 | Flakes | `jinx eval --raw /path/to/nixpkgs#hello.drvPath` == `nix eval`; `flake.lock` v5–7, path + git+file fetchers, registry; lock *generation* not implemented |
 | Store | real writes via `nix-daemon` (AddToStore/FramedSink at protocol 1.38): `.drv` files, `toFile`, `path`/`filterSource`; import-from-derivation triggers builds via `BuildPaths` |
 | GC | custom non-moving mark-sweep (32 KiB blocks, bump allocation, precise VM roots + conservative native/JIT stack scan); full suite passes with forced collections every ~4 KB |
-| JIT | Cranelift tier: all 40 opcodes lowered, entry-point tiering (default threshold 1000); full suite passes with **every chunk compiled**, alone and combined with GC stress |
+| JIT | Cranelift tier: all 40 opcodes lowered, entry-point tiering (**off by default** — a net regression on real nixpkgs evals; `--jit` / `JINX_JIT=1` enables it at threshold 4000 for compute-heavy code, ~1.4× on `fib`); full suite passes with **every chunk compiled**, alone and combined with GC stress |
+| Performance vs C++ Nix (see `bench/REPORT.md`) | parse **4.6× faster**; nixpkgs `-A hello` **1.11× faster**, `-A firefox` **parity**, NixOS minimal ISO **1.14× faster**; RSS 1.7–3.2× higher (GC tuned for pauses over footprint; `JINX_GC_HEAP_MB` to trade back) |
 
 ## Layout
 
@@ -52,8 +53,8 @@ cargo build --release -p jinx-cli
   --raw /path/to/nixpkgs#hello.drvPath
 ```
 
-Knobs: `--jit=on|off` / `JINX_JIT` / `JINX_JIT_THRESHOLD`; `JINX_GC_OFF`, `JINX_GC_STRESS`,
-`JINX_GC_STATS`, `JINX_GC_HEAP_MB`.
+Knobs: `--jit=on|off` / `JINX_JIT` / `JINX_JIT_THRESHOLD` (JIT off by default);
+`JINX_GC_OFF`, `JINX_GC_STRESS`, `JINX_GC_STATS`, `JINX_GC_HEAP_MB` (GC min-trigger 1 GiB).
 
 ## Conformance & benchmarks
 
