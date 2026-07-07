@@ -47,10 +47,13 @@ pub fn make_apply_prog() -> &'static Program {
         ops.push(Op::Call(n));
         ops.push(Op::Force);
         ops.push(Op::Ret);
-        prog.chunks.push(Chunk {
+        let mut chunk = Chunk {
             ops,
+            max_height: n + 1,
             ..Default::default()
-        });
+        };
+        chunk.kind = crate::compile::classify_chunk(&chunk, &prog.chunks);
+        prog.chunks.push(chunk);
     }
     prog.leak()
 }

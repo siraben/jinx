@@ -163,6 +163,73 @@ pub fn compile_program(
     c.prog.leak()
 }
 
+/// Classify a finished chunk for the frame-less force fast path
+/// (`VM::force`). Lambda bodies are excluded: they are entered through
+/// `call_closure`, never through thunk forcing. `chunks` must already
+/// contain every child chunk referenced by `MakeThunk`/`MakeClosure` (the
+/// compiler pops children before parents; synthetic programs pass their
+/// finished chunk list).
+pub(crate) fn classify_chunk(chunk: &Chunk, chunks: &[Chunk]) -> ChunkKind {
+    if chunk.lambda.is_some() {
+        return ChunkKind::General;
+    }
+    match chunk.ops.as_slice() {
+        [Op::GetUpval(k), Op::Force, Op::Ret] => {
+            return ChunkKind::Forward {
+                upval: *k,
+                pos: chunk.pos_at(1),
+            }
+        }
+        [Op::Const(i), Op::Ret] => return ChunkKind::ConstReturn { idx: *i },
+        _ => {}
+    }
+    if straight_ok(chunk, chunks) {
+        return ChunkKind::Straight;
+    }
+    ChunkKind::General
+}
+
+/// See [`ChunkKind::Straight`] for the invariants this checks.
+fn straight_ok(chunk: &Chunk, chunks: &[Chunk]) -> bool {
+    if chunk.ops.len() < 2 || chunk.ops.len() > 16 || chunk.max_height > 8 {
+        return false;
+    }
+    let last = chunk.ops.len() - 1;
+    if !matches!(chunk.ops[last], Op::Ret) {
+        return false;
+    }
+    for (i, op) in chunk.ops.iter().enumerate() {
+        match op {
+            Op::Ret => {
+                if i != last {
+                    return false;
+                }
+            }
+            Op::Const(_)
+            | Op::GetUpval(_)
+            | Op::ResolveWith(_)
+            | Op::Force
+            | Op::Select { .. }
+            | Op::SelectForce(_)
+            | Op::Call(_) => {}
+            Op::MakeThunk(cid) | Op::MakeClosure(cid) => {
+                let child = &chunks[*cid as usize];
+                // The frame-less MakeThunk copies the with-prefix straight
+                // from this chunk's upvalue array, and can only materialize
+                // upvalue captures (a straight chunk has no locals).
+                if child.with_captures != chunk.with_captures {
+                    return false;
+                }
+                if child.captures.iter().any(|c| matches!(c, Cap::Local(_))) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 impl<'a> Compiler<'a> {
     // ---------------- state / emission helpers ----------------
 
@@ -191,6 +258,7 @@ impl<'a> Compiler<'a> {
         let mut st = self.states.pop().unwrap();
         st.chunk.captures = st.upvals.iter().map(|(_, c)| *c).collect();
         st.chunk.max_height = st.max_height;
+        st.chunk.kind = classify_chunk(&st.chunk, &self.prog.chunks);
         self.prog.chunks[st.chunk_idx as usize] = st.chunk;
         st.chunk_idx
     }

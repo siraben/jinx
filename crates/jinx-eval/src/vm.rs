@@ -599,11 +599,56 @@ impl VM {
                     // over the blackholed thunk). The GC traces blackholes
                     // like thunks (see `has_heap_payload`).
                     self.set_b(cell, Value::make(Tag::Blackhole, v.w1));
-                    let (code, _) = thunk_code(&v);
-                    let saved_force_pos = self.force_pos;
-                    self.force_pos = pos;
-                    let run = self.run_code(code, v);
-                    self.force_pos = saved_force_pos;
+                    let (code, elems) = thunk_code(&v);
+                    use crate::chunk::ChunkKind;
+                    let run = match code.chunk().kind {
+                        // ---- frame-less trivial kinds (round-4) ----
+                        ChunkKind::ConstReturn { idx } => {
+                            Ok(val(code.prog().consts[idx as usize]))
+                        }
+                        ChunkKind::Forward { upval, pos: gpos } => {
+                            let target = elems[upval as usize];
+                            let tv = val(target);
+                            if tv.tag() == Tag::Blackhole {
+                                // Exact port of the framed behavior: the
+                                // forwarding frame *is* the running frame, so
+                                // a blackholed target matching our own thunk
+                                // data is a direct self-reference (reported
+                                // at the reference site `gpos`); anything
+                                // else reports at the enclosing force
+                                // position.
+                                let bpos = if tv.w1 != 0 && tv.w1 == v.w1 {
+                                    gpos
+                                } else if pos.is_set() {
+                                    pos
+                                } else {
+                                    gpos
+                                };
+                                Err(self.new_err(
+                                    ErrKind::InfiniteRecursion,
+                                    "infinite recursion encountered",
+                                    bpos,
+                                ))
+                            } else {
+                                self.force(target, gpos).map(|()| val(target))
+                            }
+                        }
+                        ChunkKind::Straight => {
+                            let saved_force_pos = self.force_pos;
+                            self.force_pos = pos;
+                            let r = self.force_straight(code, elems);
+                            self.force_pos = saved_force_pos;
+                            r
+                        }
+                        // ---- general chunks: full frame ----
+                        ChunkKind::General => {
+                            let saved_force_pos = self.force_pos;
+                            self.force_pos = pos;
+                            let run = self.run_code(code, v);
+                            self.force_pos = saved_force_pos;
+                            run
+                        }
+                    };
                     match run {
                         Ok(res) => {
                             self.set_b(cell, res);
@@ -1321,6 +1366,21 @@ impl VM {
         pos: PosIdx,
     ) -> Result<(), ErrId> {
         let cell = *self.stack.last().unwrap();
+        let r = self.select_value(cell, sym, cache_idx, prog, pos)?;
+        *self.stack.last_mut().unwrap() = r;
+        Ok(())
+    }
+
+    /// Cell-in/cell-out core of `Op::Select` (shared with the frame-less
+    /// `force_straight` path).
+    pub(crate) fn select_value(
+        &mut self,
+        cell: VRef,
+        sym: Symbol,
+        cache_idx: u32,
+        prog: &'static crate::chunk::Program,
+        pos: PosIdx,
+    ) -> Result<VRef, ErrId> {
         self.force_attrs(cell, pos, "while selecting an attribute")?;
         let v = val(cell);
         let attrs_ptr = v.ptr() as *const u64;
@@ -1349,8 +1409,7 @@ impl VM {
         match found {
             Some(a) => {
                 self.last_select_pos = PosIdx(a.pos);
-                *self.stack.last_mut().unwrap() = a.val;
-                Ok(())
+                Ok(a.val)
             }
             None => Err(self.missing_attr_err(&v, sym, pos)),
         }
@@ -1760,6 +1819,161 @@ impl VM {
             } else {
                 self.frames[fi].upvals()[k]
             };
+            self.force_attrs(
+                cell,
+                pos,
+                "while evaluating the first subexpression of a with expression",
+            )?;
+            let v = val(cell);
+            if let Some(a) = attrs_get(&v, sym) {
+                return Ok(a.val);
+            }
+        }
+        let name = String::from_utf8_lossy(self.symbols.resolve(sym)).into_owned();
+        Err(self.new_err(
+            ErrKind::UndefinedVar,
+            format!("undefined variable '{name}'"),
+            pos,
+        ))
+    }
+
+    /// Frame-less interpreter for [`crate::chunk::ChunkKind::Straight`]
+    /// chunks: runs the body against a small native-stack scratch array
+    /// instead of pushing a `Frame` (the conservative stack scan roots the
+    /// scratch cells; the forced cell's blackhole roots `upvals`). The
+    /// caller has already blackholed the cell and set `force_pos`.
+    fn force_straight(
+        &mut self,
+        code: &'static CodeRef,
+        upvals: &'static [VRef],
+    ) -> Result<Value, ErrId> {
+        let chunk = code.chunk();
+        let prog = code.prog();
+        let mut st = [NonNull::<Value>::dangling(); 8];
+        let mut sp = 0usize;
+        let mut ip = 0usize;
+        loop {
+            match chunk.ops[ip] {
+                Op::Const(i) => {
+                    st[sp] = prog.consts[i as usize];
+                    sp += 1;
+                }
+                Op::GetUpval(i) => {
+                    st[sp] = upvals[i as usize];
+                    sp += 1;
+                }
+                Op::ResolveWith(sym) => {
+                    let c = self.resolve_with_upvals(chunk, upvals, Symbol(sym), chunk.pos_at(ip))?;
+                    st[sp] = c;
+                    sp += 1;
+                }
+                Op::Force => {
+                    let c = st[sp - 1];
+                    if matches!(val(c).tag(), Tag::Thunk | Tag::Blackhole | Tag::Failed) {
+                        self.force(c, chunk.pos_at(ip))?;
+                    }
+                }
+                Op::MakeThunk(cid) => {
+                    st[sp] = self.make_thunk_from_upvals(prog, cid, Tag::Thunk, upvals);
+                    sp += 1;
+                }
+                Op::MakeClosure(cid) => {
+                    st[sp] = self.make_thunk_from_upvals(prog, cid, Tag::Closure, upvals);
+                    sp += 1;
+                }
+                Op::Select { sym, cache } => {
+                    st[sp - 1] =
+                        self.select_value(st[sp - 1], Symbol(sym), cache, prog, chunk.pos_at(ip))?;
+                }
+                Op::SelectForce(t) => {
+                    let c = st[sp - 1];
+                    let p = self.last_select_pos;
+                    self.force(c, p).map_err(|e| {
+                        if p.is_set() && !self.pos_is_derivation_internal(p) {
+                            let text = prog.texts[t as usize].clone();
+                            self.add_trace(
+                                e,
+                                p,
+                                format!(
+                                    "while evaluating the attribute '{}'",
+                                    String::from_utf8_lossy(&text)
+                                ),
+                            );
+                        }
+                        e
+                    })?;
+                }
+                Op::Call(n) => {
+                    let n = n as usize;
+                    let fun = st[sp - n - 1];
+                    let mut cpos = chunk.pos_at(ip);
+                    if !cpos.is_set() {
+                        cpos = self.force_pos;
+                        if !cpos.is_set() {
+                            cpos = self.determine_pos(&val(fun), NO_POS);
+                        }
+                    }
+                    let v = self.call_function(fun, &st[sp - n..sp], cpos)?;
+                    sp -= n + 1;
+                    let c = self.alloc_cell(v);
+                    st[sp] = c;
+                    sp += 1;
+                }
+                Op::Ret => return Ok(val(st[sp - 1])),
+                _ => unreachable!("non-straight op in Straight chunk"),
+            }
+            ip += 1;
+        }
+    }
+
+    /// `make_thunk` for the frame-less path: captures resolve against an
+    /// upvalue array only (Straight chunks have no locals, and their
+    /// children share the with-prefix — both enforced by `classify_chunk`).
+    fn make_thunk_from_upvals(
+        &mut self,
+        prog: &'static crate::chunk::Program,
+        cid: u32,
+        tag: Tag,
+        parent_upvals: &[VRef],
+    ) -> VRef {
+        self.gc_check();
+        let child: &Chunk = &prog.chunks[cid as usize];
+        let n = child.with_captures as usize + child.captures.len();
+        let code = prog.code_ref(cid) as *const CodeRef as *const ();
+        let (v, out) = self.heap.new_thunk_raw(tag, code, n);
+        // SAFETY: `out` has n slots; we write exactly n below.
+        unsafe {
+            let wc = child.with_captures as usize;
+            std::ptr::copy_nonoverlapping(parent_upvals.as_ptr(), out, wc);
+            let mut k = wc;
+            for cap in &child.captures {
+                let c = match cap {
+                    crate::chunk::Cap::Upval(i) => parent_upvals[*i as usize],
+                    crate::chunk::Cap::Local(_) => {
+                        unreachable!("straight chunk child with local capture")
+                    }
+                };
+                out.add(k).write(c);
+                k += 1;
+            }
+            debug_assert_eq!(k, n);
+        }
+        self.heap.alloc_value(v)
+    }
+
+    /// `resolve_with` for the frame-less path: a Straight chunk has no
+    /// runtime with-entries of its own, so only the captured prefix
+    /// (outermost first) is searched.
+    fn resolve_with_upvals(
+        &mut self,
+        chunk: &'static Chunk,
+        upvals: &[VRef],
+        sym: Symbol,
+        pos: PosIdx,
+    ) -> Result<VRef, ErrId> {
+        let wc = chunk.with_captures as usize;
+        for k in (0..wc).rev() {
+            let cell = upvals[k];
             self.force_attrs(
                 cell,
                 pos,

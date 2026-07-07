@@ -228,6 +228,29 @@ impl JitState {
     }
 }
 
+/// Compile-time classification of a chunk's body, used by `VM::force` to
+/// run trivial thunks inline without pushing a `Frame` (round-4 frameless
+/// execution). Lambda bodies are always `General`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ChunkKind {
+    #[default]
+    General,
+    /// Body is exactly `GetUpval(upval); Force; Ret`: a pure forwarding
+    /// thunk (every `let`/`rec`/`inherit` alias compiles to one, plus
+    /// non-aliasable var thunks). `pos` is the source position the `Force`
+    /// op would report (`pos_at(1)`).
+    Forward { upval: u32, pos: PosIdx },
+    /// Body is exactly `Const(idx); Ret`.
+    ConstReturn { idx: u32 },
+    /// Straightline body over the frame-less-interpretable op subset
+    /// (`Const`/`GetUpval`/`ResolveWith`/`Force`/`MakeThunk`/`MakeClosure`/
+    /// `Select`/`SelectForce`/`Call`/`Ret`, single trailing `Ret`,
+    /// `max_height <= 8`, thunk/closure children capture only upvalues and
+    /// share this chunk's with-prefix). `VM::force` runs these on a small
+    /// native-stack scratch array without pushing a `Frame`.
+    Straight,
+}
+
 #[derive(Default)]
 pub struct Chunk {
     pub ops: Vec<Op>,
@@ -251,6 +274,8 @@ pub struct Chunk {
     pub max_height: u32,
     /// JIT tier-up state.
     pub jit: JitState,
+    /// Trivial-body classification (see [`ChunkKind`]).
+    pub kind: ChunkKind,
 }
 
 impl Chunk {
