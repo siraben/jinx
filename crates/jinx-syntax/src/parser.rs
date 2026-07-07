@@ -895,7 +895,13 @@ impl<'a> Parser<'a> {
             self.next()?;
             return Ok((path_start, begin));
         }
+        // `string_parts_interpolated` (parser.y): its base cases are
+        // `DOLLAR_CURLY expr '}'` and `STR DOLLAR_CURLY expr '}'`, so before the
+        // first interpolation a STR is only valid when *immediately* followed by
+        // `${`. A trailing/lone STR with no `${` (e.g. `/foo//bar`, which lexes
+        // to PATH `/foo/` + STR `/bar`) is a syntax error, matching C++.
         let mut es: Vec<(PosIdx, ExprId)> = vec![(self.at(begin), path_start)];
+        let mut seen_interp = false;
         loop {
             let t = self.peek()?.clone();
             match t.kind {
@@ -903,6 +909,15 @@ impl<'a> Parser<'a> {
                     let t = self.next()?;
                     let e = self.exprs.add(Expr::String(t.text));
                     es.push((self.at(t.begin), e));
+                    if !seen_interp {
+                        // Grammar `STR DOLLAR_CURLY ...`: the STR must be
+                        // followed by `${`, else it is `unexpected <tok>,
+                        // expecting '${'`.
+                        let n = self.peek()?.clone();
+                        if !matches!(n.kind, TokKind::DollarCurly) {
+                            return Err(self.err_unexpected(&n, &["'${'"]));
+                        }
+                    }
                 }
                 TokKind::DollarCurly => {
                     let open = self.next()?;
@@ -913,6 +928,7 @@ impl<'a> Parser<'a> {
                     }
                     self.next()?;
                     es.push((self.at(open.begin), e));
+                    seen_interp = true;
                 }
                 TokKind::PathEnd => {
                     self.next()?;
