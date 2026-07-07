@@ -1,3 +1,4 @@
 /target
 /.oracle
 /result*
+.DS_Store

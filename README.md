@@ -79,3 +79,12 @@ nix shell nixpkgs#hyperfine -c bash bench/run-benchmarks.sh
   *server*, `nix repl`, and the debugger are out of scope; builds happen via the real
   `nix-daemon` (IFD works this way).
 - Eval caching (`~/.cache/nix/eval-cache`) is not implemented.
+
+## License & provenance
+
+LGPL-2.1-or-later (see `COPYING`), matching upstream Nix. jinx is an independent
+reimplementation whose semantics were ported by reading the
+[NixOS/nix](https://github.com/NixOS/nix) sources; a few Nix-language files
+(`derivation.nix`, `call-flake.nix`) are vendored verbatim from that repository.
+Conformance fixtures live in the upstream repo and are read at test time (expected at
+`/path/to/nix`), not vendored.
