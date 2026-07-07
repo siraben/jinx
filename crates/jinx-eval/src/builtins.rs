@@ -3871,17 +3871,40 @@ fn prim_intersect_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
     let e1 = attrs_entries(&val(args[0]));
     let e2 = attrs_entries(&val(args[1]));
     // Both attrsets are sorted by symbol id: keep e2's entries whose name is
-    // also in e1 via a single linear merge (not a binary search per key).
+    // also in e1. When the sizes are lopsided (the callPackage pattern
+    // intersects ~10 formals against a ~20k-entry scope) iterate the small
+    // side and binary-search the large one; otherwise a single linear merge.
     let mut entries: Vec<Attr> = Vec::with_capacity(e1.len().min(e2.len()));
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < e1.len() && j < e2.len() {
-        match e1[i].sym.cmp(&e2[j].sym) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                entries.push(e2[j]);
-                i += 1;
-                j += 1;
+    let (small_len, large_len) = (e1.len().min(e2.len()), e1.len().max(e2.len()));
+    if small_len == 0 {
+        // empty result
+    } else if large_len / small_len >= 8 {
+        if e1.len() <= e2.len() {
+            // small = e1: keep the matching e2 entry.
+            for a in e1 {
+                if let Ok(k) = e2.binary_search_by(|x| x.sym.cmp(&a.sym)) {
+                    entries.push(e2[k]);
+                }
+            }
+        } else {
+            // small = e2: keep e2's own entry on a hit in e1.
+            for a in e2 {
+                if e1.binary_search_by(|x| x.sym.cmp(&a.sym)).is_ok() {
+                    entries.push(*a);
+                }
+            }
+        }
+    } else {
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < e1.len() && j < e2.len() {
+            match e1[i].sym.cmp(&e2[j].sym) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    entries.push(e2[j]);
+                    i += 1;
+                    j += 1;
+                }
             }
         }
     }
