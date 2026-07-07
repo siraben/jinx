@@ -875,7 +875,12 @@ impl VM {
                 }
                 Op::Force => {
                     let c = *self.stack.last().unwrap();
-                    self.force(c, pos!())?;
+                    // Fast path: only thunk-like cells need the (out-of-line)
+                    // force machinery; an already-WHNF value returns immediately.
+                    // C++ `forceValue` inlines the `!isThunk` early-out too.
+                    if matches!(val(c).tag(), Tag::Thunk | Tag::Blackhole | Tag::Failed) {
+                        self.force(c, pos!())?;
+                    }
                 }
                 Op::ForceBool(ctx) => {
                     let c = *self.stack.last().unwrap();

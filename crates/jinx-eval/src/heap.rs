@@ -331,7 +331,13 @@ impl Marker<'_> {
         let addr = v.as_ptr() as usize;
         if let Some((idx, granule)) = self.space.locate(addr) {
             let meta = self.space.meta_mut(idx).unwrap();
-            if meta.is_start(granule) && meta.set_mark(granule) {
+            // A VRef must resolve to a value-block cell start. A stale field
+            // read from a conservatively-pinned dead object can point elsewhere
+            // (a reused data block); refuse to treat it as a cell then.
+            // A VRef must resolve to a value-block cell start. A stale field
+            // read from a conservatively-pinned dead object can point elsewhere
+            // (a reused data block); refuse to treat it as a cell then.
+            if meta.kind == BlockKind::Value && meta.is_start(granule) && meta.set_mark(granule) {
                 self.worklist.push(v);
             }
         }
@@ -355,9 +361,27 @@ impl Marker<'_> {
         let addr = p as usize;
         let newly = if let Some((idx, granule)) = self.space.locate(addr) {
             let meta = self.space.meta_mut(idx).unwrap();
-            debug_assert!(meta.is_start(granule), "data ptr not at object start");
+            // Robustness against conservatively-pinned *dead* cells: the native
+            // stack scan can pin a value cell via a stale word, and that dead
+            // cell may still hold a stale payload pointer whose data object was
+            // already freed (its block released and re-bumped/reused). Precise
+            // roots and live objects always point at a genuine data-object
+            // start, so refuse to follow anything that does not resolve to a
+            // data-block object start — otherwise we would read a reused/interior
+            // location as an ObjHeader and walk a bogus length. (Mirrors the
+            // `find_start`/`is_start` validation the conservative root scan
+            // already applies; here we extend it to precise-content tracing,
+            // which is unsafe once a pinned holder can be stale.)
+            if meta.kind != BlockKind::Data || !meta.is_start(granule) {
+                return;
+            }
             meta.set_mark(granule)
         } else if let Some(li) = self.space.locate_large(addr) {
+            // Only a pointer to the large object's start is a genuine object;
+            // a stale interior pointer must not be read as a header.
+            if self.space.large[li].ptr.as_ptr() as usize != addr {
+                return;
+            }
             let lo = &mut self.space.large[li];
             let newly = !lo.marked;
             lo.marked = true;
@@ -630,6 +654,46 @@ mod tests {
             );
         }
         assert_eq!(unsafe { leaf_int(live) }, 32);
+    }
+
+    /// Regression: the conservative native-stack scan can pin a *dead* value
+    /// cell via a stale word, and such a cell may still hold a stale payload
+    /// pointer whose data object was freed and its block reused — leaving the
+    /// pointer landing at a non-object-start (interior) location, or on a value
+    /// cell rather than a data object. The tracer must refuse to read such a
+    /// location as an `ObjHeader` (previously it did, walking a bogus length —
+    /// a use-after-free that segfaulted heavy `JINX_GC_STRESS` evals).
+    #[test]
+    fn tracer_skips_stale_non_object_start_payloads() {
+        let mut h = Heap::new();
+        // A live keeper so its value block is retained across the collection.
+        let keeper = h.alloc_value(Value::int(7));
+
+        // A real string data object; take an *interior* address (not a start).
+        let s = h.new_string(b"0123456789abcdef", std::ptr::null_mut());
+        let interior = s.ptr() as usize + 8;
+        // A cell whose value claims to be a List pointing into the middle of the
+        // string. Following it as a data object would read string bytes as a
+        // header and iterate a bogus element count.
+        let stale_interior = h.alloc_value(Value::make(Tag::List, interior as u64));
+
+        // A cell whose value claims its payload is another *value cell* (a
+        // pointer into a value block, never a valid data object).
+        let stale_kind = h.alloc_value(Value::make(Tag::Attrs, keeper.as_ptr() as u64));
+
+        // Pin all three as roots (as the conservative stack scan would) and
+        // collect. This must complete without dereferencing the bogus payloads.
+        h.collect(
+            |m| {
+                m.mark_cell(keeper);
+                m.mark_cell(stale_interior);
+                m.mark_cell(stale_kind);
+            },
+            false,
+        );
+
+        // The collector ran to completion and left the keeper intact.
+        assert_eq!(unsafe { (*keeper.as_ptr()).as_int() }, 7);
     }
 }
 
