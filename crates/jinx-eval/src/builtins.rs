@@ -4367,10 +4367,97 @@ fn call_path_filter(vm: &mut VM, filter: VRef, path: &std::path::Path) -> Result
     )
 }
 
+/// Maximum recursion depth when comparing filter closures structurally. A
+/// deeper structure conservatively compares UNEQUAL (recomputes the dump).
+const FILTER_IDENT_MAX_DEPTH: u32 = 128;
+
+/// Conservative structural identity for path-filter arguments, used as the
+/// filter component of the filtered-dump memo key.
+///
+/// Soundness contract: a *false hit* would alias two distinct filters and
+/// produce a wrong store path, so we only return `true` when we can prove the
+/// filters equal WITHOUT evaluating anything. In particular thunks are never
+/// forced — an unforced, non-pointer-equal thunk anywhere makes the comparison
+/// UNEQUAL. A conservative miss merely recomputes the dump, which is always
+/// safe.
+fn filter_ident_eq(a: Option<VRef>, b: Option<VRef>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => value_ident_eq(x, y, 0),
+        _ => false,
+    }
+}
+
+fn value_ident_eq(a: VRef, b: VRef, depth: u32) -> bool {
+    if a == b {
+        // Same cell: identical by construction (short-circuits thunks too).
+        return true;
+    }
+    if depth >= FILTER_IDENT_MAX_DEPTH {
+        return false;
+    }
+    let va = val(a);
+    let vb = val(b);
+    let ta = va.tag();
+    if ta != vb.tag() {
+        return false;
+    }
+    match ta {
+        Tag::Null | Tag::True | Tag::False => true,
+        Tag::Int => va.as_int() == vb.as_int(),
+        Tag::Float => va.as_float().to_bits() == vb.as_float().to_bits(),
+        Tag::String => {
+            // Require equal bytes and the same (or both-null) context object;
+            // distinct-but-equal contexts conservatively compare unequal.
+            str_bytes(&va) == str_bytes(&vb) && std::ptr::eq(str_ctx(&va), str_ctx(&vb))
+        }
+        Tag::Path => {
+            // SAFETY: tag checked above; both are ObjKind::Path objects.
+            let (acc_a, bytes_a) = unsafe { crate::value::path_parts(va.ptr() as *const u64) };
+            let (acc_b, bytes_b) = unsafe { crate::value::path_parts(vb.ptr() as *const u64) };
+            acc_a == acc_b && bytes_a == bytes_b
+        }
+        Tag::Closure => {
+            let (code_a, ups_a) = crate::vm::thunk_code(&va);
+            let (code_b, ups_b) = crate::vm::thunk_code(&vb);
+            std::ptr::eq(code_a, code_b)
+                && ups_a.len() == ups_b.len()
+                && ups_a
+                    .iter()
+                    .zip(ups_b.iter())
+                    .all(|(&x, &y)| value_ident_eq(x, y, depth + 1))
+        }
+        Tag::List => {
+            let la = list_elems(&va);
+            let lb = list_elems(&vb);
+            la.len() == lb.len()
+                && la
+                    .iter()
+                    .zip(lb.iter())
+                    .all(|(&x, &y)| value_ident_eq(x, y, depth + 1))
+        }
+        Tag::Attrs => {
+            let ba = attrs_entries(&va);
+            let bb = attrs_entries(&vb);
+            ba.len() == bb.len()
+                && ba.iter().zip(bb.iter()).all(|(x, y)| {
+                    x.sym == y.sym && value_ident_eq(x.val, y.val, depth + 1)
+                })
+        }
+        // Thunk / Blackhole / Failed / PrimOp / PrimOpApp: equal only if the
+        // very same cell (already handled above). Never force; treat as unequal.
+        _ => false,
+    }
+}
+
 /// Port of `addPath` (without an expected hash): serialize the tree at
 /// `real_path` (applying `filter` to each directory entry when given), compute
 /// its content-addressed store path, and — under [`StoreMode::Daemon`] — add it
 /// to the store. Returns the resulting [`StorePath`].
+///
+/// For the refs-empty case the (dump-hash, store-path) result is memoized in
+/// `vm.filtered_path_cache`, keyed by the canonical real path, ingestion
+/// method, name, and the structural identity of the filter closure.
 fn add_filtered_path(
     vm: &mut VM,
     name: &str,
@@ -4381,6 +4468,29 @@ fn add_filtered_path(
 ) -> Result<jinx_store::store_path::StorePath, ErrId> {
     use jinx_store::hash::HashAlgorithm;
     use jinx_store::store_path::{ContentAddressMethod, FileIngestionMethod, FixedOutputInfo, StoreReferences};
+
+    // Memoize refs-empty results: the store path is then a pure function of the
+    // dump, name and method, so identical (path, method, name, filter) inputs
+    // yield the same path without re-dumping/re-hashing.
+    let memo_key: Option<(Vec<u8>, u8, String)> = if refs.is_empty() {
+        use std::os::unix::ffi::OsStrExt;
+        let m: u8 = match method {
+            FileIngestionMethod::Flat => 0,
+            _ => 1,
+        };
+        Some((real_path.as_os_str().as_bytes().to_vec(), m, name.to_string()))
+    } else {
+        None
+    };
+    if let Some(key) = &memo_key {
+        if let Some(entries) = vm.filtered_path_cache.get(key) {
+            for (f, _hash, sp) in entries {
+                if filter_ident_eq(*f, filter) {
+                    return Ok(sp.clone());
+                }
+            }
+        }
+    }
 
     // Build the content-address "dump": raw contents for Flat, a (filtered) NAR
     // for the recursive method.
@@ -4450,6 +4560,18 @@ fn add_filtered_path(
         if let Err(msg) = r {
             return Err(vm.new_err(ErrKind::Eval, msg, NO_POS));
         }
+    }
+
+    if let Some(key) = memo_key {
+        // Root the filter closure so its cell (and the upvalue cells reachable
+        // from it) survive GC — the stored VRef is later compared structurally.
+        if let Some(f) = filter {
+            vm.perm_roots.push(f);
+        }
+        vm.filtered_path_cache
+            .entry(key)
+            .or_default()
+            .push((filter, hash, sp.clone()));
     }
 
     Ok(sp)

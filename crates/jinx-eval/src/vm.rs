@@ -171,6 +171,18 @@ pub struct VM {
     /// coercions (keyed by the source path bytes) so repeated `copyPathToStore`
     /// of the same path skips re-hashing the file/tree.
     pub src_to_store: FxHashMap<Vec<u8>, (Vec<u8>, u32)>,
+    /// Memoize `filterSource` / `builtins.path` dumps for the refs-empty case,
+    /// keyed by (canonical real path, method, name). Each bucket holds one
+    /// entry per distinct filter argument: `(filter, nar-hash, store-path)`.
+    /// Filters are compared by conservative *structural* identity (see
+    /// `filter_ident_eq` in builtins.rs) — never by code pointer alone — so two
+    /// closures with the same code but different captures never alias. Filter
+    /// closures are kept alive via `perm_roots`, so the stored `VRef`s (and the
+    /// upvalue cells reachable from them) remain valid for later comparison.
+    pub filtered_path_cache: FxHashMap<
+        (Vec<u8>, u8, String),
+        Vec<(Option<VRef>, jinx_store::hash::Hash, jinx_store::store_path::StorePath)>,
+    >,
     pub call_depth: usize,
     pub max_call_depth: usize,
     /// (prefix, path) entries, from -I and NIX_PATH.
@@ -264,6 +276,7 @@ impl VM {
             file_cache: Vec::new(),
             file_cache_idx: FxHashMap::default(),
             src_to_store: FxHashMap::default(),
+            filtered_path_cache: FxHashMap::default(),
             call_depth: 0,
             max_call_depth: 10000,
             last_select_pos: NO_POS,
