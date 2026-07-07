@@ -2342,7 +2342,15 @@ impl VM {
             return Ok((printed.clone(), *id));
         }
         let os = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
-        let (hash, _sz) = match jinx_store::nar::hash_path(os, HashAlgorithm::Sha256) {
+        // Read/NAR-hash the *real* on-disk location, applying any store
+        // redirect (as every read builtin does). Coercing a path inside a
+        // not-yet-materialized flake source (e.g. `src = ./.` in nixpkgs)
+        // maps `/nix/store/<h>-source/...` to the extracted temp dir; without
+        // this, hashing the logical path fails with "does not exist" on a cold
+        // store. The resulting store path still derives its name from the
+        // logical basename below, matching C++ fetchToStore(path.baseName()).
+        let real = self.redirect_fs(os);
+        let (hash, _sz) = match jinx_store::nar::hash_path(&real, HashAlgorithm::Sha256) {
             Ok(r) => r,
             Err(e) => {
                 // C++ throws a bare `FileNotFound("path '%s' does not exist")`
