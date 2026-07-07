@@ -76,8 +76,9 @@ struct Options {
     location: bool,
     /// `--max-call-depth` override (C++ default 10000).
     max_call_depth: Option<usize>,
-    /// Whether to print full traces. The harness nix.conf enables show-trace
-    /// by default; `--no-show-trace` turns it off (traces are truncated).
+    /// Whether to print full traces. C++ default is false (traces truncate and
+    /// lambda call frames are omitted); nix.conf `show-trace = true` or a
+    /// `--show-trace` CLI flag turns it on. `--no-show-trace` forces it off.
     show_trace: bool,
     /// `--trace-verbose`: enable `builtins.traceVerbose` output.
     trace_verbose: bool,
@@ -119,7 +120,11 @@ fn parse_args() -> Result<Options, String> {
         experimental: vec![],
         location: true,
         max_call_depth: None,
-        show_trace: true,
+        // C++ default is false; nix.conf `show-trace = true` (as the harness
+        // sets) or a `--show-trace` CLI flag (parsed below, overriding this)
+        // turns it on. Without it, lambda call frames are omitted and long
+        // traces truncate.
+        show_trace: nix_conf_read().show_trace.unwrap_or(false),
         trace_verbose: false,
         // `NIX_ABORT_ON_WARN` (truthy) enables abort-on-warn like the setting.
         abort_on_warn: matches!(
@@ -477,13 +482,31 @@ fn abs_path(p: &str) -> Vec<u8> {
 /// Collect experimental features from the nix.conf pointed to by NIX_CONF_DIR
 /// (following `include`/`!include` directives), reading
 /// `experimental-features` and `extra-experimental-features`.
-fn nix_conf_experimental_features() -> Vec<String> {
-    let mut out = Vec::new();
+/// Parsed subset of the nix.conf settings jinx honors.
+#[derive(Default)]
+struct NixConf {
+    /// Accumulated `experimental-features` + `extra-experimental-features`.
+    experimental: Vec<String>,
+    /// `show-trace` (last value wins); `None` when unset (C++ default false).
+    show_trace: Option<bool>,
+}
+
+/// Read the nix.conf pointed to by NIX_CONF_DIR (following `include`/`!include`
+/// directives), collecting the settings jinx cares about.
+fn nix_conf_read() -> NixConf {
+    let mut conf = NixConf::default();
     let dir = match std::env::var("NIX_CONF_DIR") {
         Ok(d) => std::path::PathBuf::from(d),
-        Err(_) => return out,
+        Err(_) => return conf,
     };
-    fn read_conf(path: &std::path::Path, out: &mut Vec<String>, depth: usize) {
+    fn parse_bool(v: &str) -> Option<bool> {
+        match v.trim() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        }
+    }
+    fn read_conf(path: &std::path::Path, conf: &mut NixConf, depth: usize) {
         if depth > 10 {
             return;
         }
@@ -497,25 +520,34 @@ fn nix_conf_experimental_features() -> Vec<String> {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("include ") {
-                read_conf(&base.join(rest.trim()), out, depth + 1);
+                read_conf(&base.join(rest.trim()), conf, depth + 1);
                 continue;
             }
             if let Some(rest) = line.strip_prefix("!include ") {
-                read_conf(&base.join(rest.trim()), out, depth + 1);
+                read_conf(&base.join(rest.trim()), conf, depth + 1);
                 continue;
             }
             if let Some((k, v)) = line.split_once('=') {
                 let k = k.trim();
                 if k == "experimental-features" || k == "extra-experimental-features" {
                     for f in v.split_whitespace() {
-                        out.push(f.to_string());
+                        conf.experimental.push(f.to_string());
+                    }
+                } else if k == "show-trace" {
+                    if let Some(b) = parse_bool(v) {
+                        conf.show_trace = Some(b);
                     }
                 }
             }
         }
     }
-    read_conf(&dir.join("nix.conf"), &mut out, 0);
-    out
+    read_conf(&dir.join("nix.conf"), &mut conf, 0);
+    conf
+}
+
+/// Experimental features from nix.conf (thin wrapper over [`nix_conf_read`]).
+fn nix_conf_experimental_features() -> Vec<String> {
+    nix_conf_read().experimental
 }
 
 /// Instantiate-mode derivation validation (a subset of C++ `getDerivations` +
