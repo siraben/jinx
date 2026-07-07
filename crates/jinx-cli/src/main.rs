@@ -10,9 +10,9 @@ use jinx_eval::builtins;
 use jinx_eval::error::{ErrId, ErrKind};
 use jinx_eval::print;
 use jinx_eval::value::{Tag, VRef};
-use jinx_eval::vm::{attrs_get, list_elems, thunk_code, val, VM};
+use jinx_eval::vm::{attrs_get, list_elems, str_bytes, thunk_code, val, VM};
 use jinx_syntax::lexer::{Lexer, TokKind};
-use jinx_syntax::pos::NO_POS;
+use jinx_syntax::pos::{PosIdx, NO_POS};
 use jinx_syntax::symbol::Symbol;
 use jinx_syntax::{parse_and_bind, parse_and_bind_with, show, Origin, PosTable, SymbolTable};
 
@@ -49,6 +49,10 @@ struct Options {
     /// Whether to print full traces. The harness nix.conf enables show-trace
     /// by default; `--no-show-trace` turns it off (traces are truncated).
     show_trace: bool,
+    /// `--trace-verbose`: enable `builtins.traceVerbose` output.
+    trace_verbose: bool,
+    /// `--abort-on-warn` / `NIX_ABORT_ON_WARN`: `builtins.warn` throws.
+    abort_on_warn: bool,
 }
 
 fn parse_lint_level(v: &str) -> Result<LintLevel, String> {
@@ -81,6 +85,12 @@ fn parse_args() -> Result<Options, String> {
         location: true,
         max_call_depth: None,
         show_trace: true,
+        trace_verbose: false,
+        // `NIX_ABORT_ON_WARN` (truthy) enables abort-on-warn like the setting.
+        abort_on_warn: matches!(
+            std::env::var("NIX_ABORT_ON_WARN").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        ),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -122,6 +132,9 @@ fn parse_args() -> Result<Options, String> {
             "--pure-eval" => opts.pure_eval = true,
             "--show-trace" => opts.show_trace = true,
             "--no-show-trace" => opts.show_trace = false,
+            "--trace-verbose" => opts.trace_verbose = true,
+            "--abort-on-warn" => opts.abort_on_warn = true,
+            "--no-abort-on-warn" => opts.abort_on_warn = false,
             "--read-write-mode" | "--dry-run" | "--indirect" => {}
             "--extra-experimental-features" | "--experimental-features" => {
                 let v = need(&args, &mut i, a)?;
@@ -364,6 +377,75 @@ fn nix_conf_experimental_features() -> Vec<String> {
     out
 }
 
+/// Instantiate-mode derivation validation (a subset of C++ `getDerivations` +
+/// `PackageInfo::queryDrvPath`): if the value is a derivation, coerce its
+/// `drvPath` to a store path and require it names a `.drv`.
+fn instantiate_check(vm: &mut VM, v: VRef) -> Result<(), ErrId> {
+    let vv = val(v);
+    if vv.tag() != Tag::Attrs {
+        return Ok(());
+    }
+    // A derivation is an attrset whose `type` is the string "derivation".
+    let is_drv = match attrs_get(&vv, vm.syms.type_) {
+        Some(a) => {
+            vm.force(a.val, NO_POS)?;
+            let tv = val(a.val);
+            tv.tag() == Tag::String && str_bytes(&tv) == b"derivation"
+        }
+        None => false,
+    };
+    if !is_drv {
+        return Ok(());
+    }
+    if let Some(a) = attrs_get(&vv, vm.syms.drv_path) {
+        let dpos = PosIdx(a.pos);
+        let (s, _ctx) = vm.coerce_to_string(
+            a.val,
+            dpos,
+            "while evaluating the 'drvPath' attribute of a derivation",
+            false,
+            false,
+            false,
+        )?;
+        if let Err(e) = require_derivation(vm, &s) {
+            vm.add_trace(e, dpos, "while evaluating the 'drvPath' attribute of a derivation");
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Port of `StorePath::requireDerivation`: extract the store-path base name and
+/// error if its name part does not end in `.drv`.
+fn require_derivation(vm: &mut VM, path: &[u8]) -> Result<(), ErrId> {
+    let store_dir = vm.store_dir.clone();
+    // Strip the store dir prefix; if absent, coerceToStorePath would have
+    // raised a different error already — nothing to validate here.
+    let rest = if path.starts_with(&store_dir) && path.get(store_dir.len()) == Some(&b'/') {
+        &path[store_dir.len() + 1..]
+    } else {
+        return Ok(());
+    };
+    let base: &[u8] = match rest.iter().position(|&c| c == b'/') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    // StorePath::name() = base name after the 32-char hash and its '-'.
+    let name: &[u8] = if base.len() > 33 && base[32] == b'-' {
+        &base[33..]
+    } else {
+        base
+    };
+    if !name.ends_with(b".drv") {
+        let msg = format!(
+            "store path '{}' is not a valid derivation path",
+            String::from_utf8_lossy(base)
+        );
+        return Err(vm.new_err(ErrKind::Eval, msg, NO_POS));
+    }
+    Ok(())
+}
+
 fn run_eval(opts: Options) -> ExitCode {
     let symbols = SymbolTable::new();
     let positions = PosTable::new();
@@ -377,6 +459,8 @@ fn run_eval(opts: Options) -> ExitCode {
         vm.max_call_depth = d;
     }
     vm.show_trace = opts.show_trace;
+    vm.trace_verbose = opts.trace_verbose;
+    vm.abort_on_warn = opts.abort_on_warn;
     for f in nix_conf_experimental_features() {
         vm.experimental.enable(&f);
     }
@@ -518,6 +602,17 @@ fn run_eval(opts: Options) -> ExitCode {
         } else {
             v
         };
+        // Instantiate mode (no --eval): nix-instantiate collects derivations
+        // and validates each `drvPath`. jinx has no build backend, but the
+        // validation surfaces real errors (e.g. a manually-set, non-`.drv`
+        // drvPath), which is what `non-eval-fail-bad-drvPath` exercises.
+        if !opts.eval {
+            if let Err(e) = instantiate_check(&mut vm, v) {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+            continue;
+        }
         if opts.strict && !opts.xml {
             if let Err(e) = print::deep_force(&mut vm, v) {
                 report_err(&vm, e);

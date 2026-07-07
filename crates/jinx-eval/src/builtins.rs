@@ -164,7 +164,7 @@ pub fn register_globals(vm: &mut VM) {
         Reg { name: "__seq", arity: 2, func: prim_seq },
         Reg { name: "__deepSeq", arity: 2, func: prim_deep_seq },
         Reg { name: "__trace", arity: 2, func: prim_trace },
-        Reg { name: "__traceVerbose", arity: 2, func: prim_seq_second },
+        Reg { name: "__traceVerbose", arity: 2, func: prim_trace_verbose },
         Reg { name: "__addErrorContext", arity: 2, func: prim_add_error_context },
         Reg { name: "__warn", arity: 2, func: prim_warn },
         Reg { name: "__tryEval", arity: 1, func: prim_try_eval },
@@ -535,6 +535,16 @@ fn prim_seq_second(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosI
     Ok(val(args[1]))
 }
 
+fn prim_trace_verbose(vm: &mut VM, d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    // Only emit the trace when `--trace-verbose` is set (C++ swaps the impl
+    // based on the `trace-verbose` setting); otherwise behave like `seq`.
+    if vm.trace_verbose {
+        prim_trace(vm, d, args, pos)
+    } else {
+        prim_seq_second(vm, d, args, pos)
+    }
+}
+
 fn prim_deep_seq(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
     print::deep_force(vm, args[0])?;
     vm.force(args[1], pos)?;
@@ -569,6 +579,15 @@ fn prim_warn(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) ->
     out.push(b'\n');
     use std::io::Write;
     let _ = std::io::stderr().write_all(&out);
+    if vm.abort_on_warn {
+        // C++ throws a plain EvalBaseError (uncached, not tryEval-catchable)
+        // after emitting the warning, to reveal the surrounding stack trace.
+        return Err(vm.new_err(
+            ErrKind::Eval,
+            "aborting to reveal stack trace of warning, as abort-on-warn is set",
+            pos,
+        ));
+    }
     vm.force(args[1], pos)?;
     Ok(val(args[1]))
 }

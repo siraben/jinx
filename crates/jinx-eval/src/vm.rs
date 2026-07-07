@@ -188,6 +188,11 @@ pub struct VM {
     pub last_select_pos: PosIdx,
     /// Whether the error renderer prints full traces (`--show-trace`).
     pub show_trace: bool,
+    /// `builtins.traceVerbose` only prints when `--trace-verbose` is set.
+    pub trace_verbose: bool,
+    /// `--abort-on-warn` / `NIX_ABORT_ON_WARN`: `builtins.warn` throws after
+    /// emitting the warning, to reveal the stack trace.
+    pub abort_on_warn: bool,
     /// Position the current thunk was forced with. C++ `forceValue(v, pos)`
     /// threads `pos` into `callFunction` for `tApp` values; jinx's synthetic
     /// apply thunks (no call pos of their own) recover it from here.
@@ -216,6 +221,8 @@ impl VM {
             max_call_depth: 10000,
             last_select_pos: NO_POS,
             show_trace: true,
+            trace_verbose: false,
+            abort_on_warn: false,
             force_pos: NO_POS,
             search_path: Vec::new(),
             true_cell: immortal::cell(Value::bool(true)),
