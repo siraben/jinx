@@ -2,7 +2,7 @@
 //! byte-for-byte (notably float formatting: std::to_chars shortest
 //! round-trip, with ".0" appended to integral results).
 
-use jinx_syntax::pos::PosIdx;
+use jinx_syntax::pos::{PosIdx, NO_POS};
 use jinx_syntax::symbol::Symbol;
 
 use crate::error::{ErrId, ErrKind};
@@ -72,8 +72,77 @@ fn json_float(f: f64) -> String {
     }
 }
 
-/// nlohmann-style string escaping (control chars as \uXXXX).
-fn json_string(out: &mut Vec<u8>, s: &[u8]) {
+/// Höhrmann UTF-8 decoding DFA, exactly as embedded in `nlohmann::json`'s
+/// `dump()` (the type map for bytes 0x00-0xFF followed by the state-transition
+/// table). Used to reproduce nlohmann's `type_error.316` diagnostics.
+#[rustfmt::skip]
+const UTF8D: [u8; 400] = [
+    // bytes 0x00..0xFF -> character class
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
+    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7, 7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+    8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2, 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
+    10,3,3,3,3,3,3,3,3,3,3,3,3,4,3,3, 11,6,6,6,5,8,8,8,8,8,8,8,8,8,8,8,
+    // state transitions
+    0,12,24,36,60,96,84,12,12,12,48,72, 12,12,12,12,12,12,12,12,12,12,12,12,
+    12,0,12,12,12,12,12,0,12,0,12,12, 12,24,12,12,12,12,12,24,12,24,12,12,
+    12,12,12,12,12,12,12,24,12,12,12,12, 12,24,12,12,12,12,12,12,12,24,12,12,
+    12,12,12,12,12,12,12,36,12,36,12,12, 12,36,12,12,12,12,12,36,12,36,12,12,
+    12,36,12,12,12,12,12,12,12,12,12,12,
+    // padding to 400 (unused)
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,
+];
+
+const UTF8_ACCEPT: u32 = 0;
+const UTF8_REJECT: u32 = 12;
+
+/// Run nlohmann's UTF-8 validation over `s`. Returns the index and value of the
+/// byte that first drives the decoder into `UTF8_REJECT` (nlohmann's `invalid
+/// UTF-8 byte at index i: 0xXX`), or the last byte's index for a truncated
+/// trailing sequence (`incomplete UTF-8 string; last byte: 0xXX`).
+fn utf8_error(s: &[u8]) -> Option<Utf8Error> {
+    let mut state = UTF8_ACCEPT;
+    for (i, &byte) in s.iter().enumerate() {
+        let ty = UTF8D[byte as usize] as u32;
+        state = UTF8D[(256 + state + ty) as usize] as u32;
+        if state == UTF8_REJECT {
+            return Some(Utf8Error::Invalid { index: i, byte });
+        }
+    }
+    if state != UTF8_ACCEPT {
+        // Truncated multi-byte sequence at end of string.
+        let i = s.len().saturating_sub(1);
+        return Some(Utf8Error::Incomplete { byte: s[i] });
+    }
+    None
+}
+
+enum Utf8Error {
+    Invalid { index: usize, byte: u8 },
+    Incomplete { byte: u8 },
+}
+
+impl Utf8Error {
+    /// The `e.what()` text nlohmann's `type_error` produces.
+    fn what(&self) -> String {
+        match self {
+            Utf8Error::Invalid { index, byte } => format!(
+                "[json.exception.type_error.316] invalid UTF-8 byte at index {index}: 0x{byte:02X}"
+            ),
+            Utf8Error::Incomplete { byte } => format!(
+                "[json.exception.type_error.316] incomplete UTF-8 string; last byte: 0x{byte:02X}"
+            ),
+        }
+    }
+}
+
+/// nlohmann-style string escaping (control chars as \uXXXX), no validation.
+fn json_escape(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
     for &c in s {
         match c {
@@ -91,9 +160,28 @@ fn json_string(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
 }
 
-/// Public wrapper for JSON string escaping (used to build `__json`).
+/// Validate UTF-8 (exactly like `dump()`) then escape, returning the nlohmann
+/// diagnostic on failure.
+fn json_string(out: &mut Vec<u8>, s: &[u8]) -> Result<(), Utf8Error> {
+    if let Some(e) = utf8_error(s) {
+        return Err(e);
+    }
+    json_escape(out, s);
+    Ok(())
+}
+
+/// Build the `JSONSerializationError` an invalid string triggers, matching
+/// `value-to-json.cc` (`JSON serialization error: %s` with `e.what()`).
+fn json_utf8_errid(vm: &mut VM, e: Utf8Error) -> ErrId {
+    let msg = format!("JSON serialization error: {}", e.what());
+    vm.new_err(ErrKind::Eval, msg, NO_POS)
+}
+
+/// Public wrapper for JSON string escaping (used to build `__json`); silently
+/// tolerates invalid UTF-8 (the surrounding derivationStrict path validates
+/// elsewhere).
 pub fn json_string_pub(out: &mut Vec<u8>, s: &[u8]) {
-    json_string(out, s);
+    json_escape(out, s);
 }
 
 pub fn to_json(vm: &mut VM, cell: VRef, pos: PosIdx, out: &mut Vec<u8>) -> Result<(), ErrId> {
@@ -133,7 +221,9 @@ fn to_json_ctx_inner(
         Tag::False => out.extend_from_slice(b"false"),
         Tag::Null => out.extend_from_slice(b"null"),
         Tag::String => {
-            json_string(out, str_bytes(&v));
+            if let Err(e) = json_string(out, str_bytes(&v)) {
+                return Err(json_utf8_errid(vm, e));
+            }
             for id in vm.read_str_ctx(&v) {
                 if !ctx.contains(&id) {
                     ctx.push(id);
@@ -144,7 +234,9 @@ fn to_json_ctx_inner(
             // C++ copies the path to the store here (copyToStore=true).
             let path = crate::vm::path_bytes(&v).to_vec();
             let (printed, id) = vm.copy_path_to_store(&path, pos)?;
-            json_string(out, &printed);
+            if let Err(e) = json_string(out, &printed) {
+                return Err(json_utf8_errid(vm, e));
+            }
             if !ctx.contains(&id) {
                 ctx.push(id);
             }
@@ -165,7 +257,9 @@ fn to_json_ctx_inner(
                     true,
                 )?;
                 vm.temp_end(scope);
-                json_string(out, &s);
+                if let Err(e) = json_string(out, &s) {
+                    return Err(json_utf8_errid(vm, e));
+                }
                 for id in sctx {
                     if !ctx.contains(&id) {
                         ctx.push(id);
@@ -186,7 +280,9 @@ fn to_json_ctx_inner(
                 if i > 0 {
                     out.push(b',');
                 }
-                json_string(out, name);
+                if let Err(e) = json_string(out, name) {
+                    return Err(json_utf8_errid(vm, e));
+                }
                 out.push(b':');
                 to_json_ctx(vm, *vc, PosIdx(*apos), out, ctx).map_err(|e| {
                     vm.add_trace(
