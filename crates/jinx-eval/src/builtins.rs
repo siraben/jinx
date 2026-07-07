@@ -1450,7 +1450,11 @@ fn process_drv_attr(
         }
     }
     match key {
-        b"__structuredAttrs" => return Ok(()),
+        // Only elided from the env when structured-attrs mode is *on* (C++
+        // skips it solely inside the `if (jsonObject)` branch). With
+        // `__structuredAttrs = false` it is a normal boolean attribute and is
+        // passed to the builder as the env var `__structuredAttrs=""`.
+        b"__structuredAttrs" if structured => return Ok(()),
         b"__contentAddressed" => {
             *st.content_addressed = vm.force_bool(a.val, pos, "")?;
             if *st.content_addressed && !vm.experimental.ca_derivations {
