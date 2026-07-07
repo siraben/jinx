@@ -244,3 +244,76 @@ fn live_add_to_store_and_temp_root() {
     let _ = std::fs::remove_dir_all(&tmp);
     eprintln!("added {} to the store", dir.print_store_path(&expected));
 }
+
+#[test]
+fn live_add_text_to_store() {
+    let Some(mut store) = try_connect() else { return };
+    let dir = store.store_dir().clone();
+
+    let name = format!("jinx-daemon-text-{}.txt", std::process::id());
+    let contents = b"jinx add_to_store_bytes / text CA test\n";
+    // Expected path via the local text-path computation.
+    let expected = dir
+        .make_text_path(&name, contents, &Default::default())
+        .unwrap();
+
+    let info = store
+        .add_to_store_bytes(
+            &name,
+            "text:sha256",
+            &jinx_store::store_path::StorePathSet::new(),
+            false,
+            contents,
+        )
+        .unwrap();
+    assert_eq!(info.path, expected, "daemon text path must match local text-path CA");
+    assert!(store.is_valid_path(&expected).unwrap());
+    eprintln!("added text {} to the store", dir.print_store_path(&expected));
+}
+
+#[test]
+fn live_add_large_tree_no_deadlock() {
+    // Exercises the FramedSink stderr-drain path: a multi-megabyte NAR spans
+    // many frames, so a chatty daemon must not deadlock the streaming add.
+    let Some(mut store) = try_connect() else { return };
+    let dir = store.store_dir().clone();
+
+    let tmp = std::env::temp_dir().join(format!("jinx-daemon-big-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    // ~4 MB of deterministic content across a few files.
+    for i in 0..3 {
+        let mut f = std::fs::File::create(tmp.join(format!("f{i}.dat"))).unwrap();
+        let chunk = vec![b'a' + (i as u8); 1024];
+        for _ in 0..1300 {
+            f.write_all(&chunk).unwrap();
+        }
+    }
+
+    let (nar_hash, _) = jinx_store::nar::hash_path(&tmp, HashAlgorithm::Sha256).unwrap();
+    let expected = dir
+        .make_fixed_output_path(
+            "big",
+            &FixedOutputInfo {
+                method: FileIngestionMethod::NixArchive,
+                hash: nar_hash,
+                references: Default::default(),
+            },
+        )
+        .unwrap();
+
+    let info = store
+        .add_to_store_nar_path(
+            "big",
+            &tmp,
+            ContentAddressMethod::NixArchive,
+            HashAlgorithm::Sha256,
+            &jinx_store::store_path::StorePathSet::new(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(info.path, expected);
+    assert!(store.is_valid_path(&expected).unwrap());
+    let _ = std::fs::remove_dir_all(&tmp);
+    eprintln!("added large {} to the store", dir.print_store_path(&expected));
+}
