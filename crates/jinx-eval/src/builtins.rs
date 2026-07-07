@@ -2044,9 +2044,44 @@ fn prim_path(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) ->
             hash: h,
             references: StoreReferences::default(),
         });
-        store
+        let expected_sp = store
             .make_fixed_output_path_from_ca(&name_s, &ca)
-            .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?
+            .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?;
+        // Port of prim_path: hash the actual (possibly filtered) path and
+        // require the resulting store path to match the one derived from the
+        // declared hash. C++ skips this when the expected path is already valid
+        // in the store; under jinx's readonly/dummy store it never is, so we
+        // always verify. A mismatch is `store path mismatch ...`.
+        use std::os::unix::ffi::OsStrExt;
+        let logical = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
+        let real = vm.redirect_fs(logical);
+        let refset = jinx_store::store_path::StorePathSet::new();
+        let dst = add_filtered_path(vm, &name_s, real.as_path(), filter, method, &refset)
+            .map_err(|e| {
+                vm.add_trace(
+                    e,
+                    pos,
+                    format!("while adding path '{}'", String::from_utf8_lossy(&path)),
+                );
+                e
+            })?;
+        if dst != expected_sp {
+            let e = vm.new_err(
+                ErrKind::Eval,
+                format!(
+                    "store path mismatch in (possibly filtered) path added from '{}'",
+                    String::from_utf8_lossy(&path)
+                ),
+                pos,
+            );
+            vm.add_trace(
+                e,
+                pos,
+                format!("while adding path '{}'", String::from_utf8_lossy(&path)),
+            );
+            return Err(e);
+        }
+        expected_sp
     } else {
         // No expected hash: hash the (filtered) path content, adding it to the
         // store when daemon-backed. Port of `addPath` without `expectedHash`.
