@@ -188,6 +188,71 @@ impl Heap {
         Value::make(Tag::Attrs, p as u64)
     }
 
+    /// `//`: merge two sorted attr slices directly into a fresh bindings
+    /// object (single pass, no intermediate Vec). Mirrors C++
+    /// `ExprOpUpdate::eval`, which merges straight into the destination
+    /// Bindings. Both inputs must be sorted by sym; on duplicate syms the
+    /// right entry wins (same as the old temp-Vec merge).
+    pub fn new_bindings_merge(&mut self, le: &[Attr], re: &[Attr]) -> Value {
+        debug_assert!(le.windows(2).all(|w| w[0].sym < w[1].sym));
+        debug_assert!(re.windows(2).all(|w| w[0].sym < w[1].sym));
+        // Exact merged length. Fast paths: disjoint ranges need no scan.
+        let dups = if le.last().unwrap().sym < re.first().unwrap().sym
+            || re.last().unwrap().sym < le.first().unwrap().sym
+        {
+            0
+        } else {
+            let (mut i, mut j, mut d) = (0usize, 0usize, 0usize);
+            while i < le.len() && j < re.len() {
+                match le[i].sym.cmp(&re[j].sym) {
+                    std::cmp::Ordering::Equal => {
+                        d += 1;
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                }
+            }
+            d
+        };
+        let n = le.len() + re.len() - dups;
+        let p = self.alloc_data(ObjKind::Bindings, n);
+        // SAFETY: object sized for n 16-byte entries; merge writes exactly n.
+        unsafe {
+            let out = p.add(1) as *mut Attr;
+            let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
+            while i < le.len() && j < re.len() {
+                match le[i].sym.cmp(&re[j].sym) {
+                    std::cmp::Ordering::Equal => {
+                        out.add(k).write(re[j]);
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => {
+                        out.add(k).write(le[i]);
+                        i += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        out.add(k).write(re[j]);
+                        j += 1;
+                    }
+                }
+                k += 1;
+            }
+            if i < le.len() {
+                std::ptr::copy_nonoverlapping(le.as_ptr().add(i), out.add(k), le.len() - i);
+                k += le.len() - i;
+            }
+            if j < re.len() {
+                std::ptr::copy_nonoverlapping(re.as_ptr().add(j), out.add(k), re.len() - j);
+                k += re.len() - j;
+            }
+            debug_assert_eq!(k, n);
+        }
+        Value::make(Tag::Attrs, p as u64)
+    }
+
     pub fn new_ctx(&mut self, elems: &[u32]) -> *mut u64 {
         let p = self.alloc_data(ObjKind::Ctx, elems.len());
         // SAFETY: object sized for len u32s (word-padded).
@@ -195,6 +260,41 @@ impl Heap {
             std::ptr::copy_nonoverlapping(elems.as_ptr(), p.add(1) as *mut u32, elems.len());
         }
         p
+    }
+
+    /// Like `new_thunk`, but returns the object with `len` upval slots
+    /// UNINITIALIZED; the caller must write all `len` slots before the next
+    /// possible collection (i.e. before any further gc_check/alloc wrapper).
+    /// Avoids the temp Vec + copy in the very hot `make_thunk` path.
+    pub fn new_thunk_raw(&mut self, tag: Tag, code: *const (), len: usize) -> (Value, *mut VRef) {
+        debug_assert!(matches!(tag, Tag::Thunk | Tag::Closure));
+        let p = self.alloc_data(ObjKind::Thunk, len);
+        // SAFETY: object sized for len pointers at offset 16.
+        unsafe {
+            p.add(1).write(code as u64);
+            (Value::make(tag, p as u64), p.add(2) as *mut VRef)
+        }
+    }
+
+    /// Like `new_bindings`, but with `len` UNINITIALIZED entries for the
+    /// caller to fill (sorted by sym) before the next possible collection.
+    pub fn new_bindings_raw(&mut self, len: usize) -> (Value, *mut Attr) {
+        let p = self.alloc_data(ObjKind::Bindings, len);
+        (Value::make(Tag::Attrs, p as u64), unsafe {
+            p.add(1) as *mut Attr
+        })
+    }
+
+    /// Concatenate two element slices directly into a fresh list object.
+    pub fn new_list_concat(&mut self, a: &[VRef], b: &[VRef]) -> Value {
+        let p = self.alloc_data(ObjKind::List, a.len() + b.len());
+        // SAFETY: object sized for a+b pointers.
+        unsafe {
+            let out = p.add(1) as *mut VRef;
+            std::ptr::copy_nonoverlapping(a.as_ptr(), out, a.len());
+            std::ptr::copy_nonoverlapping(b.as_ptr(), out.add(a.len()), b.len());
+        }
+        Value::make(Tag::List, p as u64)
     }
 
     /// Thunks and closures: `code` is an immortal pointer (Chunk), `upvals`

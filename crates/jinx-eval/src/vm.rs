@@ -853,7 +853,11 @@ impl VM {
             };
         }
         loop {
-            self.gc_check();
+            // No per-op gc_check: every allocation site (alloc_cell,
+            // make_thunk, MakeList/MakeAttrs/ConcatLists, new_*_value
+            // wrappers, op_update) performs its own check, which is where
+            // C++/Boehm polls too. A missed poll only delays collection to
+            // the next allocating op.
             let op = chunk.ops[ip];
             match op {
                 Op::Const(i) => {
@@ -925,21 +929,26 @@ impl VM {
                     self.stack.push(c);
                 }
                 Op::MakeAttrs(d) => {
+                    // gc_check BEFORE building: the entry cells are still
+                    // rooted on the operand stack while we fill the object.
+                    self.gc_check();
                     let desc = &self.frames[fi].code.prog().attrs_descs[d as usize];
                     let n = desc.names.len();
                     let start = self.stack.len() - n;
-                    let entries: Vec<Attr> = desc
-                        .names
-                        .iter()
-                        .zip(&self.stack[start..])
-                        .map(|(&(sym, pos), &cell)| Attr {
-                            sym: sym.0,
-                            pos: pos.0,
-                            val: cell,
-                        })
-                        .collect();
-                    self.gc_check();
-                    let v = self.heap.new_bindings(&entries);
+                    let (v, out) = self.heap.new_bindings_raw(n);
+                    // SAFETY: `out` has n slots; desc.names and the popped
+                    // stack range both have exactly n items.
+                    unsafe {
+                        for (k, (&(sym, pos), &cell)) in
+                            desc.names.iter().zip(&self.stack[start..]).enumerate()
+                        {
+                            out.add(k).write(Attr {
+                                sym: sym.0,
+                                pos: pos.0,
+                                val: cell,
+                            });
+                        }
+                    }
                     let c = self.heap.alloc_value(v);
                     self.stack.truncate(start);
                     self.stack.push(c);
@@ -998,12 +1007,11 @@ impl VM {
                     } else if eb.is_empty() {
                         va
                     } else {
-                        let mut items: Vec<VRef> = Vec::with_capacity(ea.len() + eb.len());
-                        items.extend_from_slice(ea);
-                        items.extend_from_slice(eb);
                         // a and b stay reachable from native locals;
-                        // elements are reachable through them.
-                        self.new_list_value(&items)
+                        // elements are reachable through them. gc_check runs
+                        // inside before the object is carved.
+                        self.gc_check();
+                        self.heap.new_list_concat(ea, eb)
                     };
                     let c = self.alloc_cell(v);
                     self.stack.push(c);
@@ -1355,6 +1363,10 @@ impl VM {
     }
 
     pub(crate) fn op_update(&mut self) -> Result<(), ErrId> {
+        // gc_check BEFORE popping: left/right must still be rooted on the VM
+        // stack when a collection can run, since the merge below reads their
+        // heap entries after allocating the destination object.
+        self.gc_check();
         let left = self.stack.pop().unwrap();
         let right = self.stack.pop().unwrap();
         let (lv, rv) = (val(left), val(right));
@@ -1364,24 +1376,7 @@ impl VM {
         } else if re.is_empty() {
             lv
         } else {
-            let mut entries: Vec<Attr> = Vec::with_capacity(le.len() + re.len());
-            let (mut i, mut j) = (0, 0);
-            while i < le.len() && j < re.len() {
-                if le[i].sym == re[j].sym {
-                    entries.push(re[j]);
-                    i += 1;
-                    j += 1;
-                } else if le[i].sym < re[j].sym {
-                    entries.push(le[i]);
-                    i += 1;
-                } else {
-                    entries.push(re[j]);
-                    j += 1;
-                }
-            }
-            entries.extend_from_slice(&le[i..]);
-            entries.extend_from_slice(&re[j..]);
-            self.new_bindings_value(&entries)
+            self.heap.new_bindings_merge(le, re)
         };
         let c = self.alloc_cell(v);
         self.stack.push(c);
@@ -1625,30 +1620,40 @@ impl VM {
     // ---------------- thunks / with ----------------
 
     pub(crate) fn make_thunk(&mut self, fi: usize, cid: u32, tag: Tag) -> VRef {
+        // gc_check FIRST: the upval sources (stack cells, frame upvals,
+        // with_local) are all rooted, and no collection can run while we fill
+        // the fresh object below.
+        self.gc_check();
         let prog = self.frames[fi].code.prog();
         let child: &Chunk = &prog.chunks[cid as usize];
         let cur_chunk = self.frames[fi].code.chunk();
-        let mut upvals: Vec<VRef> =
-            Vec::with_capacity(child.with_captures as usize + child.captures.len());
-        if child.with_captures > 0 {
-            let f_upvals = self.frames[fi].upvals();
-            let inherited = cur_chunk.with_captures as usize;
-            upvals.extend_from_slice(&f_upvals[..inherited]);
-            upvals.extend_from_slice(&self.frames[fi].with_local);
-            debug_assert_eq!(upvals.len(), child.with_captures as usize);
-        }
-        let base = self.frames[fi].locals_base;
-        for cap in &child.captures {
-            match cap {
-                crate::chunk::Cap::Local(s) => upvals.push(self.stack[base + *s as usize]),
-                crate::chunk::Cap::Upval(i) => {
-                    upvals.push(self.frames[fi].upvals()[*i as usize])
-                }
-            }
-        }
-        self.gc_check();
+        let n = child.with_captures as usize + child.captures.len();
         let code = prog.code_ref(cid) as *const CodeRef as *const ();
-        let v = self.heap.new_thunk(tag, code, &upvals);
+        let (v, out) = self.heap.new_thunk_raw(tag, code, n);
+        let mut k = 0usize;
+        // SAFETY: `out` has n slots; we write exactly n below.
+        unsafe {
+            if child.with_captures > 0 {
+                let f_upvals = self.frames[fi].upvals();
+                let inherited = cur_chunk.with_captures as usize;
+                std::ptr::copy_nonoverlapping(f_upvals.as_ptr(), out, inherited);
+                k = inherited;
+                let wl = &self.frames[fi].with_local;
+                std::ptr::copy_nonoverlapping(wl.as_ptr(), out.add(k), wl.len());
+                k += wl.len();
+                debug_assert_eq!(k, child.with_captures as usize);
+            }
+            let base = self.frames[fi].locals_base;
+            for cap in &child.captures {
+                let c = match cap {
+                    crate::chunk::Cap::Local(s) => self.stack[base + *s as usize],
+                    crate::chunk::Cap::Upval(i) => self.frames[fi].upvals()[*i as usize],
+                };
+                out.add(k).write(c);
+                k += 1;
+            }
+            debug_assert_eq!(k, n);
+        }
         self.heap.alloc_value(v)
     }
 
