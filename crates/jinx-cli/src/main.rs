@@ -306,10 +306,6 @@ fn run(opts: Options) -> ExitCode {
         eprintln!("error: only --parse and --eval are supported in this milestone");
         return ExitCode::FAILURE;
     }
-    if opts.json {
-        eprintln!("error: --json output is not implemented in jinx yet");
-        return ExitCode::FAILURE;
-    }
     run_eval(opts)
 }
 
@@ -779,13 +775,26 @@ fn run_eval(opts: Options) -> ExitCode {
             let _ = lock.flush();
             continue;
         }
-        if opts.strict && !opts.xml {
+        if opts.strict && !opts.xml && !opts.json {
             if let Err(e) = print::deep_force(&mut vm, v) {
                 report_err(&vm, e);
                 return ExitCode::FAILURE;
             }
         }
         let mut out = Vec::new();
+        if opts.json {
+            // `nix-instantiate --eval --json`: serialize the value as JSON
+            // (toJSON semantics — it deep-forces as needed). No trailing newline,
+            // matching nix-instantiate.
+            if let Err(e) = jinx_eval::json::to_json(&mut vm, v, NO_POS, &mut out) {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+            let mut lock = stdout.lock();
+            let _ = lock.write_all(&out);
+            let _ = lock.flush();
+            continue;
+        }
         if opts.xml {
             let mut ctx = Vec::new();
             if let Err(e) =
