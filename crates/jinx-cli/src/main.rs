@@ -314,13 +314,26 @@ fn run(opts: Options) -> ExitCode {
 }
 
 fn run_parse(opts: &Options) -> ExitCode {
+    let home = std::env::var("HOME").ok();
+    let mut positions = PosTable::new();
+    // `--parse -E <expr>`: parse an inline expression with a «string» origin,
+    // exactly like the eval path (the operand is the expression, not a file).
+    if opts.from_args {
+        let Some(expr) = opts.files.first() else {
+            eprintln!("error: -E requires an expression");
+            return ExitCode::FAILURE;
+        };
+        let source = expr.clone().into_bytes();
+        let origin = Origin::String {
+            source: source.clone(),
+        };
+        return emit_parse(&source, origin, &cwd_string(), home.as_deref(), &mut positions);
+    }
     let file = opts.files.first().cloned();
     if !(opts.read_stdin && opts.files.is_empty()) && file.is_none() {
         eprintln!("error: --parse expects a file or '-'");
         return ExitCode::FAILURE;
     }
-    let home = std::env::var("HOME").ok();
-    let mut positions = PosTable::new();
     let (source, origin, base_path) = if let Some(file) = file {
         // File argument: origin is the (absolutized) path; relative path
         // literals resolve against the file's directory, like nix-instantiate.
@@ -356,15 +369,20 @@ fn run_parse(opts: &Options) -> ExitCode {
         };
         (source, origin, cwd_string())
     };
+    emit_parse(&source, origin, &base_path, home.as_deref(), &mut positions)
+}
+
+/// Parse `source` under `origin`, print `Expr::show` on success (exit 0) or the
+/// rendered error on failure (exit 1) — the shared tail of every `--parse` mode.
+fn emit_parse(
+    source: &[u8],
+    origin: Origin,
+    base_path: &str,
+    home: Option<&str>,
+    positions: &mut PosTable,
+) -> ExitCode {
     let mut warnings = Vec::new();
-    let result = parse_and_bind(
-        &source,
-        origin,
-        &base_path,
-        home.as_deref(),
-        &mut positions,
-        &mut warnings,
-    );
+    let result = parse_and_bind(source, origin, base_path, home, positions, &mut warnings);
     for w in &warnings {
         write_stderr_line(&jinx_syntax::error::filter_ansi_escapes(w));
     }
@@ -379,7 +397,7 @@ fn run_parse(opts: &Options) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            write_stderr_line(&e.render(&positions));
+            write_stderr_line(&e.render(positions));
             ExitCode::FAILURE
         }
     }
