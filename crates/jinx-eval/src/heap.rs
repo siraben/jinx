@@ -724,11 +724,31 @@ impl Marker<'_> {
 }
 
 /// Highest scannable address of the current thread's stack.
+#[cfg(target_os = "macos")]
 fn current_stack_base() -> usize {
     // SAFETY: pthread_self is always valid; Darwin returns the stack top.
     unsafe {
         let me = libc::pthread_self();
         libc::pthread_get_stackaddr_np(me) as usize
+    }
+}
+
+/// Highest scannable address of the current thread's stack.
+#[cfg(target_os = "linux")]
+fn current_stack_base() -> usize {
+    // SAFETY: pthread_getattr_np/pthread_attr_getstack are the documented way
+    // to obtain the stack extent on Linux; `stackaddr` is the LOWEST address,
+    // so the scannable top is `stackaddr + stacksize`.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        let rc = libc::pthread_getattr_np(libc::pthread_self(), &mut attr);
+        assert_eq!(rc, 0, "pthread_getattr_np failed");
+        let mut stackaddr: *mut libc::c_void = std::ptr::null_mut();
+        let mut stacksize: libc::size_t = 0;
+        let rc = libc::pthread_attr_getstack(&mut attr, &mut stackaddr, &mut stacksize);
+        assert_eq!(rc, 0, "pthread_attr_getstack failed");
+        libc::pthread_attr_destroy(&mut attr);
+        stackaddr as usize + stacksize
     }
 }
 
@@ -748,13 +768,31 @@ extern "C" fn dump_callee_saved(buf: *mut usize) {
     )
 }
 
+/// Dump all callee-saved general registers into `buf` (they may hold the only
+/// reference to a heap object at the moment GC runs).
+///
+/// System V x86-64: rbx, rbp, r12-r15 are callee-saved.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+extern "C" fn dump_callee_saved(buf: *mut usize) {
+    std::arch::naked_asm!(
+        "mov [rdi], rbx",
+        "mov [rdi + 8], rbp",
+        "mov [rdi + 16], r12",
+        "mov [rdi + 24], r13",
+        "mov [rdi + 32], r14",
+        "mov [rdi + 40], r15",
+        "ret",
+    )
+}
+
 /// Spill callee-saved registers into a stack buffer, then invoke `f` with the
 /// current stack pointer. The buffer lives in this frame, so the [sp, base)
 /// scan performed by `f` covers both the mutator's stack and the registers.
 #[inline(never)]
 fn spill_registers_and(f: impl FnOnce(usize)) {
     let mut buf = [0usize; 12];
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     dump_callee_saved(buf.as_mut_ptr());
     let sp = buf.as_ptr() as usize;
     f(sp);
