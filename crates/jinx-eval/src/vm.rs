@@ -152,7 +152,7 @@ impl Frame {
 
 pub struct VM {
     pub heap: Heap,
-    pub stack: Vec<VRef>,
+    pub stack: crate::stack::Stack,
     pub frames: Vec<Frame>,
     pub temp_roots: Vec<VRef>,
     /// Permanent extra roots (mutable global cells like `derivation`,
@@ -245,7 +245,7 @@ impl VM {
         let syms = SpecialSyms::new(&mut symbols);
         VM {
             heap: Heap::new(),
-            stack: Vec::with_capacity(1024),
+            stack: crate::stack::Stack::with_capacity(1024),
             frames: Vec::with_capacity(64),
             temp_roots: Vec::new(),
             perm_roots: Vec::new(),

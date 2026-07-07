@@ -13,6 +13,7 @@ pub mod json;
 pub mod mem;
 pub mod print;
 pub mod regex;
+pub mod stack;
 pub mod value;
 pub mod vm;
 pub mod xml;
