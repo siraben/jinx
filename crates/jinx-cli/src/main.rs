@@ -2,6 +2,9 @@
 //! M1: `--parse -`. M2: `--eval [--strict] [-E expr | file | -]` with
 //! --arg/--argstr/-A/-I/NIX_PATH, printing via printAmbiguous.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
