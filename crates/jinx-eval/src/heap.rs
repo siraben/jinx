@@ -14,7 +14,7 @@ use crate::mem::{BlockKind, BlockSpace, BLOCK_SIZE, GRANULE, LARGE_OBJECT_MIN};
 use crate::value::{self, Attr, ObjKind, Tag, VRef, Value, VALUE_SIZE};
 use std::ptr::NonNull;
 
-const DEFAULT_MIN_TRIGGER: usize = 64 << 20; // 64 MiB
+const DEFAULT_MIN_TRIGGER: usize = 256 << 20; // 256 MiB
 const STRESS_TRIGGER: usize = 4 << 10;
 
 pub struct GcStats {
