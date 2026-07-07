@@ -4584,6 +4584,7 @@ fn prim_path_exists(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: Pos
 }
 
 fn prim_read_file(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    realise_path_context(vm, args[0], pos)?;
     let p = coerce_to_path(
         vm,
         args[0],
@@ -4618,6 +4619,7 @@ fn file_type_str(m: &std::fs::Metadata) -> &'static str {
 }
 
 fn prim_read_dir(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    realise_path_context(vm, args[0], pos)?;
     let p = coerce_to_path(
         vm,
         args[0],
@@ -4682,6 +4684,7 @@ fn prim_read_dir(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx
 }
 
 fn prim_read_file_type(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    realise_path_context(vm, args[0], pos)?;
     let p = coerce_to_path(
         vm,
         args[0],
@@ -4987,7 +4990,85 @@ fn resolve_expr_path_vm(vm: &VM, path: &Path) -> PathBuf {
     }
 }
 
+/// Port of the build step of `EvalState::realiseContext` / `realisePath`: when
+/// the value being read is a string whose context references a derivation output
+/// (`Built`), build that output through the daemon (import-from-derivation) so
+/// its (input-addressed) store path becomes valid on disk before we read it.
+///
+/// Only `Built` elements are acted on; `Opaque`/`DrvDeep` are left alone (their
+/// validity is not enforced here, so virtual-store/flake redirects still work).
+/// A no-op under the dummy store (no build backend).
+fn realise_path_context(vm: &mut VM, cell: VRef, pos: PosIdx) -> Result<(), ErrId> {
+    use crate::context::ContextElem;
+    use jinx_store::daemon::{DerivedPath, OutputsSpec};
+    use jinx_store::store_path::StorePath;
+
+    if vm.store_mode != crate::vm::StoreMode::Daemon {
+        return Ok(());
+    }
+    vm.force(cell, pos)?;
+    let v = val(cell);
+    // Paths carry no context. Strings expose theirs directly; a derivation (or
+    // other attrset/functor) is coerced to its `outPath` string to recover the
+    // `Built` context, matching C++ `coerceToPath` feeding `realiseContext`.
+    let ids: Vec<u32> = match v.tag() {
+        Tag::Path => return Ok(()),
+        Tag::String => vm.read_str_ctx(&v),
+        _ => match vm.coerce_to_string(
+            cell,
+            pos,
+            "while realising the context of a path",
+            false,
+            false,
+            true,
+        ) {
+            Ok((_, cids)) => cids,
+            // Not coercible to a path-like string: let coerce_to_path report it.
+            Err(_) => return Ok(()),
+        },
+    };
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    // Collect the derivation outputs to build (dedup by drv, union of outputs).
+    let mut wanted: std::collections::BTreeMap<StorePath, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for id in ids {
+        if let ContextElem::Built { drv_path, output } = vm.ctx_elem(id) {
+            let drv_s = String::from_utf8_lossy(&drv_path).into_owned();
+            if let Ok(sp) = StorePath::new(&drv_s) {
+                wanted
+                    .entry(sp)
+                    .or_default()
+                    .insert(String::from_utf8_lossy(&output).into_owned());
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(());
+    }
+
+    let reqs: Vec<DerivedPath> = wanted
+        .into_iter()
+        .map(|(drv_path, outs)| DerivedPath::Built {
+            drv_path,
+            outputs: OutputsSpec::Names(outs),
+        })
+        .collect();
+
+    let r: Result<(), String> = (|| {
+        let Some(d) = vm.daemon() else { return Ok(()) };
+        d.build_paths(&reqs, 0).map_err(|e| e.to_string())
+    })();
+    if let Err(msg) = r {
+        return Err(vm.new_err(ErrKind::Eval, msg, pos));
+    }
+    Ok(())
+}
+
 fn prim_import(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    realise_path_context(vm, args[0], pos)?;
     let p = coerce_to_path(
         vm,
         args[0],
@@ -5095,6 +5176,7 @@ fn prim_scoped_import(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: P
         pos,
         "while evaluating the first argument passed to builtins.scopedImport",
     )?;
+    realise_path_context(vm, args[1], pos)?;
     let p = coerce_to_path(
         vm,
         args[1],
