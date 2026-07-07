@@ -4782,37 +4782,47 @@ fn prim_read_dir(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx
     // Mirror C++ `realisePath` + `readDirectory`: a missing path yields
     // "path '%s' does not exist"; a non-directory yields "'%s' is not a
     // directory" (ENOTDIR from opendir on the symlink-resolved path).
-    if std::fs::symlink_metadata(&path).is_err() {
-        let msg = format!("path '{path}' does not exist");
-        return Err(vm.new_err(ErrKind::Eval, msg, pos));
-    }
-    let target = std::fs::canonicalize(&path)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.clone());
-    let rd = match std::fs::read_dir(&target) {
-        Ok(rd) => rd,
-        Err(err) => {
-            let msg = if err.raw_os_error() == Some(20) {
-                format!("'{target}' is not a directory")
-            } else if err.kind() == std::io::ErrorKind::NotFound {
-                format!("path '{target}' does not exist")
-            } else {
-                format!("reading directory '{}': {}", target, io_msg(&err))
-            };
+    //
+    // Successful listings are memoized by the resolved real path, since a
+    // batch evaluator sees a stable filesystem (matches C++ caching directory
+    // reads). Only success is cached; error paths re-probe.
+    let items: Vec<(Vec<u8>, &'static str)> = if let Some(cached) = vm.read_dir_cache.get(&path) {
+        cached.clone()
+    } else {
+        if std::fs::symlink_metadata(&path).is_err() {
+            let msg = format!("path '{path}' does not exist");
             return Err(vm.new_err(ErrKind::Eval, msg, pos));
         }
+        let target = std::fs::canonicalize(&path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.clone());
+        let rd = match std::fs::read_dir(&target) {
+            Ok(rd) => rd,
+            Err(err) => {
+                let msg = if err.raw_os_error() == Some(20) {
+                    format!("'{target}' is not a directory")
+                } else if err.kind() == std::io::ErrorKind::NotFound {
+                    format!("path '{target}' does not exist")
+                } else {
+                    format!("reading directory '{}': {}", target, io_msg(&err))
+                };
+                return Err(vm.new_err(ErrKind::Eval, msg, pos));
+            }
+        };
+        let mut items: Vec<(Vec<u8>, &'static str)> = Vec::new();
+        for ent in rd {
+            let Ok(ent) = ent else { continue };
+            let name = ent.file_name().to_string_lossy().into_owned().into_bytes();
+            let t = ent
+                .path()
+                .symlink_metadata()
+                .map(|m| file_type_str(&m))
+                .unwrap_or("unknown");
+            items.push((name, t));
+        }
+        vm.read_dir_cache.insert(path.clone(), items.clone());
+        items
     };
-    let mut items: Vec<(Vec<u8>, &'static str)> = Vec::new();
-    for ent in rd {
-        let Ok(ent) = ent else { continue };
-        let name = ent.file_name().to_string_lossy().into_owned().into_bytes();
-        let t = ent
-            .path()
-            .symlink_metadata()
-            .map(|m| file_type_str(&m))
-            .unwrap_or("unknown");
-        items.push((name, t));
-    }
     let scope = vm.temp_scope();
     let mut entries: Vec<Attr> = Vec::with_capacity(items.len());
     for (name, t) in &items {

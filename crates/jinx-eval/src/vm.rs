@@ -187,6 +187,11 @@ pub struct VM {
     /// symlink-following and directory `default.nix` resolution is a pure
     /// function of the (fixed) NIX_PATH config and the input path.
     pub import_resolution_cache: FxHashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// Memoize `builtins.readDir` listings keyed by the resolved real path
+    /// (mirrors C++ caching directory reads). Values are `(name, type)` pairs —
+    /// pure filesystem data, no GC pointers. Invalidation-free: a batch
+    /// evaluator sees a stable filesystem.
+    pub read_dir_cache: FxHashMap<String, Vec<(Vec<u8>, &'static str)>>,
     pub call_depth: usize,
     pub max_call_depth: usize,
     /// (prefix, path) entries, from -I and NIX_PATH.
@@ -282,6 +287,7 @@ impl VM {
             src_to_store: FxHashMap::default(),
             filtered_path_cache: FxHashMap::default(),
             import_resolution_cache: FxHashMap::default(),
+            read_dir_cache: FxHashMap::default(),
             call_depth: 0,
             max_call_depth: 10000,
             last_select_pos: NO_POS,
