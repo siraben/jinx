@@ -2,9 +2,15 @@
 
 A JIT-compiling, garbage-collected Nix evaluator in Rust, wire-compatible with
 [Nix](https://github.com/NixOS/nix) where it counts: byte-identical `.drv` files and
-store paths, the daemon worker protocol as a client, and byte-exact CLI output —
-including error messages and traces — for the evaluator surface of `nix-instantiate`
-and `nix eval` (flakes included).
+store paths, the daemon worker protocol as a client, and byte-exact evaluation output —
+including error messages and traces — across the entire language conformance corpus, for
+the evaluator surface of `nix-instantiate` and `nix eval` (flakes included).
+
+"Byte-exact" is measured against all 467 upstream `tests/functional/lang` fixtures and
+derivation outputs, not asserted globally: CLI-surface behaviors outside that corpus that
+still differ are enumerated honestly in [`KNOWN_DIVERGENCES.md`](KNOWN_DIVERGENCES.md)
+(mostly upstream position quirks, out-of-scope fetchers, and library-driven parse-error
+wording). Correctness was hardened by two rounds of adversarial differential review.
 
 Built and validated against Nix master (2.36.0pre, worker protocol 1.39) on
 aarch64-darwin.
@@ -13,7 +19,7 @@ aarch64-darwin.
 
 | Surface | Result |
 |---|---|
-| Nix language test suite (`tests/functional/lang`, 467 fixtures) | **466 pass / 0 fail / 1 skip** (the skip is disabled upstream), byte-exact stdout+stderr incl. traces |
+| Nix language test suite (`tests/functional/lang`, 467 fixtures) | **466 pass / 0 fail / 1 skip** (the skip is disabled upstream), byte-exact stdout+stderr incl. `--show-trace` traces |
 | Upstream `lang.sh` harness via PATH shim | passes (EXIT 0, incl. inline assertions) |
 | nixpkgs derivation parity (readonly) | `hello`, `firefox`, 49-package sample: **byte-identical drv paths** vs C++ Nix |
 | NixOS minimal ISO eval (`nixos/release.nix -A iso_minimal.x86_64-linux`) | **byte-identical drv path** (full module system + x86_64-linux from-source bootstrap) |
@@ -73,12 +79,20 @@ nix shell nixpkgs#hyperfine -c bash bench/run-benchmarks.sh
 ## Known limitations
 
 - Flake lock **generation** (`lockFlake`) is not implemented — an on-disk `flake.lock`
-  (or lock-free single flake) is required; github/tarball/network-git fetchers are
-  not yet wired.
+  (or lock-free single flake) is required; `github:`/tarball/network-git fetchers are
+  not yet wired (flake inputs of type `path` and `git+file` are).
+- `builtins.fetchGit` and `builtins.storePath` are not implemented.
+- Under `--readonly-mode` / `dummy://`, store-path *validity* checks are approximated by
+  filesystem checks, so some not-yet-built-path errors C++ raises do not fire identically
+  (real builds via the daemon are byte-identical).
 - Evaluator surface only: `nix build`-style scheduling, substituters, the daemon
   *server*, `nix repl`, and the debugger are out of scope; builds happen via the real
   `nix-daemon` (IFD works this way).
 - Eval caching (`~/.cache/nix/eval-cache`) is not implemented.
+
+See [`KNOWN_DIVERGENCES.md`](KNOWN_DIVERGENCES.md) for the full, itemized list of
+observable differences outside the conformance corpus (upstream quirks, platform-specific
+rendering, and library-driven parse-error wording).
 
 ## License & provenance
 
