@@ -493,6 +493,13 @@ fn translate_op(
             true
         }};
     }
+    // Helper: infallible call (helper always returns 0) — skip the error check.
+    macro_rules! plain {
+        ($name:literal, $args:expr) => {{
+            tr.call($name, $args);
+            false
+        }};
+    }
 
     match op {
         // ---- inline: constants & loads ----
@@ -592,28 +599,28 @@ fn translate_op(
             let p = tr.iconst32(pos);
             erroring!("jinx_resolve_with", &[tr.vm, tr.fi, s, p])
         }
-        Op::AllocCell => erroring!("jinx_alloc_cell", &[tr.vm]),
+        Op::AllocCell => plain!("jinx_alloc_cell", &[tr.vm]),
         Op::StoreLocal(s) => {
             let sl = tr.iconst32(s);
-            erroring!("jinx_store_local", &[tr.vm, tr.fi, sl])
+            plain!("jinx_store_local", &[tr.vm, tr.fi, sl])
         }
         Op::MakeThunk(cid) => {
             let c = tr.iconst32(cid);
             let z = tr.iconst32(0);
-            erroring!("jinx_make_thunk", &[tr.vm, tr.fi, c, z])
+            plain!("jinx_make_thunk", &[tr.vm, tr.fi, c, z])
         }
         Op::MakeClosure(cid) => {
             let c = tr.iconst32(cid);
             let o = tr.iconst32(1);
-            erroring!("jinx_make_thunk", &[tr.vm, tr.fi, c, o])
+            plain!("jinx_make_thunk", &[tr.vm, tr.fi, c, o])
         }
         Op::MakeList(k) => {
             let kk = tr.iconst32(k);
-            erroring!("jinx_make_list", &[tr.vm, kk])
+            plain!("jinx_make_list", &[tr.vm, kk])
         }
         Op::MakeAttrs(d) => {
             let dd = tr.iconst32(d);
-            erroring!("jinx_make_attrs", &[tr.vm, tr.fi, dd])
+            plain!("jinx_make_attrs", &[tr.vm, tr.fi, dd])
         }
         Op::DynAttr => {
             let p = tr.iconst32(pos);
@@ -636,9 +643,9 @@ fn translate_op(
             let o = tr.iconst32(1);
             erroring!("jinx_eq", &[tr.vm, p, o])
         }
-        Op::Not => erroring!("jinx_not", &[tr.vm]),
+        Op::Not => plain!("jinx_not", &[tr.vm]),
         Op::Update => erroring!("jinx_update", &[tr.vm]),
-        Op::ConcatLists => erroring!("jinx_concat_lists", &[tr.vm]),
+        Op::ConcatLists => plain!("jinx_concat_lists", &[tr.vm]),
         Op::ConcatStrings(d) => {
             if tr.an.concat_add.contains(&ip) {
                 emit_concat_add(tr, ip, d, chunk, blocks, err_block);
@@ -695,7 +702,7 @@ fn translate_op(
         }
         Op::CurPos => {
             let p = tr.iconst32(pos);
-            erroring!("jinx_cur_pos", &[tr.vm, p])
+            plain!("jinx_cur_pos", &[tr.vm, p])
         }
         Op::AssertFail(t) => {
             // Always an error: return the status directly.
@@ -711,8 +718,8 @@ fn translate_op(
             let p = tr.iconst32(pos);
             erroring!("jinx_assert_eq", &[tr.vm, tr.fi, tt, p])
         }
-        Op::PushWith => erroring!("jinx_push_with", &[tr.vm, tr.fi]),
-        Op::PopWith => erroring!("jinx_pop_with", &[tr.vm, tr.fi]),
+        Op::PushWith => plain!("jinx_push_with", &[tr.vm, tr.fi]),
+        Op::PopWith => plain!("jinx_pop_with", &[tr.vm, tr.fi]),
     }
 }
 
