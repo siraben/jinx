@@ -144,7 +144,15 @@ impl Utf8Error {
 /// nlohmann-style string escaping (control chars as \uXXXX), no validation.
 fn json_escape(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
-    for &c in s {
+    // Only '"', '\\' and control chars (< 0x20) need escaping; everything else
+    // (including raw high bytes) is copied verbatim. Scan for the next byte that
+    // needs escaping and bulk-copy the clean span before it.
+    let mut start = 0;
+    for (i, &c) in s.iter().enumerate() {
+        if c >= 0x20 && c != b'"' && c != b'\\' {
+            continue;
+        }
+        out.extend_from_slice(&s[start..i]);
         match c {
             b'"' => out.extend_from_slice(b"\\\""),
             b'\\' => out.extend_from_slice(b"\\\\"),
@@ -153,10 +161,17 @@ fn json_escape(out: &mut Vec<u8>, s: &[u8]) {
             b'\n' => out.extend_from_slice(b"\\n"),
             b'\r' => out.extend_from_slice(b"\\r"),
             b'\t' => out.extend_from_slice(b"\\t"),
-            c if c < 0x20 => out.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
-            c => out.push(c),
+            c => {
+                // Remaining control chars (< 0x20): \u00XX.
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.extend_from_slice(b"\\u00");
+                out.push(HEX[(c >> 4) as usize]);
+                out.push(HEX[(c & 0xf) as usize]);
+            }
         }
+        start = i + 1;
     }
+    out.extend_from_slice(&s[start..]);
     out.push(b'"');
 }
 

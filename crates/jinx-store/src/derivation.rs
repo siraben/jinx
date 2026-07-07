@@ -275,8 +275,7 @@ impl Derivation {
     /// `derivations.cc` (`infoForDerivation`).
     pub fn compute_store_path(&self, store: &StoreDir) -> Result<StorePath, DrvError> {
         let suffix = format!("{}{}", self.name, DRV_EXTENSION);
-        let contents = self.unparse(store, false, None)?;
-        let hash = hash_string(HashAlgorithm::Sha256, &contents);
+        let hash = self.unparse_hash(store, false, None)?;
         Ok(store.make_fixed_output_path_from_ca(
             &suffix,
             &ContentAddressWithReferences::Text(TextInfo {
@@ -301,13 +300,28 @@ impl Derivation {
         actual_inputs: Option<&BTreeMap<String, DerivedPathMapNode>>,
     ) -> Result<Vec<u8>, DrvError> {
         let mut s: Vec<u8> = Vec::with_capacity(65536);
+        self.unparse_into(store, mask_outputs, actual_inputs, &mut s)?;
+        Ok(s)
+    }
+
+    /// Like [`Derivation::unparse`], but renders into a caller-provided buffer
+    /// (cleared first). Lets hot paths that only hash the result reuse one
+    /// allocation across many derivations.
+    pub fn unparse_into(
+        &self,
+        store: &StoreDir,
+        mask_outputs: bool,
+        actual_inputs: Option<&BTreeMap<String, DerivedPathMapNode>>,
+        s: &mut Vec<u8>,
+    ) -> Result<(), DrvError> {
+        s.clear();
 
         /* Use older unversioned form if possible, for wider compat. Use
         newer form only if we need it, which we do for dynamic
         derivations. */
         if self.has_dynamic_drv_dep() {
             s.extend_from_slice(b"DrvWithVersion(");
-            print_unquoted_string(&mut s, b"xp-dyn-drv");
+            print_unquoted_string(s, b"xp-dyn-drv");
             s.push(b',');
         } else {
             s.extend_from_slice(b"Derive(");
@@ -322,65 +336,65 @@ impl Derivation {
                 s.push(b',');
             }
             s.push(b'(');
-            print_unquoted_string(&mut s, output_name.as_bytes());
+            print_unquoted_string(s, output_name.as_bytes());
             match output {
                 DerivationOutput::InputAddressed { path } => {
                     s.push(b',');
                     if mask_outputs {
-                        print_unquoted_string(&mut s, b"");
+                        print_unquoted_string(s, b"");
                     } else {
-                        print_unquoted_string(&mut s, store.print_store_path(path).as_bytes());
+                        print_unquoted_string(s, store.print_store_path(path).as_bytes());
                     }
                     s.push(b',');
-                    print_unquoted_string(&mut s, b"");
+                    print_unquoted_string(s, b"");
                     s.push(b',');
-                    print_unquoted_string(&mut s, b"");
+                    print_unquoted_string(s, b"");
                 }
                 DerivationOutput::CAFixed { ca } => {
                     s.push(b',');
                     if mask_outputs {
-                        print_unquoted_string(&mut s, b"");
+                        print_unquoted_string(s, b"");
                     } else {
                         let path = ca_fixed_path(store, ca, &self.name, output_name)?;
-                        print_unquoted_string(&mut s, store.print_store_path(&path).as_bytes());
+                        print_unquoted_string(s, store.print_store_path(&path).as_bytes());
                     }
                     s.push(b',');
-                    print_unquoted_string(&mut s, ca.print_method_algo().as_bytes());
+                    print_unquoted_string(s, ca.print_method_algo().as_bytes());
                     s.push(b',');
                     print_unquoted_string(
-                        &mut s,
+                        s,
                         ca.hash.to_string(HashFormat::Base16, false).as_bytes(),
                     );
                 }
                 DerivationOutput::CAFloating { method, hash_algo } => {
                     s.push(b',');
-                    print_unquoted_string(&mut s, b"");
+                    print_unquoted_string(s, b"");
                     s.push(b',');
                     print_unquoted_string(
-                        &mut s,
+                        s,
                         format!("{}{}", method.render_prefix(), hash_algo.name()).as_bytes(),
                     );
                     s.push(b',');
-                    print_unquoted_string(&mut s, b"");
+                    print_unquoted_string(s, b"");
                 }
                 DerivationOutput::Deferred => {
                     s.push(b',');
-                    print_unquoted_string(&mut s, b"");
+                    print_unquoted_string(s, b"");
                     s.push(b',');
-                    print_unquoted_string(&mut s, b"");
+                    print_unquoted_string(s, b"");
                     s.push(b',');
-                    print_unquoted_string(&mut s, b"");
+                    print_unquoted_string(s, b"");
                 }
                 DerivationOutput::Impure { method, hash_algo } => {
                     s.push(b',');
-                    print_unquoted_string(&mut s, b"");
+                    print_unquoted_string(s, b"");
                     s.push(b',');
                     print_unquoted_string(
-                        &mut s,
+                        s,
                         format!("{}{}", method.render_prefix(), hash_algo.name()).as_bytes(),
                     );
                     s.push(b',');
-                    print_unquoted_string(&mut s, b"impure");
+                    print_unquoted_string(s, b"impure");
                 }
             }
             s.push(b')');
@@ -396,8 +410,8 @@ impl Derivation {
                     s.push(b',');
                 }
                 s.push(b'(');
-                print_unquoted_string(&mut s, drv_hash_modulo.as_bytes());
-                unparse_derived_path_map_node(&mut s, child_node);
+                print_unquoted_string(s, drv_hash_modulo.as_bytes());
+                unparse_derived_path_map_node(s, child_node);
                 s.push(b')');
             }
         } else {
@@ -408,8 +422,8 @@ impl Derivation {
                     s.push(b',');
                 }
                 s.push(b'(');
-                print_unquoted_string(&mut s, store.print_store_path(drv_path).as_bytes());
-                unparse_derived_path_map_node(&mut s, child_node);
+                print_unquoted_string(s, store.print_store_path(drv_path).as_bytes());
+                unparse_derived_path_map_node(s, child_node);
                 s.push(b')');
             }
         }
@@ -425,14 +439,14 @@ impl Derivation {
             } else {
                 s.push(b',');
             }
-            print_unquoted_string(&mut s, store.print_store_path(path).as_bytes());
+            print_unquoted_string(s, store.print_store_path(path).as_bytes());
         }
         s.push(b']');
 
         s.push(b',');
-        print_unquoted_string(&mut s, &self.platform);
+        print_unquoted_string(s, &self.platform);
         s.push(b',');
-        print_string(&mut s, &self.builder);
+        print_string(s, &self.builder);
         s.push(b',');
         s.push(b'[');
         first = true;
@@ -442,7 +456,7 @@ impl Derivation {
             } else {
                 s.push(b',');
             }
-            print_string(&mut s, arg);
+            print_string(s, arg);
         }
         s.push(b']');
 
@@ -455,19 +469,47 @@ impl Derivation {
                 s.push(b',');
             }
             s.push(b'(');
-            print_string(&mut s, k);
+            print_string(s, k);
             s.push(b',');
             let mask = mask_outputs
                 && std::str::from_utf8(k)
                     .map(|k| self.outputs.contains_key(k))
                     .unwrap_or(false);
-            print_string(&mut s, if mask { b"" } else { v });
+            print_string(s, if mask { b"" } else { v });
             s.push(b')');
         }
 
         s.extend_from_slice(b"])");
 
-        Ok(s)
+        Ok(())
+    }
+
+    /// Unparse and SHA-256 the result, reusing a thread-local buffer across
+    /// calls. Used by the hashing paths (`compute_store_path`,
+    /// `hashDerivationModulo`) which discard the ATerm text after hashing, so
+    /// the per-derivation 64 KiB allocation is amortized away.
+    fn unparse_hash(
+        &self,
+        store: &StoreDir,
+        mask_outputs: bool,
+        actual_inputs: Option<&BTreeMap<String, DerivedPathMapNode>>,
+    ) -> Result<Hash, DrvError> {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(Vec::with_capacity(65536));
+        }
+        SCRATCH.with(|b| {
+            // try_borrow_mut guards against any (unexpected) reentrancy by
+            // falling back to a fresh buffer rather than panicking.
+            if let Ok(mut s) = b.try_borrow_mut() {
+                self.unparse_into(store, mask_outputs, actual_inputs, &mut s)?;
+                Ok(hash_string(HashAlgorithm::Sha256, &s[..]))
+            } else {
+                let mut s = Vec::with_capacity(65536);
+                self.unparse_into(store, mask_outputs, actual_inputs, &mut s)?;
+                Ok(hash_string(HashAlgorithm::Sha256, &s[..]))
+            }
+        })
     }
 
     /// Port of `hasDynamicDrvDep`.
@@ -707,18 +749,23 @@ fn validate_path(s: &str) -> Result<(), DrvError> {
 /// Port of `printString`: quote and escape `"`, `\`, `\n`, `\r`, `\t`.
 fn print_string(res: &mut Vec<u8>, s: &[u8]) {
     res.push(b'"');
-    for &c in s {
-        match c {
-            b'"' | b'\\' => {
-                res.push(b'\\');
-                res.push(c);
-            }
-            b'\n' => res.extend_from_slice(b"\\n"),
-            b'\r' => res.extend_from_slice(b"\\r"),
-            b'\t' => res.extend_from_slice(b"\\t"),
-            _ => res.push(c),
-        }
+    // Scan for the next byte that needs escaping and bulk-copy the clean span
+    // before it; the common (no-escape) case becomes a single extend.
+    let mut start = 0;
+    for (i, &c) in s.iter().enumerate() {
+        let esc: &[u8] = match c {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            _ => continue,
+        };
+        res.extend_from_slice(&s[start..i]);
+        res.extend_from_slice(esc);
+        start = i + 1;
     }
+    res.extend_from_slice(&s[start..]);
     res.push(b'"');
 }
 
@@ -1009,8 +1056,7 @@ pub fn hash_derivation_modulo(
         }
     }
 
-    Ok(DrvHashModulo::DrvHash(hash_string(
-        HashAlgorithm::Sha256,
-        drv.unparse(store, mask_outputs, Some(&inputs2))?,
-    )))
+    Ok(DrvHashModulo::DrvHash(
+        drv.unparse_hash(store, mask_outputs, Some(&inputs2))?,
+    ))
 }
