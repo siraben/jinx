@@ -48,7 +48,7 @@ table! {
     jinx_update(P),
     jinx_concat_lists(P),
     jinx_concat_strings(P, P, W),
-    jinx_select(P, W, W),
+    jinx_select(P, P, W, W, W),
     jinx_select_force(P, P, W),
     jinx_select_or(P, W, W),
     jinx_select_dyn(P, P, W, W),

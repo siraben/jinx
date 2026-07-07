@@ -146,6 +146,7 @@ pub fn compile_program(
             haspath_descs: Vec::new(),
             texts: Vec::new(),
             refs: Vec::new(),
+            select_caches: Vec::new(),
         },
         const_map: FxHashMap::default(),
         states: Vec::new(),
@@ -848,7 +849,17 @@ impl<'a> Compiler<'a> {
                     self.emit(Op::SelectDyn(t), dpos);
                     self.bump(-1);
                 } else {
-                    self.emit(Op::Select(an.symbol.0), pos);
+                    let cache = self.prog.select_caches.len() as u32;
+                    self.prog
+                        .select_caches
+                        .push(std::cell::Cell::new(crate::chunk::SelectCache::default()));
+                    self.emit(
+                        Op::Select {
+                            sym: an.symbol.0,
+                            cache,
+                        },
+                        pos,
+                    );
                 }
             }
             self.emit(Op::SelectForce(t), pos);

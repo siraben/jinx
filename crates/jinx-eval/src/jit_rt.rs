@@ -256,21 +256,10 @@ pub extern "C" fn jinx_concat_strings(vm: *mut VM, fi: u64, d: u32) -> u64 {
 
 // ---------------- selection ----------------
 
-pub extern "C" fn jinx_select(vm: *mut VM, sym: u32, pos: u32) -> u64 {
+pub extern "C" fn jinx_select(vm: *mut VM, fi: u64, sym: u32, cache: u32, pos: u32) -> u64 {
     let vm = vm!(vm);
-    let c = *vm.stack.last().unwrap();
-    if let Err(e) = vm.force_attrs(c, PosIdx(pos), "while selecting an attribute") {
-        return err(e);
-    }
-    let v = val(c);
-    match attrs_get(&v, Symbol(sym)) {
-        Some(a) => {
-            vm.last_select_pos = PosIdx(a.pos);
-            *vm.stack.last_mut().unwrap() = a.val;
-            0
-        }
-        None => err(vm.missing_attr_err(&v, Symbol(sym), PosIdx(pos))),
-    }
+    let prog = vm.frames[fi as usize].code.prog();
+    status(vm.op_select(Symbol(sym), cache, prog, PosIdx(pos)))
 }
 
 pub extern "C" fn jinx_select_force(vm: *mut VM, fi: u64, text: u32) -> u64 {

@@ -93,7 +93,8 @@ pub enum Op {
     /// Pop `concat_descs[i].poss.len()` values; string/path/arith concat.
     ConcatStrings(u32),
     /// Force TOS as attrs; select `sym`, error if missing; push attr cell.
-    Select(u32),
+    /// `cache` indexes a per-site [`SelectCache`] inline cache.
+    Select { sym: u32, cache: u32 },
     /// Force TOS (the final selected value) at the last-selected attribute's
     /// definition position, adding a "while evaluating the attribute '<path>'"
     /// frame on error. Operand = `texts` index of the selection-path string.
@@ -268,6 +269,27 @@ pub struct Program {
     pub texts: Vec<Vec<u8>>,
     /// One per chunk; thunk data objects point at these.
     pub refs: Vec<CodeRef>,
+    /// One inline cache per `Select` site.
+    pub select_caches: Vec<std::cell::Cell<SelectCache>>,
+}
+
+/// Per-`Select`-site inline cache: the last attrset object selected here and
+/// the slot its attribute was found at. Bindings objects are immutable, so a
+/// pointer match lets us skip the binary search; the slot's symbol is
+/// re-checked on hit to stay correct even if the GC reuses an address.
+#[derive(Clone, Copy)]
+pub struct SelectCache {
+    pub attrs: *const u64,
+    pub slot: u32,
+}
+
+impl Default for SelectCache {
+    fn default() -> Self {
+        SelectCache {
+            attrs: std::ptr::null(),
+            slot: 0,
+        }
+    }
 }
 
 /// Immortal handle stored as the code word of thunk/closure data objects.

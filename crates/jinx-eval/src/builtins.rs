@@ -37,6 +37,7 @@ pub fn make_apply_prog() -> &'static Program {
         haspath_descs: Vec::new(),
         texts: Vec::new(),
         refs: Vec::new(),
+        select_caches: Vec::new(),
     };
     for n in 1..=2u32 {
         let mut ops = vec![Op::GetUpval(0)];

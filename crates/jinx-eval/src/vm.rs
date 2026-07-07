@@ -969,18 +969,9 @@ impl VM {
                 Op::ConcatStrings(d) => {
                     self.op_concat_strings(fi, d)?;
                 }
-                Op::Select(sym) => {
-                    let c = *self.stack.last().unwrap();
-                    self.force_attrs(c, pos!(), "while selecting an attribute")?;
-                    let v = val(c);
-                    let found = attrs_get(&v, Symbol(sym));
-                    match found {
-                        Some(a) => {
-                            self.last_select_pos = PosIdx(a.pos);
-                            *self.stack.last_mut().unwrap() = a.val;
-                        }
-                        None => return Err(self.missing_attr_err(&v, Symbol(sym), pos!())),
-                    }
+                Op::Select { sym, cache } => {
+                    let prog = self.frames[fi].code.prog();
+                    self.op_select(Symbol(sym), cache, prog, pos!())?;
                 }
                 Op::SelectForce(t) => {
                     let c = *self.stack.last().unwrap();
@@ -1173,6 +1164,53 @@ impl VM {
                 }
             }
             ip += 1;
+        }
+    }
+
+    /// `Op::Select`: force TOS as attrs and replace it with attribute `sym`,
+    /// using the per-site inline cache to skip the binary search when the same
+    /// attrset object recurs. Shared by the interpreter and the JIT's
+    /// `jinx_select` helper.
+    pub(crate) fn op_select(
+        &mut self,
+        sym: Symbol,
+        cache_idx: u32,
+        prog: &'static crate::chunk::Program,
+        pos: PosIdx,
+    ) -> Result<(), ErrId> {
+        let cell = *self.stack.last().unwrap();
+        self.force_attrs(cell, pos, "while selecting an attribute")?;
+        let v = val(cell);
+        let attrs_ptr = v.ptr() as *const u64;
+        let es = attrs_entries(&v);
+        let cache = &prog.select_caches[cache_idx as usize];
+        let c = cache.get();
+        // Cache hit: same attrset object and the cached slot still names `sym`
+        // (re-checked so an address reused by the GC can't cause a mislookup).
+        let found = if c.attrs == attrs_ptr
+            && (c.slot as usize) < es.len()
+            && es[c.slot as usize].sym == sym.0
+        {
+            Some(es[c.slot as usize])
+        } else {
+            match es.binary_search_by(|a| a.sym.cmp(&sym.0)) {
+                Ok(i) => {
+                    cache.set(crate::chunk::SelectCache {
+                        attrs: attrs_ptr,
+                        slot: i as u32,
+                    });
+                    Some(es[i])
+                }
+                Err(_) => None,
+            }
+        };
+        match found {
+            Some(a) => {
+                self.last_select_pos = PosIdx(a.pos);
+                *self.stack.last_mut().unwrap() = a.val;
+                Ok(())
+            }
+            None => Err(self.missing_attr_err(&v, sym, pos)),
         }
     }
 

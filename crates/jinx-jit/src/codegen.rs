@@ -172,7 +172,7 @@ fn stack_effect(op: Op, prog: &Program) -> (usize, usize, Option<u32>) {
         | Op::ForceAttrs(_)
         | Op::ForceList(_)
         | Op::RecOverrides(_)
-        | Op::Select(_)
+        | Op::Select { .. }
         | Op::SelectForce(_)
         | Op::PopWith => (0, 0, None),
         Op::Pop | Op::StoreLocal(_) | Op::PushWith | Op::SelectDyn(_) => (1, 0, None),
@@ -649,10 +649,11 @@ fn translate_op(
         }
 
         // ---- helper: selection ----
-        Op::Select(sym) => {
+        Op::Select { sym, cache } => {
             let s = tr.iconst32(sym);
+            let cc = tr.iconst32(cache);
             let p = tr.iconst32(pos);
-            erroring!("jinx_select", &[tr.vm, s, p])
+            erroring!("jinx_select", &[tr.vm, tr.fi, s, cc, p])
         }
         Op::SelectForce(t) => {
             let tt = tr.iconst32(t);
