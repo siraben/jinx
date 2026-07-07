@@ -159,6 +159,17 @@ pub struct VM {
     /// scopedImport scope cells referenced from leaked program constants).
     pub perm_roots: Vec<VRef>,
     pub symbols: SymbolTable,
+    /// Lazily-filled cache of immortal String Values, one per symbol id
+    /// (indexed by `Symbol.0`). Attribute-name builtins (`attrNames`,
+    /// `mapAttrs`, `zipAttrsWith`, …) hand the user a string Value carrying
+    /// the attribute's name; that name is a constant, context-free string, so
+    /// rather than re-`resolve` + copy + GC-allocate one per attribute per
+    /// call we intern one immortal String Value per distinct symbol. The
+    /// immortal heap is ignored by the collector (no rooting / write-barrier),
+    /// attribute names never carry context, and Nix has no observable string
+    /// identity, so sharing the same cell everywhere is sound. See
+    /// [`VM::symbol_string`].
+    pub sym_string_cache: Vec<Option<VRef>>,
     pub positions: PosTable,
     pub syms: SpecialSyms,
     pub errors: Vec<EvalError>,
@@ -282,6 +293,7 @@ impl VM {
             temp_roots: Vec::new(),
             perm_roots: Vec::new(),
             symbols,
+            sym_string_cache: Vec::new(),
             positions,
             syms,
             errors: Vec::new(),
@@ -425,6 +437,27 @@ impl VM {
 
     pub fn temp_end(&mut self, s: TempScope) {
         self.temp_roots.truncate(s.0);
+    }
+
+    /// Return an immortal String Value cell holding the name of `sym`, with no
+    /// string context. The cell is created on first use and cached by symbol
+    /// id. Because the cell (and its payload) live on the immortal heap they
+    /// are ignored by the collector — no rooting, no write-barrier, no GC risk
+    /// — and stay valid for the lifetime of the VM. Callers may drop the
+    /// returned `VRef` straight into a list/bindings without a temp root.
+    pub fn symbol_string(&mut self, sym: Symbol) -> VRef {
+        let idx = sym.0 as usize;
+        if idx >= self.sym_string_cache.len() {
+            self.sym_string_cache.resize(idx + 1, None);
+        }
+        if let Some(c) = self.sym_string_cache[idx] {
+            return c;
+        }
+        // `resolve` borrow ends once the bytes are copied into the immortal
+        // string, before we touch the cache again.
+        let cell = immortal::cell(immortal::string(self.symbols.resolve(sym)));
+        self.sym_string_cache[idx] = Some(cell);
+        cell
     }
 
     // ---------------- allocation wrappers ----------------

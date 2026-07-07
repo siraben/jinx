@@ -3674,20 +3674,15 @@ fn prim_attr_names(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosI
         pos,
         "while evaluating the argument passed to builtins.attrNames",
     )?;
-    let mut names: Vec<Vec<u8>> = attrs_entries(&val(args[0]))
-        .iter()
-        .map(|a| vm.symbols.resolve(Symbol(a.sym)).to_vec())
-        .collect();
-    names.sort();
-    let scope = vm.temp_scope();
-    let mut cells: Vec<VRef> = Vec::with_capacity(names.len());
-    for n in &names {
-        let v = mk_string(vm, n);
-        cells.push(temp_cell(vm, v));
+    let mut syms: Vec<u32> = attrs_entries(&val(args[0])).iter().map(|a| a.sym).collect();
+    syms.sort_by(|x, y| vm.symbols.resolve(Symbol(*x)).cmp(vm.symbols.resolve(Symbol(*y))));
+    // The name Values are immortal (see `VM::symbol_string`), so they need no
+    // temp rooting while the list is built.
+    let mut cells: Vec<VRef> = Vec::with_capacity(syms.len());
+    for s in &syms {
+        cells.push(vm.symbol_string(Symbol(*s)));
     }
-    let v = vm.new_list_value(&cells);
-    vm.temp_end(scope);
-    Ok(v)
+    Ok(vm.new_list_value(&cells))
 }
 
 fn prim_attr_values(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
@@ -3843,9 +3838,7 @@ fn prim_map_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
     let scope = vm.temp_scope();
     let mut entries: Vec<Attr> = Vec::with_capacity(entries_in.len());
     for a in &entries_in {
-        let name_bytes = vm.symbols.resolve(Symbol(a.sym)).to_vec();
-        let nv = mk_string(vm, &name_bytes);
-        let nc = temp_cell(vm, nv);
+        let nc = vm.symbol_string(Symbol(a.sym));
         let t = vm.new_apply_thunk(args[0], &[nc, a.val]);
         let tc = temp_cell(vm, t);
         // C++ `attrs.alloc(i.name)` gives the result attributes no position.
@@ -4173,9 +4166,7 @@ fn prim_zip_attrs_with(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
     let scope = vm.temp_scope();
     let mut entries: Vec<Attr> = Vec::with_capacity(buckets.len());
     for (sym, vals) in &buckets {
-        let name_bytes = vm.symbols.resolve(Symbol(*sym)).to_vec();
-        let nv = mk_string(vm, &name_bytes);
-        let nc = temp_cell(vm, nv);
+        let nc = vm.symbol_string(Symbol(*sym));
         let lv = vm.new_list_value(vals);
         let lc = temp_cell(vm, lv);
         let t = vm.new_apply_thunk(args[0], &[nc, lc]);
