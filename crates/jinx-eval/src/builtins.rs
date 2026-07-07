@@ -4813,11 +4813,20 @@ fn prim_read_dir(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx
         for ent in rd {
             let Ok(ent) = ent else { continue };
             let name = ent.file_name().to_string_lossy().into_owned().into_bytes();
-            let t = ent
-                .path()
-                .symlink_metadata()
-                .map(|m| file_type_str(&m))
-                .unwrap_or("unknown");
+            // `DirEntry::file_type` reads dirent `d_type` (no extra syscall on
+            // APFS); this matches C++ nix, which trusts d_type from
+            // getdirentries. Fall back to lstat only when d_type is unknown.
+            let t = match ent.file_type() {
+                Ok(ft) if ft.is_symlink() => "symlink",
+                Ok(ft) if ft.is_dir() => "directory",
+                Ok(ft) if ft.is_file() => "regular",
+                Ok(_) => "unknown",
+                Err(_) => ent
+                    .path()
+                    .symlink_metadata()
+                    .map(|m| file_type_str(&m))
+                    .unwrap_or("unknown"),
+            };
             items.push((name, t));
         }
         vm.read_dir_cache.insert(path.clone(), items.clone());
