@@ -245,7 +245,7 @@ fn analyze(chunk: &Chunk, prog: &Program) -> Analysis {
             Op::Force if !desync => {
                 if let Some(Some(ci)) = sym.last().copied() {
                     let v = jinx_eval::vm::val(prog.consts[ci as usize]);
-                    if !matches!(v.tag(), Tag::Thunk | Tag::Blackhole | Tag::Failed) {
+                    if !v.needs_force() {
                         a.elide_force.insert(ip);
                     }
                 }

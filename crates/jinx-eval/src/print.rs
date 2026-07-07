@@ -214,8 +214,10 @@ fn print_ambiguous_rec(
                 out.push(b']');
             }
         }
-        Tag::Thunk => out.extend_from_slice(b"<CODE>"),
-        Tag::Blackhole => out.extend_from_slice("«potential infinite recursion»".as_bytes()),
+        Tag::Thunk | Tag::Thunk0 => out.extend_from_slice(b"<CODE>"),
+        Tag::Blackhole | Tag::Blackhole0 => {
+            out.extend_from_slice("«potential infinite recursion»".as_bytes())
+        }
         Tag::Failed => out.extend_from_slice(b"<CODE>"),
         Tag::Closure => out.extend_from_slice(b"<LAMBDA>"),
         Tag::PrimOp => out.extend_from_slice(b"<PRIMOP>"),
@@ -415,9 +417,11 @@ fn print_value_rec(
                 .as_bytes(),
             );
         }
-        Tag::Blackhole => {
+        Tag::Blackhole | Tag::Blackhole0 => {
             out.extend_from_slice("«potential infinite recursion»".as_bytes())
         }
-        Tag::Thunk | Tag::Failed => out.extend_from_slice("«thunk»".as_bytes()),
+        Tag::Thunk | Tag::Thunk0 | Tag::Failed => {
+            out.extend_from_slice("«thunk»".as_bytes())
+        }
     }
 }

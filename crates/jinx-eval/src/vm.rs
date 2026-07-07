@@ -490,6 +490,8 @@ impl VM {
                 let (code, _) = thunk_code(v);
                 code.chunk().pos
             }
+            // SAFETY: Blackhole0's w1 is always an immortal CodeRef.
+            Tag::Blackhole0 => unsafe { (*(v.w1 as *const CodeRef)).chunk().pos },
             _ => fallback,
         }
     }
@@ -560,7 +562,7 @@ impl VM {
                 "the partially applied built-in function '{}'",
                 primapp_parts(v).0.display()
             ),
-            Tag::Thunk | Tag::Blackhole => "a thunk".into(),
+            Tag::Thunk | Tag::Thunk0 | Tag::Blackhole | Tag::Blackhole0 => "a thunk".into(),
             Tag::Failed => "an error".into(),
         }
     }
@@ -592,14 +594,23 @@ impl VM {
         loop {
             let v = val(cell);
             match v.tag() {
-                Tag::Thunk => {
+                Tag::Thunk | Tag::Thunk0 => {
                     // Retain the thunk's data pointer in the blackhole so that
                     // `determine_pos` can recover the position of the
                     // expression being computed (C++ `Value::determinePos`
-                    // over the blackholed thunk). The GC traces blackholes
-                    // like thunks (see `has_heap_payload`).
-                    self.set_b(cell, Value::make(Tag::Blackhole, v.w1));
-                    let (code, elems) = thunk_code(&v);
+                    // over the blackholed thunk). The GC traces Blackhole
+                    // like Thunk (see `has_heap_payload`); a Thunk0 packs its
+                    // immortal (untraced) CodeRef into w1, blackholed as
+                    // Blackhole0.
+                    let (code, elems): (&'static CodeRef, &'static [VRef]) =
+                        if v.tag() == Tag::Thunk {
+                            self.set_b(cell, Value::make(Tag::Blackhole, v.w1));
+                            thunk_code(&v)
+                        } else {
+                            self.set_b(cell, Value::make(Tag::Blackhole0, v.w1));
+                            // SAFETY: Thunk0's w1 is always an immortal CodeRef.
+                            (unsafe { &*(v.w1 as *const CodeRef) }, &[])
+                        };
                     use crate::chunk::ChunkKind;
                     let run = match code.chunk().kind {
                         // ---- frame-less trivial kinds (round-4) ----
@@ -655,7 +666,7 @@ impl VM {
                             // The chunk may itself return an (unforced)
                             // thunk value (e.g. a call result); keep going
                             // until WHNF, like C++ forceValue on tApp.
-                            if res.tag() == Tag::Thunk {
+                            if matches!(res.tag(), Tag::Thunk | Tag::Thunk0) {
                                 continue;
                             }
                             return Ok(());
@@ -666,7 +677,7 @@ impl VM {
                         }
                     }
                 }
-                Tag::Blackhole => {
+                Tag::Blackhole | Tag::Blackhole0 => {
                     // Re-forcing a blackhole is infinite recursion. The
                     // position C++ reports is the reference site that closes
                     // the cycle:
@@ -994,7 +1005,7 @@ impl VM {
                     // Fast path: only thunk-like cells need the (out-of-line)
                     // force machinery; an already-WHNF value returns immediately.
                     // C++ `forceValue` inlines the `!isThunk` early-out too.
-                    if matches!(val(c).tag(), Tag::Thunk | Tag::Blackhole | Tag::Failed) {
+                    if val(c).needs_force() {
                         self.force(c, pos!())?;
                     }
                 }
@@ -1780,6 +1791,11 @@ impl VM {
         let cur_chunk = self.frames[fi].code.chunk();
         let n = child.with_captures as usize + child.captures.len();
         let code = prog.code_ref(cid) as *const CodeRef as *const ();
+        if n == 0 && tag == Tag::Thunk {
+            // Capture-free thunk: pack the code ref straight into the cell
+            // (16 bytes total instead of a 16-byte data object + cell).
+            return self.heap.alloc_value(Value::make(Tag::Thunk0, code as u64));
+        }
         let (v, out) = self.heap.new_thunk_raw(tag, code, n);
         let mut k = 0usize;
         // SAFETY: `out` has n slots; we write exactly n below.
@@ -1869,7 +1885,7 @@ impl VM {
                 }
                 Op::Force => {
                     let c = st[sp - 1];
-                    if matches!(val(c).tag(), Tag::Thunk | Tag::Blackhole | Tag::Failed) {
+                    if val(c).needs_force() {
                         self.force(c, chunk.pos_at(ip))?;
                     }
                 }
@@ -1940,6 +1956,11 @@ impl VM {
         let child: &Chunk = &prog.chunks[cid as usize];
         let n = child.with_captures as usize + child.captures.len();
         let code = prog.code_ref(cid) as *const CodeRef as *const ();
+        if n == 0 && tag == Tag::Thunk {
+            // Capture-free thunk: pack the code ref straight into the cell
+            // (16 bytes total instead of a 16-byte data object + cell).
+            return self.heap.alloc_value(Value::make(Tag::Thunk0, code as u64));
+        }
         let (v, out) = self.heap.new_thunk_raw(tag, code, n);
         // SAFETY: `out` has n slots; we write exactly n below.
         unsafe {
@@ -2114,7 +2135,7 @@ impl VM {
             // `vcur` may need forcing between applications (e.g. a lambda
             // body returning a thunk value cannot happen — run_code returns
             // WHNF-or-thunk copies; force via a temp cell when required).
-            if i < args.len() && vcur.tag() == Tag::Thunk {
+            if i < args.len() && matches!(vcur.tag(), Tag::Thunk | Tag::Thunk0) {
                 let c = self.alloc_cell(vcur);
                 let scope = self.temp_scope();
                 self.temp_roots.push(c);
@@ -2399,7 +2420,9 @@ impl VM {
             }
             // Functions are incomparable.
             Tag::Closure | Tag::PrimOp | Tag::PrimOpApp => Ok(false),
-            Tag::Thunk | Tag::Blackhole | Tag::Failed => unreachable!("forced"),
+            Tag::Thunk | Tag::Thunk0 | Tag::Blackhole | Tag::Blackhole0 | Tag::Failed => {
+                unreachable!("forced")
+            }
         }
     }
 
@@ -2617,7 +2640,9 @@ impl VM {
                 // Both numeric: handled by the int/float branch above.
                 Ok(())
             }
-            Tag::Thunk | Tag::Blackhole | Tag::Failed => unreachable!("forced"),
+            Tag::Thunk | Tag::Thunk0 | Tag::Blackhole | Tag::Blackhole0 | Tag::Failed => {
+                unreachable!("forced")
+            }
         }
     }
 

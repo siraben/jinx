@@ -172,7 +172,9 @@ fn print_xml(
             print_function(vm, &v, location, w)?;
         }
         Tag::PrimOp | Tag::PrimOpApp => w.empty("unevaluated", vec![]),
-        Tag::Thunk | Tag::Failed | Tag::Blackhole => w.empty("unevaluated", vec![]),
+        Tag::Thunk | Tag::Thunk0 | Tag::Failed | Tag::Blackhole | Tag::Blackhole0 => {
+            w.empty("unevaluated", vec![])
+        }
     }
     Ok(())
 }

@@ -43,9 +43,20 @@ pub enum Tag {
     Blackhole = 13,
     /// Cached evaluation failure; w1 = index into the VM's error table.
     Failed = 14,
+    /// Capture-free (nullary) thunk packed into the cell: w1 = the immortal
+    /// `*const CodeRef` directly -- no Thunk data object is allocated.
+    ///
+    /// TAG-NUMBERING CONTRACT: every thunk-like tag that `force` must handle
+    /// must be `Thunk` (9) or `>= Blackhole` (13). The interpreter uses
+    /// [`Value::needs_force`]; the JIT's inline force fast path tests
+    /// `tag == Thunk || tag >= Blackhole` (jinx-jit codegen), so tags 13..=16
+    /// are covered with zero Cranelift changes. Do not renumber these below 13.
+    Thunk0 = 15,
+    /// Blackholed `Thunk0`; w1 = the `*const CodeRef` (for `determine_pos`).
+    Blackhole0 = 16,
 }
 
-pub const NUM_TAGS: u8 = 15;
+pub const NUM_TAGS: u8 = 17;
 
 /// Data-object kinds (first byte of ObjHeader).
 #[repr(u8)]
@@ -174,6 +185,17 @@ impl Value {
                 // (w1 == 0) blackhole sentinel traces to null, which
                 // `mark_data` ignores.
                 | Tag::Blackhole
+            // Tag::Thunk0 / Tag::Blackhole0 carry an immortal CodeRef in w1
+            // -- nothing to trace, so deliberately excluded here.
+        )
+    }
+
+    /// Thunk-like tags that `force` must handle (everything else is WHNF).
+    #[inline]
+    pub fn needs_force(&self) -> bool {
+        matches!(
+            self.tag(),
+            Tag::Thunk | Tag::Thunk0 | Tag::Blackhole | Tag::Blackhole0 | Tag::Failed
         )
     }
 }
