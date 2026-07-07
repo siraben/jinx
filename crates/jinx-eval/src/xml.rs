@@ -207,13 +207,21 @@ fn show_attrs(
 
 fn pos_to_xml(vm: &VM, pos: PosIdx, xa: &mut Vec<(Vec<u8>, Vec<u8>)>) {
     if let Some(p) = vm.positions.lookup(pos) {
-        // path/line/column; only when a real position exists.
+        // C++ posToXML only writes `path` when the origin is a real file
+        // (`std::get_if<SourcePath>`); for `-E`/stdin origins it emits just
+        // line/column. Match that.
+        let is_file = matches!(
+            vm.positions.origin_of(pos),
+            Some(jinx_syntax::pos::Origin::Path { .. })
+        );
         let s = p.to_string();
         // p renders as "path:line:column" in jinx; split conservatively.
         if let Some((path, rest)) = s.rsplit_once(':').and_then(|(a, c)| {
             a.rsplit_once(':').map(|(p, l)| (p, (l, c)))
         }) {
-            xa.push(attr("path", path.as_bytes()));
+            if is_file {
+                xa.push(attr("path", path.as_bytes()));
+            }
             xa.push(attr("line", rest.0.as_bytes()));
             xa.push(attr("column", rest.1.as_bytes()));
         }
