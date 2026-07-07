@@ -1,5 +1,94 @@
 # jinx benchmark report
 
+This is the **v4** report: **round 4** (frameless thunk execution, cheap-eager
+classifier, `Thunk0` capture-free thunk packing) plus **wave 5** (the measured
+alloc/hash/IO floor: NAR-dump IO engine, attrset-builtin allocation diet, and a
+NEON/SSE2 escape scan), and the first **cross-platform validation** on
+x86_64-linux. The v3/v2/v1 reports are preserved below as history. Method,
+oracle, and correctness preconditions are unchanged from v3 (byte-identical drv
+output to the oracle; the full 466-fixture suite green under default,
+`JINX_GC_STRESS=1`, `JINX_JIT=1 JINX_JIT_THRESHOLD=0`, and combined).
+
+**Machines:** dev = Apple M-series (aarch64-darwin); x-plat bench = "justin",
+AMD Ryzen 9 5950X (x86_64-linux, 32 threads).
+
+## Wall time (hyperfine, PGO binary, interleaved vs the oracle; aarch64-darwin)
+
+| Workload | C++ nix | jinx (default = jit off) | jinx vs nix | v3 vs nix |
+|---|---|---|---|---|
+| nixpkgs `-A hello` | 227.5 ± 13.6 ms | **192.4 ± 11.8 ms** (user −20%) | **1.18× faster** | 1.17× |
+| nixpkgs `-A firefox` | 545.7 ± 18.9 ms | **458.4 ± 24.1 ms** (user −21%) | **1.19× faster** | 1.13× |
+| NixOS minimal ISO | 8.68 ± 0.22 s | **7.35 ± 0.64 s** | **1.18× faster** | 1.18× |
+
+Wave 5's headline is **firefox 1.13→1.19×** (user CPU −21% vs the oracle — the
+attrset-builtin allocation diet and per-symbol string cache) and a large **ISO
+memory** win (below). `parse`/`fib`/`ops` micro-benchmarks are unchanged code
+this wave (4.1× / 2.0× jit / 2.2× vs the oracle — see v3).
+
+### Peak RSS — the wave-5 headline (`/usr/bin/time -l`, ISO)
+
+| Workload | C++ nix (Boehm) | jinx pre-wave5 | **jinx v4** | Δ this wave |
+|---|---|---|---|---|
+| minimal ISO | 1.10 GiB | 3.59 GiB | **2.77 GiB** | **−841 MiB (−23%)** |
+
+P1a (streaming the filtered NAR straight into the hash sink instead of
+materializing a 445 MB `Vec<u8>`) plus the attrset allocation diet cut ISO peak
+RSS by 841 MiB — from 3.4× the oracle toward ~2.5×. hello/firefox RSS unchanged
+(they barely dump NAR).
+
+## Wave 5 — measured plan and attribution
+
+The plan was built from profiles, not assumptions, and it **killed the
+cargo-cult SIMD wishlist with evidence**: hardware SHA-256 is already fully
+enabled (verified 32 `sha256h` instructions in the ARM binary; SHA-NI on x86 —
+sha256 is 0.2% of ISO), and SIMD base32/interner-hash-swap/mmap are all <0.2%
+surfaces. The real floor: **NAR-dump filesystem IO = ~48% of the ISO eval**
+(3.4 s of syscalls), attrset byte-copying on firefox, and drv-text escaping.
+
+| Item | What | Target | Result |
+|---|---|---|---|
+| P2 | per-symbol interned string cache (attr-name builtins) | firefox/hello | user −4–9% ff, −9–11% hello (agent A/B) |
+| P3 | mapAttrs/zipAttrsWith alloc diet (drop defensive `to_vec`) | firefox/ISO | folds into firefox 1.19× |
+| P1a | stream filtered NAR into `HashSink`, kill 445 MB `Vec` | ISO | **−841 MiB RSS** + ISO −6–8% wall |
+| P1b | syscall diet: `d_type` dispatch, `openat`+`fstat`, exact reads | ISO | wall-neutral (darwin, warm cache); cuts syscall count |
+| P1c | two-phase dump + read-ahead worker pool | ISO | **opt-in** (`JINX_NAR_JOBS`); see below |
+| P4 | NEON/SSE2 5-needle escape scan (drv ATerm + toJSON) | ff/hello | in noise (~4% surface); proptested SIMD==scalar |
+
+### P1c: honest verdict — opt-in, not default
+
+The read-ahead pool was the plan's speculative headline (−20–30% ISO wall). It
+does **not** deliver that on a warm page cache: measured on **both**
+aarch64-darwin and x86_64-linux it gives only **~8% ISO wall** while **tripling
+(darwin) / doubling (linux) system CPU** (darwin sys 3.6→12.3 s; justin sys
+4.9→9.8 s), because page-cache-warm reads contend on kernel VM locks rather than
+scaling across cores. That is a poor default for an interactively-run
+evaluator, so the pool ships **gated behind `JINX_NAR_JOBS`** (default serial;
+`=N` or `=auto` to enable) — it remains a real win for the cold-cache / CI /
+batch regime where workers block on IO instead of spinning. Byte-identical NAR
+under both paths, on both architectures.
+
+## Cross-platform: x86_64-linux (justin, AMD Ryzen 9 5950X)
+
+jinx's conservative GC previously scanned callee-saved registers and the thread
+stack only on aarch64/darwin. Added a System V x86-64 register-dump (naked asm)
+and a Linux `pthread_getattr_np` stack-base probe; **validated on real x86
+hardware**:
+
+| Check | Result |
+|---|---|
+| conformance (default / GC-stress / JIT-stress / combined) | **466/0/1 all four** |
+| hello & ISO `.drv` vs oracle (interp + JIT; native ISO build) | **byte-identical** |
+| `-A hello` vs C++ nix | **1.39× faster** |
+| `-A firefox` vs C++ nix | 1.06× faster (user −11%) |
+
+jinx is now correct, wire-compatible, and faster than C++ Nix on both
+aarch64-darwin and x86_64-linux. (The x86 hello lead is larger than darwin's
+because C++ nix pays more fixed startup there.)
+
+---
+
+# v3 (history)
+
 **Machine:** Apple M-series (aarch64-darwin), macOS (Darwin 25.3.0)
 **jinx:** release build, **PGO-optimized** (`bench/pgo-build.sh`). **JIT is off
 by default** (see "JIT policy"); jit rows set `JINX_JIT` explicitly.
