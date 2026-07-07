@@ -19,6 +19,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{self, Write};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -469,6 +470,70 @@ impl DaemonStore {
         }
     }
 
+    /// Whether the socket has readable data available without blocking
+    /// (`Source::hasData` via `poll`). jinx reads directly from the raw stream
+    /// with no intermediate buffering, so a `poll` on the fd is exact.
+    fn socket_has_data(&self) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: self.stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // timeout 0: non-blocking check.
+        let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+        r > 0 && (pfd.revents & libc::POLLIN) != 0
+    }
+
+    /// Non-blocking drain of pending daemon stderr messages, used between NAR
+    /// frames while streaming (`FramedSink`'s `checkError`). Port of
+    /// `processStderr(..., block=false)`: read complete messages while data is
+    /// available at a message boundary, stopping once the socket would block.
+    /// Returns `Err(Remote)` if the daemon reported an error mid-stream (so the
+    /// streaming aborts instead of deadlocking on a full socket buffer).
+    fn drain_stderr_nonblocking(&self) -> Result<()> {
+        let mut r = &self.stream;
+        loop {
+            if !self.socket_has_data() {
+                return Ok(());
+            }
+            let msg = wire::read_u64(&mut r)?;
+            match msg {
+                STDERR_WRITE => {
+                    let _ = wire::read_bytes(&mut r, MAX_STRING)?;
+                }
+                STDERR_READ => {
+                    let _len = wire::read_u64(&mut r)?;
+                    return protocol_err("daemon requested input via STDERR_READ");
+                }
+                STDERR_ERROR => return Err(self.read_error()?),
+                STDERR_NEXT => {
+                    let line = wire::read_bytes(&mut r, MAX_STRING)?;
+                    eprint!("{}", String::from_utf8_lossy(&line));
+                }
+                STDERR_START_ACTIVITY => {
+                    let _act = wire::read_u64(&mut r)?;
+                    let _lvl = wire::read_u64(&mut r)?;
+                    let _type = wire::read_u64(&mut r)?;
+                    let _s = wire::read_bytes(&mut r, MAX_STRING)?;
+                    self.read_fields()?;
+                    let _parent = wire::read_u64(&mut r)?;
+                }
+                STDERR_STOP_ACTIVITY => {
+                    let _act = wire::read_u64(&mut r)?;
+                }
+                STDERR_RESULT => {
+                    let _act = wire::read_u64(&mut r)?;
+                    let _type = wire::read_u64(&mut r)?;
+                    self.read_fields()?;
+                }
+                // STDERR_LAST is only expected after a full request; if it shows
+                // up mid-stream, stop draining and let the caller read it.
+                STDERR_LAST => return Ok(()),
+                other => return protocol_err(format!("unknown stderr message type 0x{other:x}")),
+            }
+        }
+    }
+
     /// Port of `readFields`.
     fn read_fields(&self) -> Result<()> {
         let mut r = &self.stream;
@@ -695,11 +760,68 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// `AddToStore` (op 7, protocol `>= 1.25`): add the NAR serialization of
-    /// the tree at `real_path` under `name`, content-addressed by
-    /// `method`/`algo`. Streams the NAR via a [`FramedSink`].
+    /// `AddToStore` (op 7, protocol `>= 1.25`), general form: send the header
+    /// then stream the content-address "dump" produced by `write_dump` through a
+    /// [`FramedSink`]. Port of `RemoteStore::addCAToStore` (>= 1.25 branch).
     ///
-    /// Returns the resulting store path (from the daemon's `ValidPathInfo`).
+    /// `cam` is the rendered content-address method with algorithm, e.g.
+    /// `text:sha256`, `fixed:sha256` (flat) or `fixed:r:sha256` (NAR). The bytes
+    /// the closure writes are the corresponding serialization (raw contents for
+    /// text/flat, a NAR for the recursive method).
+    pub fn add_to_store_streamed<F>(
+        &mut self,
+        name: &str,
+        cam: &str,
+        references: &StorePathSet,
+        repair: bool,
+        write_dump: F,
+    ) -> Result<ValidPathInfo>
+    where
+        F: FnOnce(&mut FramedSink) -> io::Result<()>,
+    {
+        if !self.at_least(1, 25) {
+            return protocol_err("AddToStore requires protocol >= 1.25");
+        }
+        self.write_op(Op::AddToStore)?;
+        {
+            let mut w = &self.stream;
+            wire::write_bytes(&mut w, name.as_bytes())?;
+            wire::write_bytes(&mut w, cam.as_bytes())?;
+        }
+        self.write_store_path_set(references)?;
+        {
+            let mut w = &self.stream;
+            wire::write_u64(&mut w, repair as u64)?;
+            w.flush()?;
+        }
+
+        // Stream the dump as framed chunks, draining daemon stderr between
+        // frames (prevents a deadlock when the daemon logs during a large add).
+        {
+            let store_ref: &DaemonStore = self;
+            let mut framed = FramedSink::new(store_ref);
+            let dump_res = write_dump(&mut framed);
+            match dump_res {
+                Ok(()) => framed.finish()?,
+                Err(e) => {
+                    // A daemon error surfaced via checkError takes precedence.
+                    if let Some(de) = framed.take_err() {
+                        return Err(de);
+                    }
+                    return Err(DaemonError::Io(e));
+                }
+            }
+        }
+        self.flush()?;
+
+        self.process_stderr()?;
+        // Response: ValidPathInfo (keyed path + unkeyed info).
+        let path = self.read_store_path()?;
+        self.read_unkeyed_valid_path_info(path)
+    }
+
+    /// `AddToStore` streaming the NAR serialization of the tree at `real_path`
+    /// under `name`, content-addressed by `method`/`algo`.
     pub fn add_to_store_nar_path(
         &mut self,
         name: &str,
@@ -709,30 +831,23 @@ impl DaemonStore {
         references: &StorePathSet,
         repair: bool,
     ) -> Result<ValidPathInfo> {
-        if !self.at_least(1, 25) {
-            return protocol_err("AddToStore requires protocol >= 1.25");
-        }
-        self.write_op(Op::AddToStore)?;
-        let mut w = &self.stream;
-        wire::write_bytes(&mut w, name.as_bytes())?;
-        wire::write_bytes(&mut w, cam_str(method, algo).as_bytes())?;
-        self.write_store_path_set(references)?;
-        let mut w = &self.stream;
-        wire::write_u64(&mut w, repair as u64)?;
-        w.flush()?;
+        let cam = cam_str(method, algo);
+        self.add_to_store_streamed(name, &cam, references, repair, |sink| {
+            nar::dump_path(real_path, sink)
+        })
+    }
 
-        // Stream the NAR as framed chunks.
-        {
-            let mut framed = FramedSink::new(&self.stream);
-            nar::dump_path(real_path, &mut framed)?;
-            framed.finish()?;
-        }
-        self.flush()?;
-
-        self.process_stderr()?;
-        // Response: ValidPathInfo (keyed path + unkeyed info).
-        let path = self.read_store_path()?;
-        self.read_unkeyed_valid_path_info(path)
+    /// `AddToStore` with an in-memory `dump` (raw contents for `text:`/flat
+    /// `fixed:` methods, or a pre-serialized NAR for `fixed:r:`).
+    pub fn add_to_store_bytes(
+        &mut self,
+        name: &str,
+        cam: &str,
+        references: &StorePathSet,
+        repair: bool,
+        dump: &[u8],
+    ) -> Result<ValidPathInfo> {
+        self.add_to_store_streamed(name, cam, references, repair, |sink| sink.write_all(dump))
     }
 
     /// Serialize a `BuildPaths` (op 9) request. Exposed for testing; not run
@@ -796,23 +911,47 @@ pub fn write_derived_paths(
 /// zero-length frame, matching C++ `FramedSink`/`FramedSource`.
 ///
 /// Buffers up to `CHUNK` bytes before emitting a frame (mirroring the C++
-/// `BufferedSink` behaviour).
+/// `BufferedSink` behaviour). Before each frame it drains any pending daemon
+/// stderr non-blockingly (C++ `FramedSink`'s `checkError`), so a chatty daemon
+/// cannot fill the socket's receive buffer and deadlock a large add. A daemon
+/// error observed while streaming is stashed in [`FramedSink::err`] and the
+/// write is aborted with a `BrokenPipe` error.
 pub struct FramedSink<'a> {
-    inner: &'a UnixStream,
+    store: &'a DaemonStore,
     buf: Vec<u8>,
+    err: Option<DaemonError>,
 }
 
 const FRAME_CHUNK: usize = 64 * 1024;
 
 impl<'a> FramedSink<'a> {
-    /// Create a framed sink writing to `inner`.
-    pub fn new(inner: &'a UnixStream) -> Self {
-        FramedSink { inner, buf: Vec::with_capacity(FRAME_CHUNK) }
+    /// Create a framed sink writing to `store`'s socket.
+    pub fn new(store: &'a DaemonStore) -> Self {
+        FramedSink {
+            store,
+            buf: Vec::with_capacity(FRAME_CHUNK),
+            err: None,
+        }
     }
 
+    /// Take the daemon error captured while streaming, if any.
+    pub fn take_err(&mut self) -> Option<DaemonError> {
+        self.err.take()
+    }
+
+    /// Port of `FramedSink::checkError` + `writeUnbuffered`: drain pending
+    /// stderr, then emit the buffered frame.
     fn flush_frame(&mut self) -> io::Result<()> {
+        if self.err.is_some() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "daemon error during add"));
+        }
+        // checkError: don't send more data if the daemon errored.
+        if let Err(e) = self.store.drain_stderr_nonblocking() {
+            self.err = Some(e);
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "daemon error during add"));
+        }
         if !self.buf.is_empty() {
-            let mut w = self.inner;
+            let mut w = &self.store.stream;
             wire::write_u64(&mut w, self.buf.len() as u64)?;
             w.write_all(&self.buf)?;
             self.buf.clear();
@@ -823,7 +962,7 @@ impl<'a> FramedSink<'a> {
     /// Flush any pending frame and write the zero-length terminator.
     pub fn finish(mut self) -> io::Result<()> {
         self.flush_frame()?;
-        let mut w = self.inner;
+        let mut w = &self.store.stream;
         wire::write_u64(&mut w, 0)?;
         w.flush()?;
         Ok(())
@@ -841,6 +980,6 @@ impl Write for FramedSink<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.flush_frame()?;
-        (self.inner).flush()
+        (&self.store.stream).flush()
     }
 }

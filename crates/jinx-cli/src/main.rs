@@ -53,6 +53,9 @@ struct Options {
     trace_verbose: bool,
     /// `--abort-on-warn` / `NIX_ABORT_ON_WARN`: `builtins.warn` throws.
     abort_on_warn: bool,
+    /// `--readonly-mode` (C++ `settings.readOnlyMode`): compute store paths but
+    /// never write to the store. `--read-write-mode` turns it back off.
+    readonly: bool,
 }
 
 fn parse_lint_level(v: &str) -> Result<LintLevel, String> {
@@ -91,6 +94,7 @@ fn parse_args() -> Result<Options, String> {
             std::env::var("NIX_ABORT_ON_WARN").ok().as_deref(),
             Some("1") | Some("true") | Some("yes")
         ),
+        readonly: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -135,7 +139,9 @@ fn parse_args() -> Result<Options, String> {
             "--trace-verbose" => opts.trace_verbose = true,
             "--abort-on-warn" => opts.abort_on_warn = true,
             "--no-abort-on-warn" => opts.abort_on_warn = false,
-            "--read-write-mode" | "--readonly-mode" | "--dry-run" | "--indirect" => {}
+            "--readonly-mode" => opts.readonly = true,
+            "--read-write-mode" => opts.readonly = false,
+            "--dry-run" | "--indirect" => {}
             "--extra-experimental-features" | "--experimental-features" => {
                 let v = need(&args, &mut i, a)?;
                 for f in v.split_whitespace() {
@@ -327,6 +333,38 @@ fn current_system() -> Vec<u8> {
     format!("{arch}-{os}").into_bytes()
 }
 
+/// Select the store backend like C++ `openStore` (store-registration.cc):
+/// `--readonly-mode` forces the dummy (read-only) store; otherwise `NIX_REMOTE`
+/// decides (`dummy://` → dummy, `daemon`/`unix://…` → daemon, empty/unset/`auto`
+/// → auto). jinx has no direct local-store backend, so unsupported schemes fall
+/// back to the read-only dummy store.
+fn select_store_mode(readonly: bool) -> jinx_eval::vm::StoreMode {
+    use jinx_eval::vm::StoreMode;
+    if readonly {
+        return StoreMode::Dummy;
+    }
+    match std::env::var("NIX_REMOTE") {
+        Ok(r) if r == "dummy://" || r == "dummy" => StoreMode::Dummy,
+        Ok(r) if r == "daemon" || r.starts_with("unix:") => StoreMode::Daemon,
+        Ok(r) if r.is_empty() || r == "auto" => auto_store_mode(),
+        Err(_) => auto_store_mode(),
+        Ok(_) => StoreMode::Dummy,
+    }
+}
+
+/// Port of the `auto` case of `resolveStoreConfig`: prefer the daemon when its
+/// socket exists. (jinx has no direct `LocalStore`, so the writable-store branch
+/// degrades to the daemon or, absent a socket, the read-only dummy store.)
+fn auto_store_mode() -> jinx_eval::vm::StoreMode {
+    use jinx_eval::vm::StoreMode;
+    let socket = jinx_store::daemon::resolve_socket_path();
+    if std::path::Path::new(&socket).exists() {
+        StoreMode::Daemon
+    } else {
+        StoreMode::Dummy
+    }
+}
+
 /// Parse a search-path entry ("prefix=path" or "path").
 fn search_path_entry(s: &str) -> (Vec<u8>, Vec<u8>) {
     match s.split_once('=') {
@@ -468,6 +506,7 @@ fn run_eval(opts: Options) -> ExitCode {
         vm.store_dir = sd.into_bytes();
     }
     vm.pure_eval = opts.pure_eval;
+    vm.store_mode = select_store_mode(opts.readonly);
     if let Some(d) = opts.max_call_depth {
         vm.max_call_depth = d;
     }

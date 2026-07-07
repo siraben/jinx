@@ -110,6 +110,110 @@ fn dump(path: &Path, sink: &mut impl Write, depth: usize) -> io::Result<()> {
     wire::write_bytes(sink, b")")
 }
 
+/// Serialize the file-system object at `path` as a NAR into `sink`, applying
+/// `filter` to each directory entry (root always included).
+///
+/// Port of `SourceAccessor::dumpPath` with a `PathFilter` (`archive.cc`): for
+/// every directory child, `filter` is called with the child's path; entries for
+/// which it returns `false` are omitted. The `filter` may return an error
+/// (propagated), mirroring C++ where the filter callback can throw (the
+/// evaluator's path-filter function raising an eval error).
+pub fn dump_path_filtered<F>(
+    path: impl AsRef<Path>,
+    sink: &mut impl Write,
+    filter: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(&Path) -> io::Result<bool>,
+{
+    wire::write_bytes(sink, NAR_VERSION_MAGIC_1)?;
+    dump_filtered(path.as_ref(), sink, 0, filter)
+}
+
+fn dump_filtered<F>(path: &Path, sink: &mut impl Write, depth: usize, filter: &mut F) -> io::Result<()>
+where
+    F: FnMut(&Path) -> io::Result<bool>,
+{
+    if depth >= NAR_MAX_DEPTH {
+        return Err(other_err(format!(
+            "path '{}' exceeds maximum NAR directory depth of {}",
+            path.display(),
+            NAR_MAX_DEPTH
+        )));
+    }
+
+    let st = fs::symlink_metadata(path)?;
+    let ft = st.file_type();
+
+    wire::write_bytes(sink, b"(")?;
+
+    if ft.is_file() {
+        wire::write_bytes(sink, b"type")?;
+        wire::write_bytes(sink, b"regular")?;
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            st.permissions().mode() & 0o100 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
+        if executable {
+            wire::write_bytes(sink, b"executable")?;
+            wire::write_bytes(sink, b"")?;
+        }
+        dump_contents(path, st.len(), sink)?;
+    } else if ft.is_dir() {
+        wire::write_bytes(sink, b"type")?;
+        wire::write_bytes(sink, b"directory")?;
+
+        let mut entries: BTreeMap<Vec<u8>, std::path::PathBuf> = BTreeMap::new();
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            #[cfg(unix)]
+            let name = {
+                use std::os::unix::ffi::OsStrExt;
+                entry.file_name().as_bytes().to_vec()
+            };
+            #[cfg(not(unix))]
+            let name = entry.file_name().to_string_lossy().into_owned().into_bytes();
+            entries.insert(name, entry.path());
+        }
+
+        for (name, entry_path) in &entries {
+            if !filter(entry_path)? {
+                continue;
+            }
+            wire::write_bytes(sink, b"entry")?;
+            wire::write_bytes(sink, b"(")?;
+            wire::write_bytes(sink, b"name")?;
+            wire::write_bytes(sink, name)?;
+            wire::write_bytes(sink, b"node")?;
+            dump_filtered(entry_path, sink, depth + 1, filter)?;
+            wire::write_bytes(sink, b")")?;
+        }
+    } else if ft.is_symlink() {
+        wire::write_bytes(sink, b"type")?;
+        wire::write_bytes(sink, b"symlink")?;
+        wire::write_bytes(sink, b"target")?;
+        let target = fs::read_link(path)?;
+        #[cfg(unix)]
+        let target_bytes = {
+            use std::os::unix::ffi::OsStrExt;
+            target.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(unix))]
+        let target_bytes = target.to_string_lossy().into_owned().into_bytes();
+        wire::write_bytes(sink, &target_bytes)?;
+    } else {
+        return Err(other_err(format!(
+            "file '{}' has an unsupported type",
+            path.display()
+        )));
+    }
+
+    wire::write_bytes(sink, b")")
+}
+
 /// Port of `dumpContents`: `contents` tag, u64 size, raw bytes, zero
 /// padding to 8 bytes.
 fn dump_contents(path: &Path, size: u64, sink: &mut impl Write) -> io::Result<()> {

@@ -1865,6 +1865,13 @@ fn derivation_strict_internal(
     }
     vm.built_drvs.insert(drv_path.clone(), drv.clone());
 
+    // Materialize the `.drv` in the store when a writable daemon backend is
+    // selected (non-readonly). Port of `writeDerivation` in `derivationStrict`.
+    // Under the dummy store this is a no-op (read-only path computation).
+    if let Err(msg) = write_derivation_to_store(vm, &drv, &drv_path) {
+        return Err(vm.new_err(ErrKind::Eval, msg, pos));
+    }
+
     // Build the result attrset.
     let drv_path_s = store.print_store_path(&drv_path);
     let drv_base = drv_path.to_string().as_bytes().to_vec();
@@ -1928,6 +1935,7 @@ fn prim_path(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) ->
     let mut method = FileIngestionMethod::NixArchive;
     let mut expected_hash: Option<Hash> = None;
     let mut context: Vec<u32> = Vec::new();
+    let mut filter: Option<VRef> = None;
     for a in &entries {
         let key = vm.symbols.resolve(Symbol(a.sym)).to_vec();
         match key.as_slice() {
@@ -1957,6 +1965,7 @@ fn prim_path(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) ->
                     PosIdx(a.pos),
                     "while evaluating the `filter` parameter passed to builtins.path",
                 )?;
+                filter = Some(a.val);
             }
             b"recursive" => {
                 method = if vm.force_bool(
@@ -2020,35 +2029,18 @@ fn prim_path(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) ->
             .make_fixed_output_path_from_ca(&name_s, &ca)
             .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?
     } else {
-        // No expected hash: hash the (unfiltered) path content.
+        // No expected hash: hash the (filtered) path content, adding it to the
+        // store when daemon-backed. Port of `addPath` without `expectedHash`.
+        let _ = ContentAddressMethod::Flat;
         use std::os::unix::ffi::OsStrExt;
         let logical = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
-        let os_buf = vm.redirect_fs(logical);
-        let os = os_buf.as_path();
-        let algo = HashAlgorithm::Sha256;
-        let hash = match method {
-            FileIngestionMethod::Flat => {
-                let data = std::fs::read(os)
-                    .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), pos))?;
-                hash_string(algo, &data)
-            }
-            _ => {
-                jinx_store::nar::hash_path(os, algo)
-                    .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), pos))?
-                    .0
-            }
-        };
-        let _ = ContentAddressMethod::Flat;
-        store
-            .make_fixed_output_path(
-                &name_s,
-                &FixedOutputInfo {
-                    method,
-                    hash,
-                    references: StoreReferences::default(),
-                },
-            )
-            .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?
+        let real = vm.redirect_fs(logical);
+        let refs = jinx_store::store_path::StorePathSet::new();
+        add_filtered_path(vm, &name_s, real.as_path(), filter, method, &refs)
+            .map_err(|e| {
+                vm.add_trace(e, pos, format!("while adding path '{}'", String::from_utf8_lossy(&path)));
+                e
+            })?
     };
     let printed = store.print_store_path(&sp);
     let id = vm.intern_elem(&crate::context::ContextElem::Opaque {
@@ -2061,6 +2053,35 @@ fn prim_to_xml(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) 
     let _ = pos;
     let (out, ctx) = crate::xml::prim_to_xml_impl(vm, args[0])?;
     Ok(mk_string_ctx(vm, &out, &ctx))
+}
+
+/// Port of `Store::writeDerivation`: add the `.drv` ATerm to the store as a
+/// text content-addressed object (only under [`StoreMode::Daemon`]). The store
+/// path is already known (`drv_path`); the daemon must agree. Skips the add when
+/// the path is already valid (fast path), then registers a temp root so the GC
+/// won't remove it mid-run. Returns an error message on daemon failure.
+fn write_derivation_to_store(
+    vm: &mut VM,
+    drv: &jinx_store::derivation::Derivation,
+    drv_path: &jinx_store::store_path::StorePath,
+) -> Result<(), String> {
+    if vm.store_mode != crate::vm::StoreMode::Daemon {
+        return Ok(());
+    }
+    let store = vm.store();
+    let suffix = format!("{}.drv", drv.name);
+    let contents = drv.unparse(&store, false, None).map_err(|e| e.0)?;
+    let refs = drv.drv_references();
+    let Some(d) = vm.daemon() else {
+        return Ok(());
+    };
+    let valid = d.is_valid_path(drv_path).map_err(|e| e.to_string())?;
+    if !valid {
+        d.add_to_store_bytes(&suffix, "text:sha256", &refs, false, &contents)
+            .map_err(|e| e.to_string())?;
+    }
+    d.add_temp_root(drv_path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn prim_to_file(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
@@ -2126,10 +2147,41 @@ fn prim_to_file(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx)
         .make_text_path(&name_s, &contents, &refs)
         .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?;
     let printed = store.print_store_path(&sp);
+    // Materialize the text object in the store when daemon-backed (port of
+    // `addTextToStore` via `AddToStore` with the text CA method). No-op under
+    // the dummy store.
+    if let Err(msg) = add_text_to_store(vm, &name_s, &contents, &refs, &sp) {
+        return Err(vm.new_err(ErrKind::Eval, msg, pos));
+    }
     let id = vm.intern_elem(&ContextElem::Opaque {
         path: sp.to_string().as_bytes().to_vec(),
     });
     Ok(vm.new_string_ctx(printed.as_bytes(), &[id]))
+}
+
+/// Port of `Store::addTextToStore`: add `contents` as a `text:sha256`
+/// content-addressed object with the given references (only under
+/// [`StoreMode::Daemon`]; a no-op otherwise). `sp` is the expected path.
+fn add_text_to_store(
+    vm: &mut VM,
+    name: &str,
+    contents: &[u8],
+    refs: &jinx_store::store_path::StorePathSet,
+    sp: &jinx_store::store_path::StorePath,
+) -> Result<(), String> {
+    if vm.store_mode != crate::vm::StoreMode::Daemon {
+        return Ok(());
+    }
+    let Some(d) = vm.daemon() else {
+        return Ok(());
+    };
+    let valid = d.is_valid_path(sp).map_err(|e| e.to_string())?;
+    if !valid {
+        d.add_to_store_bytes(name, "text:sha256", refs, false, contents)
+            .map_err(|e| e.to_string())?;
+    }
+    d.add_temp_root(sp).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -4211,8 +4263,8 @@ fn prim_store_path(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosI
 
 fn prim_filter_source(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
     // C++ coerces the path (second argument) before anything else, then forces
-    // the filter function, then walks the tree ("addPath"), invoking the
-    // filter on each entry. Only the error paths are exercised by the suite.
+    // the filter function, then walks the tree ("addPath"), invoking the filter
+    // on each entry (port of `addPath` with `method = NixArchive`).
     let path = coerce_to_path(
         vm,
         args[1],
@@ -4227,54 +4279,154 @@ fn prim_filter_source(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: P
     )?;
     let filter = args[0];
     let path_str = String::from_utf8_lossy(&path).into_owned();
-    filter_walk(vm, filter, &path_str).map_err(|e| {
+    let name = base_name_of(&path);
+    let name_s = String::from_utf8_lossy(&name).into_owned();
+    use std::os::unix::ffi::OsStrExt;
+    let logical = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
+    let real = vm.redirect_fs(logical);
+    let refs = jinx_store::store_path::StorePathSet::new();
+    let sp = add_filtered_path(
+        vm,
+        &name_s,
+        real.as_path(),
+        Some(filter),
+        jinx_store::store_path::FileIngestionMethod::NixArchive,
+        &refs,
+    )
+    .map_err(|e| {
         vm.add_trace(e, pos, format!("while adding path '{path_str}'"));
         e
     })?;
-    Err(vm.new_err(
-        ErrKind::Eval,
-        "the 'filterSource' builtin is not implemented by jinx yet",
-        pos,
-    ))
+    let store = vm.store();
+    let printed = store.print_store_path(&sp);
+    let id = vm.intern_elem(&crate::context::ContextElem::Opaque {
+        path: sp.to_string().as_bytes().to_vec(),
+    });
+    Ok(vm.new_string_ctx(printed.as_bytes(), &[id]))
 }
 
-/// Minimal port of the filter-invocation part of `addPath`: apply the filter
-/// to directory entries. `filter path type` must return a Boolean; the return
-/// value is forced with the C++ context string.
-fn filter_walk(vm: &mut VM, filter: VRef, dir: &str) -> Result<(), ErrId> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Ok(());
+/// `baseNameOf`: the path component after the last `/` (paths are canonicalized
+/// by `coerce_to_path`, so there is no trailing slash to worry about).
+fn base_name_of(path: &[u8]) -> Vec<u8> {
+    match path.iter().rposition(|&c| c == b'/') {
+        Some(i) => path[i + 1..].to_vec(),
+        None => path.to_vec(),
+    }
+}
+
+/// Port of `EvalState::callPathFilter`: call `filter path type` and force the
+/// result to a Boolean. `type` is `"regular"`/`"directory"`/`"symlink"`/
+/// `"unknown"` per the entry's lstat.
+fn call_path_filter(vm: &mut VM, filter: VRef, path: &std::path::Path) -> Result<bool, ErrId> {
+    let t = path
+        .symlink_metadata()
+        .map(|m| file_type_str(&m))
+        .unwrap_or("unknown");
+    use std::os::unix::ffi::OsStrExt;
+    let pv = mk_string(vm, path.as_os_str().as_bytes());
+    let pc = temp_cell(vm, pv);
+    let tv = mk_string(vm, t.as_bytes());
+    let tc = temp_cell(vm, tv);
+    let scope = vm.temp_scope();
+    vm.temp_roots.push(pc);
+    vm.temp_roots.push(tc);
+    let r = vm.call_function(filter, &[pc, tc], NO_POS);
+    vm.temp_end(scope);
+    let rv = r?;
+    let rc = temp_cell(vm, rv);
+    vm.force_bool(
+        rc,
+        NO_POS,
+        "while evaluating the return value of the path filter function",
+    )
+}
+
+/// Port of `addPath` (without an expected hash): serialize the tree at
+/// `real_path` (applying `filter` to each directory entry when given), compute
+/// its content-addressed store path, and — under [`StoreMode::Daemon`] — add it
+/// to the store. Returns the resulting [`StorePath`].
+fn add_filtered_path(
+    vm: &mut VM,
+    name: &str,
+    real_path: &std::path::Path,
+    filter: Option<VRef>,
+    method: jinx_store::store_path::FileIngestionMethod,
+    refs: &jinx_store::store_path::StorePathSet,
+) -> Result<jinx_store::store_path::StorePath, ErrId> {
+    use jinx_store::hash::HashAlgorithm;
+    use jinx_store::store_path::{ContentAddressMethod, FileIngestionMethod, FixedOutputInfo, StoreReferences};
+
+    // Build the content-address "dump": raw contents for Flat, a (filtered) NAR
+    // for the recursive method.
+    let dump: Vec<u8> = match method {
+        FileIngestionMethod::Flat => std::fs::read(real_path)
+            .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?,
+        _ => {
+            let mut nar = Vec::new();
+            match filter {
+                None => jinx_store::nar::dump_path(real_path, &mut nar)
+                    .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?,
+                Some(f) => {
+                    let mut pending: Option<ErrId> = None;
+                    let res = {
+                        let mut cb = |p: &std::path::Path| -> std::io::Result<bool> {
+                            match call_path_filter(vm, f, p) {
+                                Ok(b) => Ok(b),
+                                Err(e) => {
+                                    pending = Some(e);
+                                    Err(std::io::Error::other("path filter error"))
+                                }
+                            }
+                        };
+                        jinx_store::nar::dump_path_filtered(real_path, &mut nar, &mut cb)
+                    };
+                    if let Some(e) = pending {
+                        return Err(e);
+                    }
+                    res.map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?;
+                }
+            }
+            nar
+        }
     };
-    let mut names: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
-    for ent in rd.flatten() {
-        let t = ent
-            .path()
-            .symlink_metadata()
-            .map(|m| file_type_str(&m))
-            .unwrap_or("unknown");
-        names.push((ent.path(), t));
+
+    let hash = hash_string(HashAlgorithm::Sha256, &dump);
+    let store = vm.store();
+    let sp = store
+        .make_fixed_output_path(
+            name,
+            &FixedOutputInfo {
+                method,
+                hash,
+                references: StoreReferences {
+                    others: refs.clone(),
+                    self_ref: false,
+                },
+            },
+        )
+        .map_err(|e| vm.new_err(ErrKind::Eval, e.0, NO_POS))?;
+
+    if vm.store_mode == crate::vm::StoreMode::Daemon {
+        let cam_method = match method {
+            FileIngestionMethod::Flat => ContentAddressMethod::Flat,
+            _ => ContentAddressMethod::NixArchive,
+        };
+        let cam = jinx_store::daemon::cam_str(cam_method, HashAlgorithm::Sha256);
+        let r: Result<(), String> = (|| {
+            let Some(d) = vm.daemon() else { return Ok(()) };
+            if !d.is_valid_path(&sp).map_err(|e| e.to_string())? {
+                d.add_to_store_bytes(name, &cam, refs, false, &dump)
+                    .map_err(|e| e.to_string())?;
+            }
+            d.add_temp_root(&sp).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(msg) = r {
+            return Err(vm.new_err(ErrKind::Eval, msg, NO_POS));
+        }
     }
-    names.sort();
-    for (p, t) in names {
-        let ps = p.to_string_lossy().into_owned();
-        let pv = mk_string(vm, ps.as_bytes());
-        let pc = temp_cell(vm, pv);
-        let tv = mk_string(vm, t.as_bytes());
-        let tc = temp_cell(vm, tv);
-        let scope = vm.temp_scope();
-        vm.temp_roots.push(pc);
-        vm.temp_roots.push(tc);
-        let r = vm.call_function(filter, &[pc, tc], NO_POS);
-        vm.temp_end(scope);
-        let rv = r?;
-        let rc = temp_cell(vm, rv);
-        vm.force_bool(
-            rc,
-            NO_POS,
-            "while evaluating the return value of the path filter function",
-        )?;
-    }
-    Ok(())
+
+    Ok(sp)
 }
 
 fn coerce_to_path(vm: &mut VM, cell: VRef, pos: PosIdx, ctx: &str) -> Result<Vec<u8>, ErrId> {

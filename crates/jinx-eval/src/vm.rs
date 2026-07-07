@@ -26,6 +26,17 @@ use crate::heap::Heap;
 use crate::immortal;
 use crate::value::{self, Attr, Tag, VRef, Value};
 
+/// Which store backend evaluation-time store effects (toFile, path adds,
+/// derivation writes, IFD builds) use. Mirrors C++ `openStore` selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreMode {
+    /// Read-only: compute store paths but never write. Used under
+    /// `NIX_REMOTE=dummy://` and `--readonly-mode`.
+    Dummy,
+    /// Talk to a local `nix-daemon` over its Unix socket (lazily connected).
+    Daemon,
+}
+
 #[inline]
 pub fn val(c: VRef) -> Value {
     // SAFETY: cells handed to the VM are live.
@@ -163,6 +174,16 @@ pub struct VM {
     pub empty_list_cell: VRef,
     pub current_system: Vec<u8>,
     pub store_dir: Vec<u8>,
+    /// Which store backend evaluation-time store effects go to. Defaults to
+    /// [`StoreMode::Dummy`] (read-only path computation only); the CLI selects
+    /// [`StoreMode::Daemon`] like C++ `openStore` (see `main.rs`).
+    pub store_mode: StoreMode,
+    /// Lazily-opened worker-protocol connection (only when `store_mode` is
+    /// [`StoreMode::Daemon`]). `None` until the first store effect needs it.
+    pub daemon_conn: Option<Box<jinx_store::daemon::DaemonStore>>,
+    /// Set once a daemon connection attempt has failed, so we don't retry every
+    /// store effect.
+    pub daemon_failed: bool,
     pub pure_eval: bool,
     /// String context element table: `ctx_elems[id]` is the wire encoding of
     /// a `NixStringContextElem` (e.g. `<basename>`, `=<drv>`, `!<out>!<drv>`).
@@ -242,6 +263,9 @@ impl VM {
             empty_list_cell: immortal::cell(immortal::list(&[])),
             current_system: b"aarch64-darwin".to_vec(),
             store_dir: b"/nix/store".to_vec(),
+            store_mode: StoreMode::Dummy,
+            daemon_conn: None,
+            daemon_failed: false,
             pure_eval: false,
             ctx_elems: Vec::new(),
             ctx_intern: FxHashMap::default(),
@@ -1416,6 +1440,25 @@ impl VM {
     /// A `StoreDir` for the current store directory.
     pub fn store(&self) -> jinx_store::store_path::StoreDir {
         jinx_store::store_path::StoreDir::new(String::from_utf8_lossy(&self.store_dir).into_owned())
+    }
+
+    /// The live daemon connection, lazily opened on first use. Returns `None`
+    /// under [`StoreMode::Dummy`] or if the connection cannot be established
+    /// (so callers transparently fall back to read-only path computation).
+    pub fn daemon(&mut self) -> Option<&mut jinx_store::daemon::DaemonStore> {
+        if self.store_mode != StoreMode::Daemon {
+            return None;
+        }
+        if self.daemon_conn.is_none() && !self.daemon_failed {
+            match jinx_store::daemon::DaemonStore::connect() {
+                Ok(s) => self.daemon_conn = Some(Box::new(s)),
+                Err(e) => {
+                    self.daemon_failed = true;
+                    eprintln!("warning: could not connect to Nix daemon: {e}");
+                }
+            }
+        }
+        self.daemon_conn.as_deref_mut()
     }
 
     /// Read the context-element ids of a string value (empty if none).
