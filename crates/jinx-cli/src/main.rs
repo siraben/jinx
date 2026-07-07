@@ -755,7 +755,7 @@ fn get_derivations(
             });
             if is_drv {
                 if let Some(a) = attrs_get(&vv, vm.syms.drv_path) {
-                    let (s, _c) = vm.coerce_to_string(
+                    let (mut s, _c) = vm.coerce_to_string(
                         a.val,
                         NO_POS,
                         "while evaluating the 'drvPath' attribute of a derivation",
@@ -763,6 +763,19 @@ fn get_derivations(
                         false,
                         false,
                     )?;
+                    // C++ appends `!<outputName>` when the selected output is
+                    // not `out` (nix-instantiate.cc: fmt("%s%s", drvPathS, ...)).
+                    if let Some(o) = attrs_get(&vv, vm.symbols.create(b"outputName")) {
+                        vm.force(o.val, NO_POS)?;
+                        let ov = val(o.val);
+                        if ov.tag() == Tag::String {
+                            let name = str_bytes(&ov);
+                            if !name.is_empty() && name != b"out" {
+                                s.push(b'!');
+                                s.extend_from_slice(name);
+                            }
+                        }
+                    }
                     out.push(s);
                 }
                 return Ok(());
