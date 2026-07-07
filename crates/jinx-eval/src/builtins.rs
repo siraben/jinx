@@ -301,13 +301,20 @@ pub fn register_globals(vm: &mut VM) {
     let bsym = vm.symbols.create(b"builtins");
     vm.globals.insert(bsym, builtins_cell);
 
-    // Compile the derivation wrapper now that globals are in place.
-    let src = DERIVATION_NIX;
+    // Compile the derivation wrapper now that globals are in place. The source
+    // is the verbatim upstream `primops/derivation.nix` (see
+    // DERIVATION_NIX_FILE) with a leading newline prepended, exactly
+    // reproducing how C++ embeds it via `R"__NIX_STR( ... )__NIX_STR"` (the
+    // open-paren is followed by a newline). This keeps line numbers and source
+    // excerpts in error traces byte-identical to Nix, which does not normalize
+    // them (only eval-fail-derivation-name.postprocess masks the digits).
+    let src = derivation_nix_source();
     let mut warnings = Vec::new();
     let parsed = jinx_syntax::parse_and_bind_with(
-        src,
-        Origin::String {
-            source: src.to_vec(),
+        &src,
+        Origin::Path {
+            path: DERIVATION_INTERNAL_ORIGIN.to_string(),
+            source: src.clone(),
         },
         "/",
         None,
@@ -327,40 +334,24 @@ pub fn register_globals(vm: &mut VM) {
     crate::vm::set(derivation_cell, val(cell));
 }
 
-/// primops/derivation.nix, minus comments.
-pub(crate) const DERIVATION_NIX: &[u8] = br#"
-drvAttrs@{
-  outputs ? [ "out" ],
-  ...
-}:
+/// The `derivation` builtin's Nix implementation, vendored verbatim from
+/// upstream Nix `src/libexpr/primops/derivation.nix` (comments and doc-comment
+/// included) so that error-trace positions and source excerpts match Nix
+/// exactly. Provenance: copied from /path/to/nix/src/libexpr/primops/derivation.nix.
+pub(crate) const DERIVATION_NIX_FILE: &[u8] = include_bytes!("derivation-internal.nix");
 
-let
+/// Origin name Nix uses for the embedded derivation wrapper.
+pub(crate) const DERIVATION_INTERNAL_ORIGIN: &str = "«nix-internal»/derivation-internal.nix";
 
-  strict = derivationStrict drvAttrs;
-
-  commonAttrs =
-    drvAttrs
-    // (builtins.listToAttrs outputsList)
-    // {
-      all = map (x: x.value) outputsList;
-      inherit drvAttrs;
-    };
-
-  outputToAttrListElement = outputName: {
-    name = outputName;
-    value = commonAttrs // {
-      outPath = strict.${outputName};
-      drvPath = strict.drvPath;
-      type = "derivation";
-      inherit outputName;
-    };
-  };
-
-  outputsList = map outputToAttrListElement outputs;
-
-in
-(builtins.head outputsList).value
-"#;
+/// The wrapper source as Nix sees it: the verbatim file with a single leading
+/// newline, reproducing the `R"__NIX_STR(\n...` raw-string embedding so that
+/// all positions are shifted down by one line to match the compiled C++ binary.
+pub(crate) fn derivation_nix_source() -> Vec<u8> {
+    let mut v = Vec::with_capacity(DERIVATION_NIX_FILE.len() + 1);
+    v.push(b'\n');
+    v.extend_from_slice(DERIVATION_NIX_FILE);
+    v
+}
 
 // ---------------------------------------------------------------------
 // helpers

@@ -367,11 +367,11 @@ impl VM {
 
     /// C++ skips the "while evaluating the attribute" frame when the attr's
     /// position lives in the internal `derivation-internal.nix`. jinx compiles
-    /// that wrapper from an in-memory source; detect it by source identity.
+    /// that wrapper from an in-memory source; detect it by its origin name.
     pub fn pos_is_derivation_internal(&self, p: PosIdx) -> bool {
         matches!(
             self.positions.origin_of(p),
-            Some(o) if o.source() == crate::builtins::DERIVATION_NIX
+            Some(o) if o.display_name() == crate::builtins::DERIVATION_INTERNAL_ORIGIN
         )
     }
 
