@@ -183,6 +183,10 @@ pub struct VM {
         (Vec<u8>, u8, String),
         Vec<(Option<VRef>, jinx_store::hash::Hash, jinx_store::store_path::StorePath)>,
     >,
+    /// Memoize `resolveExprPath` results (mirrors C++ `importResolutionCache`):
+    /// symlink-following and directory `default.nix` resolution is a pure
+    /// function of the (fixed) NIX_PATH config and the input path.
+    pub import_resolution_cache: FxHashMap<std::path::PathBuf, std::path::PathBuf>,
     pub call_depth: usize,
     pub max_call_depth: usize,
     /// (prefix, path) entries, from -I and NIX_PATH.
@@ -277,6 +281,7 @@ impl VM {
             file_cache_idx: FxHashMap::default(),
             src_to_store: FxHashMap::default(),
             filtered_path_cache: FxHashMap::default(),
+            import_resolution_cache: FxHashMap::default(),
             call_depth: 0,
             max_call_depth: 10000,
             last_select_pos: NO_POS,

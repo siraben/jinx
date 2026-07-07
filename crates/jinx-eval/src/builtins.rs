@@ -5107,7 +5107,20 @@ fn read_source(vm: &mut VM, resolved: &Path, pos: PosIdx) -> Result<Vec<u8>, Err
 /// of a computed flake store path are served from the real fetched tree. The
 /// returned path stays *logical* (store-path form): symlink targets are rebased
 /// onto the logical parent and the on-disk directory check redirects the probe.
-fn resolve_expr_path_vm(vm: &VM, path: &Path) -> PathBuf {
+///
+/// Results are memoized in `vm.import_resolution_cache` (C++
+/// `importResolutionCache`) since resolution is a pure function of the fixed
+/// NIX_PATH config and the input path.
+fn resolve_expr_path_vm(vm: &mut VM, path: &Path) -> PathBuf {
+    if let Some(r) = vm.import_resolution_cache.get(path) {
+        return r.clone();
+    }
+    let r = resolve_expr_path_vm_uncached(vm, path);
+    vm.import_resolution_cache.insert(path.to_path_buf(), r.clone());
+    r
+}
+
+fn resolve_expr_path_vm_uncached(vm: &VM, path: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
     if p.to_str() == Some("/__corepkgs__/fetchurl.nix") {
         return p;
