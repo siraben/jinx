@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use jinx_eval::builtins;
-use jinx_eval::error::{ErrId, ErrKind};
+use jinx_eval::error::{best_matches, ErrId, ErrKind};
 use jinx_eval::print;
 use jinx_eval::value::{Tag, VRef};
 use jinx_eval::vm::{attrs_get, list_elems, str_bytes, thunk_code, val, VM};
@@ -1083,12 +1083,7 @@ fn find_along_attr_path(
     attr_path: &str,
     auto_args: &[(Symbol, VRef)],
 ) -> Result<VRef, ErrId> {
-    let mut tokens: Vec<String> = Vec::new();
-    if !attr_path.is_empty() {
-        for t in attr_path.split('.') {
-            tokens.push(t.to_string());
-        }
-    }
+    let tokens = parse_attr_path(attr_path).map_err(|m| vm.new_err(ErrKind::Eval, m, NO_POS))?;
     let mut v = root;
     for t in &tokens {
         // Auto-call before each selection (C++ findAlongAttrPath always runs
@@ -1119,6 +1114,10 @@ fn find_along_attr_path(
             );
             return Err(vm.new_err(ErrKind::Type, msg, NO_POS));
         }
+        if t.is_empty() {
+            let msg = format!("empty attribute name in selection path '{}'", attr_path);
+            return Err(vm.new_err(ErrKind::Eval, msg, NO_POS));
+        }
         let sym = vm.symbols.create(t.as_bytes());
         match attrs_get(&cur, sym) {
             Some(a) => v = a.val,
@@ -1127,7 +1126,14 @@ fn find_along_attr_path(
                     "attribute '{}' in selection path '{}' not found",
                     t, attr_path
                 );
-                return Err(vm.new_err(ErrKind::Eval, msg, NO_POS));
+                let cands: Vec<String> = jinx_eval::vm::attrs_entries(&cur)
+                    .iter()
+                    .map(|a| String::from_utf8_lossy(vm.symbols.resolve(Symbol(a.sym))).into_owned())
+                    .collect();
+                let sugg = best_matches(cands.into_iter(), t);
+                let e = vm.new_err(ErrKind::Eval, msg, NO_POS);
+                vm.errors[e as usize].suggestions = sugg;
+                return Err(e);
             }
         }
     }
@@ -1291,6 +1297,11 @@ fn run_nix_eval(args: Vec<String>) -> ExitCode {
     let mut experimental: Vec<String> = nix_conf_experimental_features();
     let mut apply: Option<String> = None;
     let mut installable: Option<String> = None;
+    // `--expr E` / `--file F` (`-f`): evaluate an expression / file instead of a
+    // flake installable; the positional then becomes an attribute path into it.
+    let mut expr: Option<String> = None;
+    let mut file: Option<String> = None;
+    let argv0 = std::env::args().next().unwrap_or_else(|| "nix".to_string());
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1302,6 +1313,14 @@ fn run_nix_eval(args: Vec<String>) -> ExitCode {
             "--apply" => {
                 i += 1;
                 apply = args.get(i).cloned();
+            }
+            "--expr" => {
+                i += 1;
+                expr = args.get(i).cloned();
+            }
+            "-f" | "--file" => {
+                i += 1;
+                file = args.get(i).cloned();
             }
             "--extra-experimental-features" | "--experimental-features" => {
                 i += 1;
@@ -1322,7 +1341,13 @@ fn run_nix_eval(args: Vec<String>) -> ExitCode {
                 }
             }
             s if s.starts_with('-') && s != "-" => {
-                // Ignore unknown flags that take no argument (best-effort).
+                // Unknown flags are a hard error (C++ Args::parseCmdline), unlike
+                // the silent-ignore we did before.
+                write_stderr_line(format!("error: unrecognised flag '{s}'").as_bytes());
+                write_stderr_line(
+                    format!("Try '{argv0} --help' for more information.").as_bytes(),
+                );
+                return ExitCode::FAILURE;
             }
             s => {
                 if installable.is_none() {
@@ -1339,16 +1364,11 @@ fn run_nix_eval(args: Vec<String>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let Some(installable) = installable else {
-        write_stderr_line(b"error: nix eval requires an installable argument");
+    if expr.is_some() && file.is_some() {
+        write_stderr_line(b"error: '--file' and '--expr' are exclusive");
+        write_stderr_line(format!("Try '{argv0} --help' for more information.").as_bytes());
         return ExitCode::FAILURE;
-    };
-
-    // Split `flakeref#attrpath`.
-    let (flakeref, attr_path) = match installable.split_once('#') {
-        Some((fr, ap)) => (fr.to_string(), ap.to_string()),
-        None => (installable.clone(), String::new()),
-    };
+    }
 
     let symbols = SymbolTable::new();
     let positions = PosTable::new();
@@ -1364,58 +1384,122 @@ fn run_nix_eval(args: Vec<String>) -> ExitCode {
     configure_jit(&mut vm, None);
     builtins::register_globals(&mut vm);
 
-    // Resolve the flake to its `result` attrset.
-    let flake_ref_abs = expand_flakeref(&flakeref);
-    let flake = match jinx_eval::flake::get_flake(&mut vm, &flake_ref_abs, NO_POS) {
-        Ok(c) => c,
-        Err(e) => {
-            report_err(&vm, e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Attribute-path resolution: try the default prefixes then the bare path
-    // (port of InstallableFlake::getActualAttrPaths for `nix eval`).
-    let sys = String::from_utf8_lossy(&current_system()).into_owned();
-    let candidates: Vec<String> = if attr_path.is_empty() {
-        vec![String::new()]
-    } else if let Some(rest) = attr_path.strip_prefix('.') {
-        // A leading '.' selects the raw attribute path, skipping the default
-        // prefixes (port of getActualAttrPaths' leading-dot case).
-        vec![rest.to_string()]
-    } else {
-        vec![
-            format!("packages.{sys}.{attr_path}"),
-            format!("legacyPackages.{sys}.{attr_path}"),
-            attr_path.clone(),
-        ]
-    };
-
-    let mut value: Option<VRef> = None;
-    for cand in &candidates {
-        match navigate_attr_path(&mut vm, flake, cand) {
-            Ok(Some(v)) => {
-                value = Some(v);
-                break;
+    // Resolve the root value and the attribute path to select from it.
+    // Three source modes: `--expr`, `--file`, or a flake installable.
+    let mut value: VRef;
+    if expr.is_some() || file.is_some() {
+        // `--expr`/`--file`: the positional (if any) is a `.`-separated
+        // attribute path into the evaluated value (findAlongAttrPath).
+        let attr_path = installable.clone().unwrap_or_default();
+        let root = if let Some(e) = &expr {
+            match compile_expr_thunk(&mut vm, e.as_bytes()) {
+                Ok(c) => c,
+                Err(rendered) => {
+                    write_stderr_line(&rendered);
+                    return ExitCode::FAILURE;
+                }
             }
-            Ok(None) => continue,
+        } else {
+            let f = file.clone().unwrap();
+            let path = if f.starts_with('/') {
+                PathBuf::from(f)
+            } else {
+                PathBuf::from(cwd_string()).join(f)
+            };
+            match builtins::eval_file_traced(&mut vm, &path, NO_POS, false) {
+                Ok(c) => c,
+                Err(e) => {
+                    report_err(&vm, e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+        vm.temp_roots.push(root);
+        match find_along_attr_path(&mut vm, root, &attr_path, &[]) {
+            Ok(v) => value = v,
             Err(e) => {
                 report_err(&vm, e);
                 return ExitCode::FAILURE;
             }
         }
-    }
-    let Some(mut value) = value else {
-        let quoted: Vec<String> = candidates.iter().map(|c| format!("'{c}'")).collect();
-        let list = match quoted.len() {
-            1 => quoted[0].clone(),
-            _ => format!("{} or {}", quoted[..quoted.len() - 1].join(", "), quoted[quoted.len() - 1]),
+    } else {
+        let Some(installable) = installable else {
+            write_stderr_line(b"error: nix eval requires an installable argument");
+            return ExitCode::FAILURE;
         };
-        write_stderr_line(
-            format!("error: flake '{flake_ref_abs}' does not provide attribute {list}").as_bytes(),
-        );
-        return ExitCode::FAILURE;
-    };
+
+        // Split `flakeref#attrpath`.
+        let (flakeref, fragment) = match installable.split_once('#') {
+            Some((fr, ap)) => (fr.to_string(), ap.to_string()),
+            None => (installable.clone(), String::new()),
+        };
+
+        // Resolve the flake to its `result` attrset.
+        let flake_ref_abs = expand_flakeref(&flakeref);
+        let flake = match jinx_eval::flake::get_flake(&mut vm, &flake_ref_abs, NO_POS) {
+            Ok(c) => c,
+            Err(e) => {
+                report_err(&vm, e);
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // Attribute-path resolution (port of InstallableFlake::getActualAttrPaths
+        // for `nix eval`). With no fragment, the defaults are the *default
+        // package* attr paths; with a fragment, the default prefixes apply.
+        let sys = String::from_utf8_lossy(&current_system()).into_owned();
+        let candidates: Vec<String> = if fragment.is_empty() {
+            vec![
+                format!("packages.{sys}.default"),
+                format!("defaultPackage.{sys}"),
+            ]
+        } else if let Some(rest) = fragment.strip_prefix('.') {
+            // A leading '.' selects the raw attribute path, skipping the default
+            // prefixes (port of getActualAttrPaths' leading-dot case).
+            vec![rest.to_string()]
+        } else {
+            vec![
+                format!("packages.{sys}.{fragment}"),
+                format!("legacyPackages.{sys}.{fragment}"),
+                fragment.clone(),
+            ]
+        };
+
+        let mut found: Option<VRef> = None;
+        for cand in &candidates {
+            match navigate_attr_path(&mut vm, flake, cand) {
+                Ok(Some(v)) => {
+                    found = Some(v);
+                    break;
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    report_err(&vm, e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        match found {
+            Some(v) => value = v,
+            None => {
+                let quoted: Vec<String> = candidates.iter().map(|c| format!("'{c}'")).collect();
+                let list = match quoted.len() {
+                    1 => quoted[0].clone(),
+                    _ => format!(
+                        "{} or {}",
+                        quoted[..quoted.len() - 1].join(", "),
+                        quoted[quoted.len() - 1]
+                    ),
+                };
+                let printed = canonicalize_flakeref(&flake_ref_abs);
+                write_stderr_line(
+                    format!("error: flake '{printed}' does not provide attribute {list}")
+                        .as_bytes(),
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     if let Err(e) = vm.force(value, NO_POS) {
         report_err(&vm, e);
@@ -1483,15 +1567,15 @@ fn run_nix_eval(args: Vec<String>) -> ExitCode {
             let _ = lock.flush();
         }
         EvalOut::Plain => {
+            // `nix eval` uses ValuePrinter with `PrintOptions{.force=true}` —
+            // the pretty printer that renders functions as
+            // `«lambda <name> @ <file>:<line>:<col>»`, not nix-instantiate's
+            // ambiguous `<LAMBDA>`. deep_force stands in for `.force = true`.
             if let Err(e) = print::deep_force(&mut vm, value) {
                 report_err(&vm, e);
                 return ExitCode::FAILURE;
             }
-            let mut out = Vec::new();
-            if let Err(e) = print::print_ambiguous(&mut vm, value, &mut out) {
-                report_err(&vm, e);
-                return ExitCode::FAILURE;
-            }
+            let mut out = print::print_value_trace(&vm, &val(value));
             out.push(b'\n');
             let mut lock = stdout.lock();
             let _ = lock.write_all(&out);
@@ -1523,15 +1607,70 @@ fn expand_flakeref(fr: &str) -> String {
     }
 }
 
+/// Canonicalize a flakeref for display in error text, matching how C++
+/// `FlakeRef::to_string()` renders it. A bare absolute path becomes a
+/// `path:`-scheme URL (or `git+file:` when it is a git working tree); refs that
+/// already carry a scheme are left unchanged.
+fn canonicalize_flakeref(fr: &str) -> String {
+    // Already a URL with a scheme (contains "://" or a known scheme prefix).
+    if fr.contains("://")
+        || fr.starts_with("path:")
+        || fr.starts_with("flake:")
+        || fr.starts_with("git+")
+    {
+        return fr.to_string();
+    }
+    if fr.starts_with('/') {
+        // A git working tree is rendered as `git+file://<path>`; a plain
+        // directory as `path:<path>` (FlakeRef::fromParsedURL).
+        if std::path::Path::new(fr).join(".git").exists() {
+            return format!("git+file://{fr}");
+        }
+        return format!("path:{fr}");
+    }
+    fr.to_string()
+}
+
 /// Navigate a dotted attribute path from `root`. Returns `Ok(None)` if an
 /// attribute along the way is missing (so the caller can try the next
 /// candidate); other type errors propagate.
+/// Port of `parseAttrPath` (attr-path.cc): split a dotted attribute path,
+/// honoring `"..."`-quoted segments (so `a."dot.ted"` → ["a", "dot.ted"]).
+/// Errors on a missing closing quote, matching C++.
+fn parse_attr_path(s: &str) -> Result<Vec<String>, String> {
+    let mut res = Vec::new();
+    let mut cur = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '.' {
+            res.push(std::mem::take(&mut cur));
+        } else if c == '"' {
+            loop {
+                match it.next() {
+                    None => {
+                        return Err(format!("missing closing quote in selection path '{s}'"));
+                    }
+                    Some('"') => break,
+                    Some(ch) => cur.push(ch),
+                }
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        res.push(cur);
+    }
+    Ok(res)
+}
+
 fn navigate_attr_path(vm: &mut VM, root: VRef, attr_path: &str) -> Result<Option<VRef>, ErrId> {
     let mut v = root;
     if attr_path.is_empty() {
         return Ok(Some(v));
     }
-    for comp in attr_path.split('.') {
+    let tokens = parse_attr_path(attr_path).map_err(|m| vm.new_err(ErrKind::Eval, m, NO_POS))?;
+    for comp in tokens {
         vm.force(v, NO_POS)?;
         let cur = val(v);
         if cur.tag() != Tag::Attrs {
