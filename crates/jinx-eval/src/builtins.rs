@@ -4544,6 +4544,43 @@ fn value_ident_eq(a: VRef, b: VRef, depth: u32) -> bool {
     }
 }
 
+/// Serialize the NAR of `real_path` into `sink`, applying the Nix path-`filter`
+/// closure (if any) on the eval thread in the exact traversal order. Factored
+/// out of [`add_filtered_path`] so the same walk can target either an in-memory
+/// `Vec<u8>` (daemon mode, which needs the bytes) or a streaming [`HashSink`]
+/// (readonly/dummy mode, which needs only the hash) without duplicating the
+/// filter-error plumbing. The filter's first error wins and is returned as-is.
+fn dump_nar_filtered<W: std::io::Write>(
+    vm: &mut VM,
+    real_path: &std::path::Path,
+    filter: Option<VRef>,
+    sink: &mut W,
+) -> Result<(), ErrId> {
+    match filter {
+        None => jinx_store::nar::dump_path(real_path, sink)
+            .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS)),
+        Some(f) => {
+            let mut pending: Option<ErrId> = None;
+            let res = {
+                let mut cb = |p: &std::path::Path| -> std::io::Result<bool> {
+                    match call_path_filter(vm, f, p) {
+                        Ok(b) => Ok(b),
+                        Err(e) => {
+                            pending = Some(e);
+                            Err(std::io::Error::other("path filter error"))
+                        }
+                    }
+                };
+                jinx_store::nar::dump_path_filtered(real_path, sink, &mut cb)
+            };
+            if let Some(e) = pending {
+                return Err(e);
+            }
+            res.map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))
+        }
+    }
+}
+
 /// Port of `addPath` (without an expected hash): serialize the tree at
 /// `real_path` (applying `filter` to each directory entry when given), compute
 /// its content-addressed store path, and — under [`StoreMode::Daemon`] — add it
@@ -4588,42 +4625,48 @@ fn add_filtered_path(
         jinx_store::nar_stats::record_cache_miss();
     }
 
-    // Build the content-address "dump": raw contents for Flat, a (filtered) NAR
-    // for the recursive method.
-    let dump: Vec<u8> = match method {
-        FileIngestionMethod::Flat => std::fs::read(real_path)
-            .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?,
-        _ => {
-            let mut nar = Vec::new();
-            match filter {
-                None => jinx_store::nar::dump_path(real_path, &mut nar)
-                    .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?,
-                Some(f) => {
-                    let mut pending: Option<ErrId> = None;
-                    let res = {
-                        let mut cb = |p: &std::path::Path| -> std::io::Result<bool> {
-                            match call_path_filter(vm, f, p) {
-                                Ok(b) => Ok(b),
-                                Err(e) => {
-                                    pending = Some(e);
-                                    Err(std::io::Error::other("path filter error"))
-                                }
-                            }
-                        };
-                        jinx_store::nar::dump_path_filtered(real_path, &mut nar, &mut cb)
-                    };
-                    if let Some(e) = pending {
-                        return Err(e);
-                    }
-                    res.map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?;
-                }
+    // Compute the content-address hash. The daemon needs the actual bytes for
+    // `add_to_store_bytes`, so materialize the "dump" (raw contents for Flat, a
+    // filtered NAR for the recursive method) into a `Vec<u8>`. In readonly/dummy
+    // mode only the hash is needed, so stream straight into a `HashSink` — this
+    // avoids building (and realloc'ing) the whole NAR in memory (445 MB on ISO).
+    let need_bytes = vm.store_mode == crate::vm::StoreMode::Daemon;
+    let (hash, dump): (jinx_store::hash::Hash, Option<Vec<u8>>) = match method {
+        FileIngestionMethod::Flat => {
+            if need_bytes {
+                let bytes = std::fs::read(real_path)
+                    .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?;
+                jinx_store::nar_stats::record_nar_bytes(bytes.len() as u64);
+                let h = hash_string(HashAlgorithm::Sha256, &bytes);
+                (h, Some(bytes))
+            } else {
+                let mut sink = jinx_store::hash::HashSink::new(HashAlgorithm::Sha256);
+                let mut f = std::fs::File::open(real_path)
+                    .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?;
+                std::io::copy(&mut f, &mut sink)
+                    .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?;
+                let (h, n) = sink.finish();
+                jinx_store::nar_stats::record_nar_bytes(n);
+                (h, None)
             }
-            nar
+        }
+        _ => {
+            if need_bytes {
+                let mut nar = Vec::new();
+                dump_nar_filtered(vm, real_path, filter, &mut nar)?;
+                jinx_store::nar_stats::record_nar_bytes(nar.len() as u64);
+                let h = hash_string(HashAlgorithm::Sha256, &nar);
+                (h, Some(nar))
+            } else {
+                let mut sink = jinx_store::hash::HashSink::new(HashAlgorithm::Sha256);
+                dump_nar_filtered(vm, real_path, filter, &mut sink)?;
+                let (h, n) = sink.finish();
+                jinx_store::nar_stats::record_nar_bytes(n);
+                (h, None)
+            }
         }
     };
 
-    jinx_store::nar_stats::record_nar_bytes(dump.len() as u64);
-    let hash = hash_string(HashAlgorithm::Sha256, &dump);
     let store = vm.store();
     let sp = store
         .make_fixed_output_path(
@@ -4648,7 +4691,10 @@ fn add_filtered_path(
         let r: Result<(), String> = (|| {
             let Some(d) = vm.daemon() else { return Ok(()) };
             if !d.is_valid_path(&sp).map_err(|e| e.to_string())? {
-                d.add_to_store_bytes(name, &cam, refs, false, &dump)
+                // `need_bytes` is true whenever we are in daemon mode, so `dump`
+                // is always materialized on this path.
+                let bytes = dump.as_deref().expect("daemon mode materializes dump");
+                d.add_to_store_bytes(name, &cam, refs, false, bytes)
                     .map_err(|e| e.to_string())?;
             }
             d.add_temp_root(&sp).map_err(|e| e.to_string())?;
