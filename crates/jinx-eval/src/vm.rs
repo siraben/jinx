@@ -1167,7 +1167,26 @@ impl VM {
                     let n = n as usize;
                     let args_start = self.stack.len() - n;
                     let fun = self.stack[args_start - 1];
-                    let args: Vec<VRef> = self.stack[args_start..].to_vec();
+                    // Copy args out of the (reallocatable) operand stack into
+                    // an inline buffer (the common case is 1-2 curried args),
+                    // avoiding a heap Vec allocation per call. The values stay
+                    // GC-rooted via the operand stack (truncate is after call).
+                    let mut buf = [std::mem::MaybeUninit::<VRef>::uninit(); 8];
+                    let mut heap_args: Vec<VRef> = Vec::new();
+                    let args: &[VRef] = if n <= 8 {
+                        // SAFETY: we copy exactly n initialized cells.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                self.stack[args_start..].as_ptr(),
+                                buf.as_mut_ptr() as *mut VRef,
+                                n,
+                            );
+                            std::slice::from_raw_parts(buf.as_ptr() as *const VRef, n)
+                        }
+                    } else {
+                        heap_args.extend_from_slice(&self.stack[args_start..]);
+                        &heap_args
+                    };
                     // Synthetic apply thunks (map/genList/…) carry no call
                     // pos; C++ threads the enclosing `forceValue` pos into the
                     // `tApp` call. Recover it from `force_pos`, else fall back
@@ -1180,7 +1199,7 @@ impl VM {
                             cpos = self.determine_pos(&val(fun), NO_POS);
                         }
                     }
-                    let v = self.call_function(fun, &args, cpos)?;
+                    let v = self.call_function(fun, args, cpos)?;
                     self.stack.truncate(args_start - 1);
                     let c = self.alloc_cell(v);
                     self.stack.push(c);

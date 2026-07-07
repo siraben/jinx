@@ -404,7 +404,24 @@ pub extern "C" fn jinx_call(vm: *mut VM, n: u32, pos: u32) -> u64 {
     let n = n as usize;
     let args_start = vm.stack.len() - n;
     let fun = vm.stack[args_start - 1];
-    let args: Vec<VRef> = vm.stack[args_start..].to_vec();
+    // Mirror the interpreter's Op::Call: copy small arg lists into an inline
+    // buffer instead of a heap Vec (args stay rooted via the operand stack).
+    let mut buf = [std::mem::MaybeUninit::<VRef>::uninit(); 8];
+    let mut heap_args: Vec<VRef> = Vec::new();
+    let args: &[VRef] = if n <= 8 {
+        // SAFETY: we copy exactly n initialized cells.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                vm.stack[args_start..].as_ptr(),
+                buf.as_mut_ptr() as *mut VRef,
+                n,
+            );
+            std::slice::from_raw_parts(buf.as_ptr() as *const VRef, n)
+        }
+    } else {
+        heap_args.extend_from_slice(&vm.stack[args_start..]);
+        &heap_args
+    };
     let mut cpos = PosIdx(pos);
     if !cpos.is_set() {
         cpos = vm.force_pos;
@@ -412,7 +429,7 @@ pub extern "C" fn jinx_call(vm: *mut VM, n: u32, pos: u32) -> u64 {
             cpos = vm.determine_pos(&val(fun), NO_POS);
         }
     }
-    match vm.call_function(fun, &args, cpos) {
+    match vm.call_function(fun, args, cpos) {
         Ok(v) => {
             vm.stack.truncate(args_start - 1);
             let c = vm.alloc_cell(v);
