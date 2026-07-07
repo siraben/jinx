@@ -703,6 +703,80 @@ impl<'a> Compiler<'a> {
         self.bump(1);
     }
 
+    /// Emit a force-thunk that forwards to a single outer cell captured via
+    /// `cap` (relative to the *current* frame).
+    ///
+    /// Used to *fill a recursive binding slot* (`let` / `rec { }`) whose value
+    /// is a bare reference to an outer, mutable cell. Such a slot is filled by
+    /// `StoreLocal`, which *copies the value* out of the referenced cell. A
+    /// direct alias would therefore copy whatever the outer cell holds *at fill
+    /// time* — which, when the binding scope is constructed while the outer cell
+    /// is itself mid-force, is a transient `Blackhole`. That frozen blackhole is
+    /// later re-forced and misreported as "infinite recursion". C++'s
+    /// `maybeThunk` shares the outer `Value *` cell instead, so it never
+    /// snapshots a transient state. jinx captures cells by value into fixed
+    /// placeholder slots, so it cannot share; forwarding through a thunk defers
+    /// the read (and force) of the outer cell until the slot is demanded, which
+    /// is the observable equivalent.
+    fn compile_forward_thunk(&mut self, cap: Cap, pos: PosIdx) {
+        self.push_state(0, NO_POS, Symbol(0));
+        // The single capture becomes upvalue 0 (with_captures == 0 here).
+        self.st().upvals.push((Key::From(u32::MAX, u32::MAX), cap));
+        self.emit(Op::GetUpval(0), pos);
+        self.bump(1);
+        self.emit(Op::Force, pos);
+        self.emit(Op::Ret, NO_POS);
+        let cid = self.pop_state();
+        self.emit(Op::MakeThunk(cid), NO_POS);
+        self.bump(1);
+    }
+
+    /// Fill a recursive binding slot with `id`. Like [`compile_maybe_thunk`],
+    /// but tuned for the `StoreLocal` fill path: only *immutable* values
+    /// (literals, the empty list, immortal globals) may be copied directly;
+    /// every reference to another (mutable) binding cell is forwarded through a
+    /// force-thunk (see [`compile_forward_thunk`]) so a transient blackhole is
+    /// never snapshotted into the slot.
+    fn compile_fill(&mut self, id: ExprId) {
+        match self.exprs.get(id) {
+            e @ (Expr::Int(_) | Expr::Float(_) | Expr::String(_) | Expr::Path(_)) => {
+                self.push_literal(e, NO_POS)
+            }
+            Expr::List(elems) if elems.is_empty() => {
+                let cell = self.empty_list_cell;
+                self.push_const(ConstKey::EmptyList, || cell, NO_POS);
+            }
+            Expr::Var { pos, name } => {
+                let (pos, name) = (*pos, *name);
+                match self.resolve(Key::Sym(name), None) {
+                    Resolved::Local(s) => self.compile_forward_thunk(Cap::Local(s), pos),
+                    Resolved::Upval(i) => self.compile_forward_thunk(Cap::Upval(i), pos),
+                    Resolved::Global(c) => {
+                        self.emit(Op::Const(c), pos);
+                        self.bump(1);
+                    }
+                    Resolved::With => self.compile_thunk(id),
+                }
+            }
+            _ => self.compile_thunk(id),
+        }
+    }
+
+    /// `inherit x;` inside a `let` / `rec { }`: fill the slot by forwarding to
+    /// the *outer* binding of `x` (skipping the current group via `floor_slot`).
+    /// Same rationale as [`compile_fill`] — never alias-copy a mutable cell.
+    fn compile_inherited_fill(&mut self, sym: Symbol, pos: PosIdx, floor_slot: u32) {
+        match self.resolve(Key::Sym(sym), Some(floor_slot)) {
+            Resolved::Local(s) => self.compile_forward_thunk(Cap::Local(s), pos),
+            Resolved::Upval(i) => self.compile_forward_thunk(Cap::Upval(i), pos),
+            Resolved::Global(c) => {
+                self.emit(Op::Const(c), pos);
+                self.bump(1);
+            }
+            Resolved::With => self.compile_with_var_thunk(sym, pos),
+        }
+    }
+
     /// A thunk that resolves `name` through the with-chain lazily (the
     /// defeated-maybeThunk case for `inherit x` where x comes from `with`).
     fn compile_with_var_thunk(&mut self, name: Symbol, pos: PosIdx) {
@@ -959,38 +1033,19 @@ impl<'a> Compiler<'a> {
             match def.kind {
                 AttrDefKind::Inherited => {
                     // Evaluated in the *outer* env: skip the binding group.
-                    self.compile_inherited(*sym, def.pos, start);
+                    self.compile_inherited_fill(*sym, def.pos, start);
                 }
                 AttrDefKind::InheritedFrom => {
                     let saved = self.from_owner.replace(owner);
-                    self.compile_maybe_thunk(def.e, Some(start));
+                    self.compile_fill(def.e);
                     self.from_owner = saved;
                 }
                 AttrDefKind::Plain => {
-                    self.compile_maybe_thunk(def.e, Some(start));
+                    self.compile_fill(def.e);
                 }
             }
             self.emit(Op::StoreLocal(slot), def.pos);
             self.bump(-1);
-        }
-    }
-
-    /// `inherit x;` in a rec scope: alias the *outer* binding of x.
-    fn compile_inherited(&mut self, sym: Symbol, pos: PosIdx, floor_slot: u32) {
-        match self.resolve(Key::Sym(sym), Some(floor_slot)) {
-            Resolved::Local(s) => {
-                self.emit(Op::GetLocal(s), pos);
-                self.bump(1);
-            }
-            Resolved::Upval(i) => {
-                self.emit(Op::GetUpval(i), pos);
-                self.bump(1);
-            }
-            Resolved::Global(c) => {
-                self.emit(Op::Const(c), pos);
-                self.bump(1);
-            }
-            Resolved::With => self.compile_with_var_thunk(sym, pos),
         }
     }
 
@@ -1037,13 +1092,13 @@ impl<'a> Compiler<'a> {
             for (i, (sym, def)) in names.iter().enumerate() {
                 let slot = start + i as u32;
                 match def.kind {
-                    AttrDefKind::Inherited => self.compile_inherited(*sym, def.pos, start),
+                    AttrDefKind::Inherited => self.compile_inherited_fill(*sym, def.pos, start),
                     AttrDefKind::InheritedFrom => {
                         let saved = self.from_owner.replace(owner);
                         if has_overrides {
                             self.compile_thunk(def.e);
                         } else {
-                            self.compile_maybe_thunk(def.e, Some(start));
+                            self.compile_fill(def.e);
                         }
                         self.from_owner = saved;
                     }
@@ -1051,7 +1106,7 @@ impl<'a> Compiler<'a> {
                         if has_overrides {
                             self.compile_thunk(def.e);
                         } else {
-                            self.compile_maybe_thunk(def.e, Some(start));
+                            self.compile_fill(def.e);
                         }
                     }
                 }

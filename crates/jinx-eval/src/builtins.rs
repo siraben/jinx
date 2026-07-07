@@ -93,7 +93,6 @@ const UNIMPLEMENTED: &[(&str, u8)] = &[
     ("__forceLazyFetcherAttr", 1),
     ("__importNative", 2),
     ("__outputOf", 2),
-    ("__toFile", 2),
     // flakes (experimental): present in `builtins` so failures are clearly
     // "not implemented" rather than "attribute missing".
     ("getFlake", 1),
@@ -199,6 +198,7 @@ pub fn register_globals(vm: &mut VM) {
         Reg { name: "fromTOML", arity: 1, func: prim_from_toml },
         Reg { name: "__toXML", arity: 1, func: prim_to_xml },
         Reg { name: "__path", arity: 1, func: prim_path },
+        Reg { name: "__toFile", arity: 2, func: prim_to_file },
         Reg { name: "parseFlakeRef", arity: 1, func: prim_parse_flake_ref },
         Reg { name: "flakeRefToString", arity: 1, func: prim_flake_ref_to_string },
         Reg { name: "__getContext", arity: 1, func: prim_get_context },
@@ -2053,6 +2053,75 @@ fn prim_to_xml(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) 
     let _ = pos;
     let (out, ctx) = crate::xml::prim_to_xml_impl(vm, args[0])?;
     Ok(mk_string_ctx(vm, &out, &ctx))
+}
+
+fn prim_to_file(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    use crate::context::ContextElem;
+    use jinx_store::store_path::{StorePath, StorePathSet};
+    let name = vm.force_string_no_ctx(
+        args[0],
+        pos,
+        "while evaluating the first argument passed to builtins.toFile",
+    )?;
+    let contents = vm.force_string(
+        args[1],
+        pos,
+        "while evaluating the second argument passed to builtins.toFile",
+    )?;
+    let name_s = String::from_utf8_lossy(&name).into_owned();
+    // Collect store-path references from the contents' context. Only opaque
+    // store paths are allowed; derivations / their outputs are rejected (a
+    // `toFile` result is a plain text object, it cannot depend on a build).
+    let mut refs = StorePathSet::new();
+    for id in vm.read_str_ctx(&val(args[1])) {
+        match vm.ctx_elem(id) {
+            ContextElem::Opaque { path } => {
+                if let Ok(sp) = StorePath::new(&String::from_utf8_lossy(&path)) {
+                    refs.insert(sp);
+                }
+            }
+            other => {
+                let store = vm.store();
+                let printed = {
+                    let bytes = other.encode();
+                    // `!out!<base>` / `=<base>` -> print the base with the store dir.
+                    match &other {
+                        ContextElem::Built { drv_path, output } => {
+                            let sp = StorePath::new(&String::from_utf8_lossy(drv_path));
+                            let dp = sp
+                                .map(|p| store.print_store_path(&p))
+                                .unwrap_or_else(|_| String::from_utf8_lossy(drv_path).into_owned());
+                            format!("!{}!{}", String::from_utf8_lossy(output), dp)
+                        }
+                        ContextElem::DrvDeep { drv_path } => {
+                            let sp = StorePath::new(&String::from_utf8_lossy(drv_path));
+                            let dp = sp
+                                .map(|p| store.print_store_path(&p))
+                                .unwrap_or_else(|_| String::from_utf8_lossy(drv_path).into_owned());
+                            format!("={dp}")
+                        }
+                        ContextElem::Opaque { .. } => String::from_utf8_lossy(&bytes).into_owned(),
+                    }
+                };
+                return Err(vm.new_err(
+                    ErrKind::Eval,
+                    format!(
+                        "files created by 'builtins.toFile' may not reference derivations, but '{name_s}' references '{printed}'"
+                    ),
+                    pos,
+                ));
+            }
+        }
+    }
+    let store = vm.store();
+    let sp = store
+        .make_text_path(&name_s, &contents, &refs)
+        .map_err(|e| vm.new_err(ErrKind::Eval, e.0, pos))?;
+    let printed = store.print_store_path(&sp);
+    let id = vm.intern_elem(&ContextElem::Opaque {
+        path: sp.to_string().as_bytes().to_vec(),
+    });
+    Ok(vm.new_string_ctx(printed.as_bytes(), &[id]))
 }
 
 // ---------------------------------------------------------------------
