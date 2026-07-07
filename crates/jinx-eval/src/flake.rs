@@ -37,6 +37,9 @@ struct Fetched {
     store_base: String,
     /// The real on-disk directory the store path is redirected to.
     real_dir: PathBuf,
+    /// The original working directory of the flake (for git flakes this is the
+    /// checkout, not the `git archive` export), used to read `flake.lock`.
+    orig_dir: PathBuf,
     nar_hash_sri: String,
     rev: Option<String>,
     rev_count: Option<u64>,
@@ -69,9 +72,12 @@ pub fn get_flake(vm: &mut VM, flakeref_str: &str, pos: PosIdx) -> Result<VRef, E
         fetched.real_dir.clone(),
     );
 
-    // Read the flake's lock file (from the flake subdir), or synthesize a
-    // single-root lock for a lockfile-less flake (port of `readLockFile`).
-    let mut lock_path = fetched.real_dir.clone();
+    // Read the flake's lock file (from the flake subdir of the original working
+    // directory), or synthesize a single-root lock for a lockfile-less flake
+    // (port of `readLockFile`). NOTE: jinx reads an existing `flake.lock`; it
+    // does not implement `lockFlake`'s dynamic input resolution, so flakes whose
+    // lock is not present on disk (e.g. computed in-memory) are unsupported.
+    let mut lock_path = fetched.orig_dir.clone();
     if !subdir.is_empty() {
         lock_path.push(&subdir);
     }
@@ -247,6 +253,7 @@ fn fetch_git(vm: &mut VM, attrs: &Attrs, store: &StoreDir, pos: PosIdx) -> Resul
         store_path_printed: store.print_store_path(&sp),
         store_base: sp.to_string().to_string(),
         real_dir: export,
+        orig_dir: PathBuf::from(&local),
         nar_hash_sri,
         rev: Some(rev),
         rev_count,
@@ -270,7 +277,8 @@ fn fetch_path(vm: &mut VM, attrs: &Attrs, store: &StoreDir, pos: PosIdx) -> Resu
     Ok(Fetched {
         store_path_printed: store.print_store_path(&sp),
         store_base: sp.to_string().to_string(),
-        real_dir: real,
+        real_dir: real.clone(),
+        orig_dir: real,
         nar_hash_sri,
         rev: None,
         rev_count: None,

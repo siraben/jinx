@@ -1194,6 +1194,10 @@ fn run_nix_eval(args: Vec<String>) -> ExitCode {
     let sys = String::from_utf8_lossy(&current_system()).into_owned();
     let candidates: Vec<String> = if attr_path.is_empty() {
         vec![String::new()]
+    } else if let Some(rest) = attr_path.strip_prefix('.') {
+        // A leading '.' selects the raw attribute path, skipping the default
+        // prefixes (port of getActualAttrPaths' leading-dot case).
+        vec![rest.to_string()]
     } else {
         vec![
             format!("packages.{sys}.{attr_path}"),
