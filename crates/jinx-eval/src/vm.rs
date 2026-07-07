@@ -2196,9 +2196,20 @@ impl VM {
                     }
                     None => match f.default {
                         Some(cid) => {
-                            let c = self.alloc_cell(Value::make(Tag::Blackhole, 0));
-                            pending_defaults.push((self.stack.len(), cid));
-                            self.stack.push(c);
+                            let prog = code.prog();
+                            if let crate::chunk::ChunkKind::ConstReturn { idx } =
+                                prog.chunks[cid as usize].kind
+                            {
+                                // Literal default (`? []`, `? null`, ...):
+                                // alias the immortal const cell directly --
+                                // no placeholder cell, no default thunk, no
+                                // later force.
+                                self.stack.push(prog.consts[idx as usize]);
+                            } else {
+                                let c = self.alloc_cell(Value::make(Tag::Blackhole, 0));
+                                pending_defaults.push((self.stack.len(), cid));
+                                self.stack.push(c);
+                            }
                         }
                         None => {
                             let name = self.lambda_raw_name(chunk);

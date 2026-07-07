@@ -75,6 +75,7 @@ enum ConstKey {
     Path(Vec<u8>),
     Global(Symbol),
     EmptyList,
+    EmptyAttrs,
     Bool(bool),
 }
 
@@ -462,6 +463,14 @@ impl<'a> Compiler<'a> {
             }
             Expr::Attrs(_) => self.compile_attrs(id, None),
             Expr::List(elems) => {
+                if elems.is_empty() {
+                    // Shared immortal empty list (lists are immutable, so
+                    // identity is unobservable); also turns `? []` lambda
+                    // defaults into ConstReturn chunks.
+                    let cell = self.empty_list_cell;
+                    self.push_const(ConstKey::EmptyList, || cell, NO_POS);
+                    return;
+                }
                 let elems: Vec<ExprId> = elems.clone();
                 for e in &elems {
                     self.compile_maybe_thunk(*e, None);
@@ -764,8 +773,66 @@ impl<'a> Compiler<'a> {
                 }
                 self.bump(1);
             }
-            _ => self.compile_thunk(id),
+            _ => {
+                if self.cheap_expr(id, &mut 64) {
+                    // Cheap-eagerness (Faxen subset): evaluating this
+                    // expression eagerly allocates no thunk it would not
+                    // otherwise, cannot force anything (so cannot throw or
+                    // diverge) and has no effects -- build the value in
+                    // place of a thunk.
+                    self.compile_expr(id);
+                } else {
+                    self.compile_thunk(id);
+                }
+            }
         }
+    }
+
+    /// Conservatively true iff evaluating `id` eagerly is (a) safe: cannot
+    /// force another value, throw, diverge, or perform effects, and (b) at
+    /// most as expensive as allocating the thunk it replaces: literals,
+    /// lexically-bound variables (aliased, unforced), and list/attrset
+    /// literals whose every element is itself cheap (spines built from
+    /// aliased cells). NOT lambdas: C++ traces observe thunk-vs-closure
+    /// state through `determinePos` at apply sites ("from call site"
+    /// frames), so an eagerly-built closure changes error output where C++
+    /// still has a thunk (eval-fail-mapAttrs-3/4). Lambda-body thunks stay
+    /// lazy and are forced frame-lessly (ChunkKind::Straight) instead.
+    fn cheap_expr(&self, id: ExprId, fuel: &mut u32) -> bool {
+        if *fuel == 0 {
+            return false;
+        }
+        *fuel -= 1;
+        match self.exprs.get(id) {
+            Expr::Int(_) | Expr::Float(_) | Expr::String(_) | Expr::Path(_) => true,
+            Expr::Var { name, .. } => self.peek_binds(*name),
+            Expr::List(elems) => elems.iter().all(|e| self.cheap_expr(*e, fuel)),
+            Expr::Attrs(_) => {
+                let a = self.exprs.attrs(id);
+                !a.recursive
+                    && a.dynamic_attrs.is_empty()
+                    && a.inherit_from_exprs.is_empty()
+                    && a.attrs.iter().all(|(_, d)| match d.kind {
+                        AttrDefKind::Plain | AttrDefKind::Inherited => self.cheap_expr(d.e, fuel),
+                        AttrDefKind::InheritedFrom => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Side-effect-free check that `name` is lexically bound (locals of any
+    /// enclosing state, or a global): such a variable compiles to a cell
+    /// alias in `compile_maybe_thunk` (no force, no thunk). Unlike
+    /// `resolve`, this records no upvalue captures.
+    fn peek_binds(&self, name: Symbol) -> bool {
+        let key = Key::Sym(name);
+        for st in self.states.iter().rev() {
+            if st.locals.iter().any(|(k, _)| *k == key) {
+                return true;
+            }
+        }
+        self.globals.contains_key(&name)
     }
 
     /// Compile `e` into its own chunk and emit MakeThunk.
@@ -834,7 +901,17 @@ impl<'a> Compiler<'a> {
                     Resolved::With => self.compile_thunk(id),
                 }
             }
-            _ => self.compile_thunk(id),
+            _ => {
+                if self.cheap_expr(id, &mut 64) {
+                    // Safe in fill position: StoreLocal copies the finished
+                    // immutable value; any variables inside the spine alias
+                    // binding *cells* (never their transient contents). Bare
+                    // Vars are handled by the explicit arm above (forwarded).
+                    self.compile_expr(id);
+                } else {
+                    self.compile_thunk(id);
+                }
+            }
         }
     }
 
@@ -1139,6 +1216,16 @@ impl<'a> Compiler<'a> {
         let a = self.exprs.attrs(id);
         let recursive = a.recursive;
         let pos = a.pos;
+        if a.attrs.is_empty() && a.inherit_from_exprs.is_empty() && a.dynamic_attrs.is_empty() {
+            // `{}` / `rec {}`: shared immortal empty bindings (immutable;
+            // DynAttr/RecOverrides never target it since those cases are
+            // excluded above). Turns `? {}` lambda defaults into ConstReturn
+            // chunks.
+            let i = self.const_idx(ConstKey::EmptyAttrs, || immortal::cell(immortal::bindings(&[])));
+            self.emit(Op::Const(i), pos);
+            self.bump(1);
+            return;
+        }
         let names: Vec<(Symbol, AttrDef)> = a.attrs.iter().map(|(s, d)| (*s, *d)).collect();
         let from_exprs: Vec<ExprId> = a.inherit_from_exprs.clone();
         let dynamics: Vec<DynamicAttrDef> = a.dynamic_attrs.clone();
