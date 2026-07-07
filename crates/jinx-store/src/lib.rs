@@ -17,6 +17,7 @@
 
 pub mod daemon;
 pub mod derivation;
+pub mod escape_scan;
 pub mod hash;
 pub mod nar;
 pub mod nix32;

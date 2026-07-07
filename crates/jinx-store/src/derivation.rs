@@ -748,20 +748,27 @@ fn validate_path(s: &str) -> Result<(), DrvError> {
 
 /// Port of `printString`: quote and escape `"`, `\`, `\n`, `\r`, `\t`.
 fn print_string(res: &mut Vec<u8>, s: &[u8]) {
+    use crate::escape_scan::next_drv_escape;
     res.push(b'"');
-    // Scan for the next byte that needs escaping and bulk-copy the clean span
-    // before it; the common (no-escape) case becomes a single extend.
+    // Find the next byte needing escaping (SIMD-accelerated on aarch64/x86_64,
+    // scalar elsewhere) and bulk-copy the clean span before it; the common
+    // (no-escape) case becomes a single extend.
     let mut start = 0;
-    for (i, &c) in s.iter().enumerate() {
-        let esc: &[u8] = match c {
+    while start < s.len() {
+        let i = start + next_drv_escape(&s[start..]);
+        if i >= s.len() {
+            break;
+        }
+        res.extend_from_slice(&s[start..i]);
+        let esc: &[u8] = match s[i] {
             b'"' => b"\\\"",
             b'\\' => b"\\\\",
             b'\n' => b"\\n",
             b'\r' => b"\\r",
             b'\t' => b"\\t",
-            _ => continue,
+            // `next_drv_escape` only stops on the five bytes above.
+            _ => unreachable!(),
         };
-        res.extend_from_slice(&s[start..i]);
         res.extend_from_slice(esc);
         start = i + 1;
     }

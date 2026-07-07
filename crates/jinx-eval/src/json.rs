@@ -143,15 +143,19 @@ impl Utf8Error {
 
 /// nlohmann-style string escaping (control chars as \uXXXX), no validation.
 fn json_escape(out: &mut Vec<u8>, s: &[u8]) {
+    use jinx_store::escape_scan::next_json_escape;
     out.push(b'"');
     // Only '"', '\\' and control chars (< 0x20) need escaping; everything else
-    // (including raw high bytes) is copied verbatim. Scan for the next byte that
-    // needs escaping and bulk-copy the clean span before it.
+    // (including raw high bytes) is copied verbatim. Find the next byte needing
+    // escaping (SIMD-accelerated on aarch64/x86_64, scalar elsewhere) and
+    // bulk-copy the clean span before it.
     let mut start = 0;
-    for (i, &c) in s.iter().enumerate() {
-        if c >= 0x20 && c != b'"' && c != b'\\' {
-            continue;
+    while start < s.len() {
+        let i = start + next_json_escape(&s[start..]);
+        if i >= s.len() {
+            break;
         }
+        let c = s[i];
         out.extend_from_slice(&s[start..i]);
         match c {
             b'"' => out.extend_from_slice(b"\\\""),
