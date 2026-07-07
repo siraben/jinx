@@ -170,6 +170,13 @@ pub struct VM {
     /// identity, so sharing the same cell everywhere is sound. See
     /// [`VM::symbol_string`].
     pub sym_string_cache: Vec<Option<VRef>>,
+    /// Reusable scratch buffer for attrset builtins that assemble an output
+    /// `Vec<Attr>` (e.g. `mapAttrs`, `zipAttrsWith`) before handing it to
+    /// `new_bindings_value`. Taken via `mem::take` for the duration of a call
+    /// (so reentrancy just allocates a fresh buffer) and returned afterwards,
+    /// amortizing the allocation across calls. Never a GC root: the value
+    /// cells it references are separately rooted in `temp_roots`.
+    pub scratch_attrs: Vec<Attr>,
     pub positions: PosTable,
     pub syms: SpecialSyms,
     pub errors: Vec<EvalError>,
@@ -294,6 +301,7 @@ impl VM {
             perm_roots: Vec::new(),
             symbols,
             sym_string_cache: Vec::new(),
+            scratch_attrs: Vec::new(),
             positions,
             syms,
             errors: Vec::new(),

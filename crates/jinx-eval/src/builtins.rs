@@ -3834,10 +3834,21 @@ fn prim_map_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
         pos,
         "while evaluating the second argument passed to builtins.mapAttrs",
     )?;
-    let entries_in = attrs_entries(&val(args[1])).to_vec();
+    // Borrow the input payload directly instead of copying it. This is sound
+    // because the bindings object is rooted by `args[1]` for the whole call,
+    // the heap is non-moving, and bindings objects are never mutated in place
+    // — every producer (`new_bindings`, `new_bindings_merge`, `new_bindings_raw`,
+    // `immortal::bindings`) writes into a freshly-allocated object, and the loop
+    // below only creates thunks (no user code, no in-place attr writes). So the
+    // slice stays valid and unaliased across the allocating calls inside the
+    // loop, making the old defensive `.to_vec()` unnecessary. `attrs_entries`
+    // returns a slice with a free lifetime, so it does not borrow `vm`.
+    let entries_in: &[Attr] = attrs_entries(&val(args[1]));
     let scope = vm.temp_scope();
-    let mut entries: Vec<Attr> = Vec::with_capacity(entries_in.len());
-    for a in &entries_in {
+    let mut entries = std::mem::take(&mut vm.scratch_attrs);
+    entries.clear();
+    entries.reserve(entries_in.len());
+    for a in entries_in {
         let nc = vm.symbol_string(Symbol(a.sym));
         let t = vm.new_apply_thunk(args[0], &[nc, a.val]);
         let tc = temp_cell(vm, t);
@@ -3849,6 +3860,8 @@ fn prim_map_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
         });
     }
     let v = vm.new_bindings_value(&entries);
+    entries.clear();
+    vm.scratch_attrs = entries;
     vm.temp_end(scope);
     Ok(v)
 }
@@ -4147,9 +4160,13 @@ fn prim_zip_attrs_with(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
         pos,
         "while evaluating the second argument passed to builtins.zipAttrsWith",
     )?;
-    let lists = list_elems(&val(args[1])).to_vec();
+    // Borrow the list payload directly (no `.to_vec()`): it is rooted by
+    // `args[1]`, the heap is non-moving, and list objects are not mutated in
+    // place, so the slice stays valid across the `force_attrs` calls below.
+    // `list_elems` returns a free-lifetime slice, so it does not borrow `vm`.
+    let lists: &[VRef] = list_elems(&val(args[1]));
     let mut buckets: Vec<(u32, Vec<VRef>)> = Vec::new();
-    for el in &lists {
+    for el in lists {
         vm.force_attrs(
             *el,
             NO_POS,
@@ -4164,7 +4181,9 @@ fn prim_zip_attrs_with(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
     }
     buckets.sort_by_key(|(s, _)| *s);
     let scope = vm.temp_scope();
-    let mut entries: Vec<Attr> = Vec::with_capacity(buckets.len());
+    let mut entries = std::mem::take(&mut vm.scratch_attrs);
+    entries.clear();
+    entries.reserve(buckets.len());
     for (sym, vals) in &buckets {
         let nc = vm.symbol_string(Symbol(*sym));
         let lv = vm.new_list_value(vals);
@@ -4178,6 +4197,8 @@ fn prim_zip_attrs_with(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
         });
     }
     let v = vm.new_bindings_value(&entries);
+    entries.clear();
+    vm.scratch_attrs = entries;
     vm.temp_end(scope);
     Ok(v)
 }
