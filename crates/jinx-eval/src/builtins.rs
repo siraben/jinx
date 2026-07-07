@@ -4439,9 +4439,17 @@ fn value_ident_eq(a: VRef, b: VRef, depth: u32) -> bool {
         Tag::Attrs => {
             let ba = attrs_entries(&va);
             let bb = attrs_entries(&vb);
+            // `pos` must participate: `builtins.unsafeGetAttrPos` makes an
+            // attribute's source position observable, so two attrsets that
+            // agree on symbols+values but differ in positions are NOT
+            // interchangeable inside a filter closure. Omitting this let the
+            // filterSource memo reuse a cached path for a genuinely different
+            // filter (adversarial-review finding: filter-pos-cache).
             ba.len() == bb.len()
                 && ba.iter().zip(bb.iter()).all(|(x, y)| {
-                    x.sym == y.sym && value_ident_eq(x.val, y.val, depth + 1)
+                    x.sym == y.sym
+                        && x.pos == y.pos
+                        && value_ident_eq(x.val, y.val, depth + 1)
                 })
         }
         // Thunk / Blackhole / Failed / PrimOp / PrimOpApp: equal only if the
