@@ -375,14 +375,15 @@ impl Compiler {
         if n == 0 {
             return None;
         }
-        let has_getlocal = ops.iter().any(|o| matches!(o, Op::GetLocal(_)));
-        let has_getupval = ops.iter().any(|o| matches!(o, Op::GetUpval(_)));
         let analysis = analyze(chunk, prog);
 
         self.module.clear_context(&mut self.ctx);
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(I64)); // vm
         sig.params.push(AbiParam::new(I64)); // fi
+        sig.params.push(AbiParam::new(I64)); // &mut vm.stack
+        sig.params.push(AbiParam::new(I64)); // locals_base
+        sig.params.push(AbiParam::new(I64)); // upvals ptr
         sig.returns.push(AbiParam::new(I64));
         self.ctx.func.signature = sig.clone();
 
@@ -407,28 +408,19 @@ impl Compiler {
         builder.declare_var(base, I64);
         builder.declare_var(upv, I64);
 
-        // --- entry block: frame setup ---
+        // --- entry block: frame constants arrive as arguments (the caller
+        // `VM::run_jit` reserves stack capacity and passes stack address,
+        // locals base and upvalue pointer) — no helper calls here.
         builder.switch_to_block(entry);
         let vm = builder.block_params(entry)[0];
         let fi = builder.block_params(entry)[1];
         {
-            let mh = builder.ins().iconst(I64, chunk.max_height as i64);
-            let f = refs["jinx_setup"];
-            let c = builder.ins().call(f, &[vm, fi, mh]);
-            let saval = builder.inst_results(c)[0];
+            let saval = builder.block_params(entry)[2];
+            let basev = builder.block_params(entry)[3];
+            let upvv = builder.block_params(entry)[4];
             builder.def_var(sa, saval);
-        }
-        if has_getlocal {
-            let f = refs["jinx_base"];
-            let c = builder.ins().call(f, &[vm, fi]);
-            let v = builder.inst_results(c)[0];
-            builder.def_var(base, v);
-        }
-        if has_getupval {
-            let f = refs["jinx_upvals"];
-            let c = builder.ins().call(f, &[vm, fi]);
-            let v = builder.inst_results(c)[0];
-            builder.def_var(upv, v);
+            builder.def_var(base, basev);
+            builder.def_var(upv, upvv);
         }
         builder.ins().jump(op_blocks[0], &[]);
 
@@ -579,8 +571,30 @@ fn translate_op(
                 // Operand is a constant (already WHNF): forcing is a no-op.
                 return false;
             }
+            // Inline WHNF fast path (mirrors the interpreter's tag check):
+            // only Thunk (9) / Blackhole (13) / Failed (14) need the helper.
+            let len = tr.load_len();
+            let ea = tr.slot_off(len, -1);
+            let cell = tr.b.ins().load(I64, tr.flags, ea, 0);
+            let tag = tr.tag_of(cell);
+            let is_thunk = tr
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, tag, Tag::Thunk as i64);
+            let is_bh_failed = tr.b.ins().icmp_imm(
+                IntCC::UnsignedGreaterThanOrEqual,
+                tag,
+                Tag::Blackhole as i64,
+            );
+            let need = tr.b.ins().bor(is_thunk, is_bh_failed);
+            let slow = tr.b.create_block();
+            let nb = next();
+            tr.b.ins().brif(need, slow, &[], nb, &[]);
+            tr.b.switch_to_block(slow);
             let p = tr.iconst32(pos);
-            erroring!("jinx_force_top", &[tr.vm, p])
+            let st = tr.call("jinx_force_top", &[tr.vm, p]);
+            tr.err_check(st, err_block, nb);
+            true
         }
         Op::ForceBool(c) => {
             let p = tr.iconst32(pos);
@@ -606,8 +620,17 @@ fn translate_op(
         }
         Op::AllocCell => plain!("jinx_alloc_cell", &[tr.vm]),
         Op::StoreLocal(s) => {
-            let sl = tr.iconst32(s);
-            plain!("jinx_store_local", &[tr.vm, tr.fi, sl])
+            // Inline: pop cell c; dst = stack[base + s]; *dst = *c (16 bytes).
+            let c = tr.pop();
+            let basev = tr.b.use_var(tr.base);
+            let idx = tr.b.ins().iadd_imm(basev, s as i64);
+            let ea = tr.slot_addr(idx);
+            let dst = tr.b.ins().load(I64, tr.flags, ea, 0);
+            let w0 = tr.b.ins().load(I64, tr.flags, c, 0);
+            let w1 = tr.b.ins().load(I64, tr.flags, c, 8);
+            tr.b.ins().store(tr.flags, w0, dst, 0);
+            tr.b.ins().store(tr.flags, w1, dst, 8);
+            false
         }
         Op::MakeThunk(cid) => {
             let c = tr.iconst32(cid);

@@ -14,8 +14,13 @@
 
 use crate::chunk::CodeRef;
 
-/// Signature of a compiled chunk entry point.
-pub type JitEntry = extern "C" fn(*mut crate::vm::VM, u64) -> u64;
+/// Signature of a compiled chunk entry point:
+/// `(vm, fi, &mut vm.stack, locals_base, upvals_ptr) -> status`.
+/// The caller (`VM::run_jit`) pre-reserves `locals_base + max_height`
+/// operand-stack capacity and passes the frame constants directly, so the
+/// compiled prologue makes no helper calls.
+pub type JitEntry =
+    extern "C" fn(*mut crate::vm::VM, u64, *mut crate::stack::Stack, u64, u64) -> u64;
 
 /// High bit of a helper/entry return word: set means "error", low bits carry
 /// the `ErrId`. `VRef` pointers on aarch64/x86-64 userspace never set it.

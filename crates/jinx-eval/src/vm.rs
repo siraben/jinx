@@ -844,9 +844,21 @@ impl VM {
     }
 
     /// Invoke a compiled chunk entry for frame `fi` and decode its status word.
+    /// Performs the frame setup the compiled prologue used to do via helper
+    /// calls: reserve operand-stack capacity for all inline pushes, and pass
+    /// the stack address / locals base / upvalue pointer as arguments.
     #[inline]
-    fn run_jit(&mut self, entry: crate::jit::JitEntry, fi: usize) -> Result<VRef, ErrId> {
-        let r = entry(self as *mut VM, fi as u64);
+    fn run_jit(
+        &mut self,
+        entry: crate::jit::JitEntry,
+        fi: usize,
+        chunk: &'static Chunk,
+    ) -> Result<VRef, ErrId> {
+        let base = self.frames[fi].locals_base;
+        let upv = self.frames[fi].upvals().as_ptr() as u64;
+        self.stack.reserve_to(base + chunk.max_height as usize);
+        let sa = (&mut self.stack) as *mut crate::stack::Stack;
+        let r = entry(self as *mut VM, fi as u64, sa, base as u64, upv);
         if r & crate::jit::ERR_FLAG != 0 {
             Err((r & 0xffff_ffff) as ErrId)
         } else {
@@ -861,7 +873,7 @@ impl VM {
         if self.jit.is_some() {
             let code = self.frames[fi].code;
             if let Some(entry) = self.jit_dispatch(code) {
-                return self.run_jit(entry, fi);
+                return self.run_jit(entry, fi, chunk);
             }
         }
         // Frame constants, hoisted out of the dispatch loop: the program is
