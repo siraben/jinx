@@ -4935,6 +4935,17 @@ fn prim_read_file_type(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
 
 fn parse_hash_algo(vm: &mut VM, s: &[u8], pos: PosIdx) -> Result<HashAlgorithm, ErrId> {
     let name = String::from_utf8_lossy(s).into_owned();
+    // `blake3` is a recognized algorithm gated behind the `blake3-hashes`
+    // experimental feature: C++ reports the feature-disabled *eval* error
+    // (not the unknown-algorithm usage error) when it's off.
+    if name == "blake3" && !vm.experimental.blake3_hashes {
+        return Err(vm.new_err(
+            ErrKind::Eval,
+            "experimental Nix feature 'blake3-hashes' is disabled; add \
+             '--extra-experimental-features blake3-hashes' to enable it",
+            pos,
+        ));
+    }
     HashAlgorithm::parse_opt(&name).ok_or_else(|| {
         vm.new_err(
             ErrKind::Usage,
