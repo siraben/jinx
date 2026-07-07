@@ -317,7 +317,11 @@ impl VM {
             call_flake_fn: None,
             fetch_tree_final_fn: None,
             jit: None,
-            jit_threshold: 1000,
+            // Only hand hot chunks to the JIT: a higher trip count avoids
+            // compiling chunks that never dominate runtime, cutting Cranelift
+            // compile overhead. Measured faster on real nixpkgs evals
+            // (firefox ~6%, hello ~2%) while fib stays >1.5x vs jit-off.
+            jit_threshold: 4000,
         }
     }
 
