@@ -197,6 +197,17 @@ pub struct VM {
     /// threads `pos` into `callFunction` for `tApp` values; jinx's synthetic
     /// apply thunks (no call pos of their own) recover it from here.
     pub force_pos: PosIdx,
+    /// Virtual-store redirects: maps a computed store-path prefix (e.g.
+    /// `/nix/store/<hash>-source`) to the real on-disk directory the flake
+    /// tree was fetched from. Because jinx computes store paths read-only
+    /// (never writing to the store), filesystem access under a redirected
+    /// prefix is served from the real directory instead. This stands in for
+    /// C++ Nix's lazy trees / a realised store path.
+    pub store_redirects: Vec<(Vec<u8>, std::path::PathBuf)>,
+    /// Cached compiled `call-flake.nix` lambda (flake bootstrap).
+    pub call_flake_fn: Option<VRef>,
+    /// Cached `fetchFinalTree` internal primop cell.
+    pub fetch_tree_final_fn: Option<VRef>,
 }
 
 /// RAII guard for `temp_roots`.
@@ -239,7 +250,44 @@ impl VM {
             drv_hashes: jinx_store::derivation::DrvHashes::default(),
             built_drvs: FxHashMap::default(),
             apply_prog: None,
+            store_redirects: Vec::new(),
+            call_flake_fn: None,
+            fetch_tree_final_fn: None,
         }
+    }
+
+    /// Register a virtual-store redirect: filesystem access under `store_prefix`
+    /// (an absolute store path) is served from `real_dir`.
+    pub fn add_store_redirect(&mut self, store_prefix: Vec<u8>, real_dir: std::path::PathBuf) {
+        self.store_redirects.push((store_prefix, real_dir));
+    }
+
+    /// Translate a logical path to a real on-disk path, applying any registered
+    /// store redirect whose prefix matches. Returns the input unchanged when no
+    /// redirect applies. Port of the effect of a realised/lazy store tree.
+    pub fn redirect_fs(&self, logical: &std::path::Path) -> std::path::PathBuf {
+        if self.store_redirects.is_empty() {
+            return logical.to_path_buf();
+        }
+        let bytes = logical.to_string_lossy();
+        let bytes = bytes.as_bytes();
+        for (prefix, real) in &self.store_redirects {
+            if bytes.len() >= prefix.len() && &bytes[..prefix.len()] == prefix.as_slice() {
+                let rest = &bytes[prefix.len()..];
+                // Only redirect exact matches or `<prefix>/...` sub-paths.
+                if rest.is_empty() {
+                    return real.clone();
+                }
+                if rest[0] == b'/' {
+                    let mut out = real.clone();
+                    out.push(std::path::Path::new(
+                        std::str::from_utf8(&rest[1..]).unwrap_or(""),
+                    ));
+                    return out;
+                }
+            }
+        }
+        logical.to_path_buf()
     }
 
     // ---------------- GC ----------------

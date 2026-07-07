@@ -519,6 +519,8 @@ name = "jinx-eval"
 version = "0.1.0"
 dependencies = [
  "bstr",
+ "jinx-fetch",
+ "jinx-flake",
  "jinx-store",
  "jinx-syntax",
  "libc",

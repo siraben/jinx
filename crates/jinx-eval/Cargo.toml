@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 jinx-syntax.workspace = true
 jinx-store.workspace = true
+jinx-fetch.workspace = true
+jinx-flake.workspace = true
 bstr.workspace = true
 rustc-hash.workspace = true
 sha2.workspace = true

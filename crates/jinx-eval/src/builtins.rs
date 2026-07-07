@@ -93,9 +93,6 @@ const UNIMPLEMENTED: &[(&str, u8)] = &[
     ("__forceLazyFetcherAttr", 1),
     ("__importNative", 2),
     ("__outputOf", 2),
-    // flakes (experimental): present in `builtins` so failures are clearly
-    // "not implemented" rather than "attribute missing".
-    ("getFlake", 1),
 ];
 
 pub fn register_globals(vm: &mut VM) {
@@ -199,6 +196,7 @@ pub fn register_globals(vm: &mut VM) {
         Reg { name: "__toXML", arity: 1, func: prim_to_xml },
         Reg { name: "__path", arity: 1, func: prim_path },
         Reg { name: "__toFile", arity: 2, func: prim_to_file },
+        Reg { name: "getFlake", arity: 1, func: prim_get_flake },
         Reg { name: "parseFlakeRef", arity: 1, func: prim_parse_flake_ref },
         Reg { name: "flakeRefToString", arity: 1, func: prim_flake_ref_to_string },
         Reg { name: "__getContext", arity: 1, func: prim_get_context },
@@ -2024,7 +2022,9 @@ fn prim_path(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) ->
     } else {
         // No expected hash: hash the (unfiltered) path content.
         use std::os::unix::ffi::OsStrExt;
-        let os = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
+        let logical = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
+        let os_buf = vm.redirect_fs(logical);
+        let os = os_buf.as_path();
         let algo = HashAlgorithm::Sha256;
         let hash = match method {
             FileIngestionMethod::Flat => {
@@ -2266,6 +2266,20 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+fn prim_get_flake(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    if !vm.experimental.flakes {
+        return Err(flakes_disabled(vm, pos));
+    }
+    let s = vm.force_string_no_ctx(
+        args[0],
+        pos,
+        "while evaluating the argument passed to builtins.getFlake",
+    )?;
+    let flakeref = String::from_utf8_lossy(&s).into_owned();
+    let cell = crate::flake::get_flake(vm, &flakeref, pos)?;
+    Ok(val(cell))
 }
 
 fn prim_parse_flake_ref(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
@@ -4406,7 +4420,8 @@ fn prim_path_exists(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: Pos
     }
     let dir_required = matches!(raw.split(|&b| b == b'/').next_back(), Some(b"") | Some(b"."));
     let canon = canon_path(&raw);
-    let path = PathBuf::from(String::from_utf8_lossy(&canon).into_owned());
+    let logical = PathBuf::from(String::from_utf8_lossy(&canon).into_owned());
+    let path = vm.redirect_fs(&logical);
     let exists = path.symlink_metadata().is_ok();
     let ok = if dir_required {
         path.metadata().map(|m| m.is_dir()).unwrap_or(false)
@@ -4424,7 +4439,8 @@ fn prim_read_file(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
         "while evaluating the first argument passed to builtins.readFile",
     )?;
     let path = String::from_utf8_lossy(&p).into_owned();
-    match std::fs::read(&path) {
+    let real = vm.redirect_fs(Path::new(&path));
+    match std::fs::read(&real) {
         Ok(bytes) => Ok(mk_string(vm, &bytes)),
         Err(err) => {
             let msg = format!("reading file '{}': {}", path, io_msg(&err));
@@ -4456,7 +4472,11 @@ fn prim_read_dir(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx
         pos,
         "while evaluating the first argument passed to builtins.readDir",
     )?;
-    let path = String::from_utf8_lossy(&p).into_owned();
+    let logical = String::from_utf8_lossy(&p).into_owned();
+    let path = vm
+        .redirect_fs(Path::new(&logical))
+        .to_string_lossy()
+        .into_owned();
     // Mirror C++ `realisePath` + `readDirectory`: a missing path yields
     // "path '%s' does not exist"; a non-directory yields "'%s' is not a
     // directory" (ENOTDIR from opendir on the symlink-resolved path).
@@ -4516,13 +4536,14 @@ fn prim_read_file_type(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
         pos,
         "while evaluating the first argument passed to builtins.readFileType",
     )?;
-    let path = PathBuf::from(String::from_utf8_lossy(&p).into_owned());
+    let logical = PathBuf::from(String::from_utf8_lossy(&p).into_owned());
+    let path = vm.redirect_fs(&logical);
     match path.symlink_metadata() {
         Ok(m) => Ok(mk_string(vm, file_type_str(&m).as_bytes())),
         Err(err) => {
             let msg = format!(
                 "getting status of '{}': {}",
-                path.display(),
+                logical.display(),
                 io_msg(&err)
             );
             Err(vm.new_err(ErrKind::Eval, msg, pos))
@@ -4575,7 +4596,8 @@ fn prim_hash_file(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
         "while evaluating the second argument passed to builtins.hashFile",
     )?;
     let path = String::from_utf8_lossy(&p).into_owned();
-    let bytes = std::fs::read(&path).map_err(|err| {
+    let real = vm.redirect_fs(Path::new(&path));
+    let bytes = std::fs::read(&real).map_err(|err| {
         let msg = if err.kind() == std::io::ErrorKind::NotFound {
             format!("path '{path}' does not exist")
         } else {
@@ -4698,7 +4720,7 @@ pub fn eval_file_traced(
     pos: PosIdx,
     add_trace: bool,
 ) -> Result<VRef, ErrId> {
-    let resolved = resolve_expr_path(path);
+    let resolved = resolve_expr_path_vm(vm, path);
     if let Some((_, cell)) = vm
         .file_cache
         .iter()
@@ -4766,7 +4788,8 @@ fn read_source(vm: &mut VM, resolved: &Path, pos: PosIdx) -> Result<Vec<u8>, Err
     if let Some(src) = corepkgs_source(resolved) {
         return Ok(src.to_vec());
     }
-    std::fs::read(resolved).map_err(|err| {
+    let real = vm.redirect_fs(resolved);
+    std::fs::read(&real).map_err(|err| {
         vm.new_err(
             ErrKind::Eval,
             format!("opening file '{}': {}", resolved.display(), io_msg(&err)),
@@ -4779,17 +4802,23 @@ fn read_source(vm: &mut VM, resolved: &Path, pos: PosIdx) -> Result<Vec<u8>, Err
 /// symlink (rebasing relative targets against the LOGICAL parent, so
 /// relative imports resolve through symlinks the way C++ does), then append
 /// default.nix for directories. Ancestor symlinks are left in the path.
-fn resolve_expr_path(path: &Path) -> PathBuf {
+///
+/// All filesystem probes go through the VM's virtual-store redirect, so imports
+/// of a computed flake store path are served from the real fetched tree. The
+/// returned path stays *logical* (store-path form): symlink targets are rebased
+/// onto the logical parent and the on-disk directory check redirects the probe.
+fn resolve_expr_path_vm(vm: &VM, path: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
     if p.to_str() == Some("/__corepkgs__/fetchurl.nix") {
         return p;
     }
     for _ in 0..1024 {
-        let Ok(md) = p.symlink_metadata() else { break };
+        let real = vm.redirect_fs(&p);
+        let Ok(md) = real.symlink_metadata() else { break };
         if !md.file_type().is_symlink() {
             break;
         }
-        let Ok(target) = std::fs::read_link(&p) else { break };
+        let Ok(target) = std::fs::read_link(&real) else { break };
         p = if target.is_absolute() {
             target
         } else {
@@ -4799,7 +4828,7 @@ fn resolve_expr_path(path: &Path) -> PathBuf {
             )).into_owned())
         };
     }
-    if p.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+    if vm.redirect_fs(&p).metadata().map(|m| m.is_dir()).unwrap_or(false) {
         p.join("default.nix")
     } else {
         p
@@ -4921,7 +4950,7 @@ fn prim_scoped_import(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: P
         "while evaluating the second argument passed to builtins.scopedImport",
     )?;
     let path = PathBuf::from(String::from_utf8_lossy(&p).into_owned());
-    let resolved = resolve_expr_path(&path);
+    let resolved = resolve_expr_path_vm(vm, &path);
     let source = read_source(vm, &resolved, pos)?;
     let scope = attrs_entries(&val(args[0])).to_vec();
     // Scope cells become compile-time constants of a leaked program; they

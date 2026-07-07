@@ -5,6 +5,7 @@ pub mod chunk;
 pub mod compile;
 pub mod context;
 pub mod error;
+pub mod flake;
 pub mod heap;
 pub mod immortal;
 pub mod json;
