@@ -752,44 +752,45 @@ impl<'a> Compiler<'a> {
             self.compile_expr(def);
             self.patch_jump(jend);
         } else {
+            // Full selection-path text (C++ `showAttrSelectionPath`), shared by
+            // every navigation op so that an error at any component reports the
+            // whole path (e.g. `puppy."${key}"`).
+            let text = self.attr_path_text(&attrpath);
+            self.prog.texts.push(text);
+            let t = (self.prog.texts.len() - 1) as u32;
             for an in &attrpath {
                 if let Some(de) = an.expr {
                     // The dynamic name is forced at its own position (C++
                     // `getName` uses `name.expr->getPos()`).
                     let dpos = self.expr_pos(de);
                     self.compile_expr(de);
-                    self.emit(Op::SelectDyn, dpos);
+                    self.emit(Op::SelectDyn(t), dpos);
                     self.bump(-1);
                 } else {
                     self.emit(Op::Select(an.symbol.0), pos);
                 }
             }
-            match self.static_attr_path_text(&attrpath) {
-                Some(text) => {
-                    self.prog.texts.push(text);
-                    let t = (self.prog.texts.len() - 1) as u32;
-                    self.emit(Op::SelectForce(t), pos);
-                }
-                // Paths with dynamic components: no attribute frame for now.
-                None => self.emit(Op::Force, pos),
-            }
+            self.emit(Op::SelectForce(t), pos);
         }
     }
 
-    /// The `showAttrSelectionPath` string for an all-static attr path
-    /// (dotted symbol names). Returns `None` if any component is dynamic.
-    fn static_attr_path_text(&self, attrpath: &[AttrName]) -> Option<Vec<u8>> {
+    /// The `showAttrSelectionPath` string for an attr path: raw symbol names for
+    /// static components, `"${<expr>}"` for dynamic ones (matching C++).
+    fn attr_path_text(&self, attrpath: &[AttrName]) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
         for (i, an) in attrpath.iter().enumerate() {
-            if an.expr.is_some() {
-                return None;
-            }
             if i > 0 {
                 out.push(b'.');
             }
-            out.extend_from_slice(self.symbols.resolve(an.symbol));
+            if let Some(de) = an.expr {
+                out.extend_from_slice(b"\"${");
+                out.extend_from_slice(&jinx_syntax::show::show(self.exprs, self.symbols, de));
+                out.extend_from_slice(b"}\"");
+            } else {
+                out.extend_from_slice(self.symbols.resolve(an.symbol));
+            }
         }
-        Some(out)
+        out
     }
 
     fn emit_jump_sel(&mut self, sym: Symbol, pos: PosIdx) -> usize {

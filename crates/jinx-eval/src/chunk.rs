@@ -100,8 +100,12 @@ pub enum Op {
     SelectForce(u32),
     /// Like Select but on missing/non-attrs pop and jump to `target`.
     SelectOr { sym: u32, target: u32 },
-    /// Stack: [v, name] -> [v.<name>]; dynamic component.
-    SelectDyn,
+    /// Stack: [v, name] -> [v.<name>]; dynamic component. Operand = `texts`
+    /// index of the full selection-path string (or u32::MAX for none): on any
+    /// navigation error, a "while evaluating the attribute '<path>'" frame is
+    /// added at the last-selected attribute's position, matching C++
+    /// `ExprSelect::eval`'s catch.
+    SelectDyn(u32),
     SelectDynOr { target: u32 },
     /// `e ? path` test; operand = haspath_descs index. Dynamic components
     /// have been pushed (in path order) above the subject value.

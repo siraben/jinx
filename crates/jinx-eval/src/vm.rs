@@ -881,23 +881,47 @@ impl VM {
                         }
                     }
                 }
-                Op::SelectDyn => {
+                Op::SelectDyn(t) => {
+                    // Position of the last successfully selected attribute
+                    // (C++ `pos2`); the "while evaluating the attribute" frame
+                    // is attached here on any navigation error, before this op
+                    // updates it on success.
+                    let sp = self.last_select_pos;
+                    let dyn_pos = pos!();
                     let name = self.stack.pop().unwrap();
-                    let nb = self.force_string_no_ctx(
-                        name,
-                        pos!(),
-                        "while evaluating an attribute name",
-                    )?;
-                    let sym = self.symbols.create(&nb);
-                    let c = *self.stack.last().unwrap();
-                    self.force_attrs(c, pos!(), "while selecting an attribute")?;
-                    let v = val(c);
-                    match attrs_get(&v, sym) {
-                        Some(a) => {
-                            self.last_select_pos = PosIdx(a.pos);
-                            *self.stack.last_mut().unwrap() = a.val
+                    let step = |vm: &mut Self| -> Result<(), ErrId> {
+                        let nb = vm.force_string_no_ctx(
+                            name,
+                            dyn_pos,
+                            "while evaluating an attribute name",
+                        )?;
+                        let sym = vm.symbols.create(&nb);
+                        let c = *vm.stack.last().unwrap();
+                        vm.force_attrs(c, dyn_pos, "while selecting an attribute")?;
+                        let v = val(c);
+                        match attrs_get(&v, sym) {
+                            Some(a) => {
+                                vm.last_select_pos = PosIdx(a.pos);
+                                *vm.stack.last_mut().unwrap() = a.val;
+                                Ok(())
+                            }
+                            None => Err(vm.missing_attr_err(&v, sym, dyn_pos)),
                         }
-                        None => return Err(self.missing_attr_err(&v, sym, pos!())),
+                    };
+                    if let Err(e) = step(self) {
+                        if t != u32::MAX && sp.is_set() && !self.pos_is_derivation_internal(sp) {
+                            let text =
+                                self.frames[fi].code.prog().texts[t as usize].clone();
+                            self.add_trace(
+                                e,
+                                sp,
+                                format!(
+                                    "while evaluating the attribute '{}'",
+                                    String::from_utf8_lossy(&text)
+                                ),
+                            );
+                        }
+                        return Err(e);
                     }
                 }
                 Op::SelectDynOr { target } => {
