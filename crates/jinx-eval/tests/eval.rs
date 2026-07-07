@@ -90,6 +90,97 @@ fn strings_paths_concat() {
     ok(r#"toString { __toString = self: 5; }"#, r#""5""#);
 }
 
+/// `builtins.concatStringsSep` must coerce path elements with C++
+/// `coerceToString`'s default `copyToStore = true`: a path (e.g. `./ldexpl.c`)
+/// is copied to the store and rendered as its `/nix/store/...` path, not the
+/// raw source path. This governs the NixOS minimal-bootstrap `mes-libc` builder
+/// (`firstLibc = ... ++ [ ./ldexpl.c ]`); getting it wrong diverges the whole
+/// cross-system Linux stdenv from the C++ reference.
+#[test]
+fn concat_strings_sep_copies_path_to_store() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("jinx_cssep_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("ldexpl.c");
+    std::fs::File::create(&file)
+        .unwrap()
+        .write_all(b"int ldexpl(void){return 0;}\n")
+        .unwrap();
+    let abs = file.to_string_lossy().into_owned();
+
+    let out = eval(&format!(r#"builtins.concatStringsSep " " [ "a" {abs} ]"#))
+        .expect("concatStringsSep with a path element");
+    // The path is copied to the store: rendered as /nix/store/<hash>-ldexpl.c,
+    // never the raw temp path.
+    assert!(
+        out.starts_with(r#""a /nix/store/"#) && out.ends_with(r#"-ldexpl.c""#),
+        "expected store path, got {out}"
+    );
+    assert!(
+        !out.contains(abs.as_str()),
+        "raw source path leaked into result: {out}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Create a temp file with the given contents and return its absolute path as a
+/// bare (unquoted) Nix path literal. Used by the coerceToString-flag tests to
+/// feed a real path through builtins that copy it to the store.
+fn temp_path(tag: &str, contents: &[u8]) -> (std::path::PathBuf, String) {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("jinx_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("f.txt");
+    std::fs::File::create(&file).unwrap().write_all(contents).unwrap();
+    let abs = file.to_string_lossy().into_owned();
+    (dir, abs)
+}
+
+/// `builtins.stringLength`, `builtins.substring`, `builtins.abort`,
+/// `builtins.throw`, and the `unsafeDiscard*` builtins all inherit C++
+/// `coerceToString`'s default `copyToStore = true`. A path argument must be
+/// copied to the store and rendered as its `/nix/store/<hash>-f.txt` path, not
+/// the raw source path. Oracle-verified (`nix-instantiate --eval`).
+#[test]
+fn string_builtins_copy_path_to_store() {
+    let (dir, abs) = temp_path("strb", b"hello contents\n");
+    let store_len = "/nix/store/0123456789abcdefghijklmnopqrstuv-f.txt".len(); // 48
+
+    // stringLength counts the store path, not the raw temp path.
+    let out = eval(&format!("builtins.stringLength {abs}")).expect("stringLength(path)");
+    assert_eq!(out, store_len.to_string(), "stringLength should count store path");
+
+    // substring over the whole string yields the store path.
+    let out = eval(&format!("builtins.substring 0 200 {abs}")).expect("substring(path)");
+    assert!(
+        out.starts_with(r#""/nix/store/"#) && out.ends_with(r#"-f.txt""#) && !out.contains(abs.as_str()),
+        "substring should render the store path, got {out}"
+    );
+
+    // unsafeDiscardStringContext coerces (copying to store) then drops context.
+    let out = eval(&format!("builtins.unsafeDiscardStringContext {abs}"))
+        .expect("unsafeDiscardStringContext(path)");
+    assert!(
+        out.starts_with(r#""/nix/store/"#) && out.ends_with(r#"-f.txt""#) && !out.contains(abs.as_str()),
+        "unsafeDiscardStringContext should render the store path, got {out}"
+    );
+
+    // abort / throw embed the coerced store path in their error message.
+    let e = eval(&format!("builtins.abort {abs}")).expect_err("abort(path)");
+    assert!(
+        e.contains("/nix/store/") && e.contains("-f.txt") && !e.contains(abs.as_str()),
+        "abort message should contain the store path, got {e}"
+    );
+    let e = eval(&format!("builtins.throw {abs}")).expect_err("throw(path)");
+    assert!(
+        e.contains("/nix/store/") && e.contains("-f.txt") && !e.contains(abs.as_str()),
+        "throw message should contain the store path, got {e}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn scoping_let_rec_with() {
     ok("let x = 1; y = x + 1; in x + y", "3");

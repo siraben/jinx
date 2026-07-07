@@ -471,8 +471,10 @@ fn prim_abort(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -
         args[0],
         pos,
         "while evaluating the error message passed to builtins.abort",
+        // C++ `coerceToString` default copyToStore=true: a path argument is
+        // copied to the store and the store path appears in the message.
         false,
-        false,
+        true,
         true,
     )?;
     let msg = format!(
@@ -487,8 +489,10 @@ fn prim_throw(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -
         args[0],
         pos,
         "while evaluating the error message passed to builtins.throw",
+        // C++ `coerceToString` default copyToStore=true: a path argument is
+        // copied to the store and the store path appears in the message.
         false,
-        false,
+        true,
         true,
     )?;
     Err(vm.new_err(ErrKind::Thrown, s, pos))
@@ -849,8 +853,10 @@ fn prim_string_length(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: P
         args[0],
         pos,
         "while evaluating the argument passed to builtins.stringLength",
+        // C++ `coerceToString` default copyToStore=true: a path is copied to
+        // the store, so the length counts the /nix/store/... path.
         false,
-        false,
+        true,
         true,
     )?;
     Ok(Value::int(s.len() as i64))
@@ -883,8 +889,10 @@ fn prim_substring(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
         args[2],
         pos,
         "while evaluating the third argument (the string) passed to builtins.substring",
+        // C++ `coerceToString` default copyToStore=true: a path is copied to
+        // the store and substring operates on the /nix/store/... path.
         false,
-        false,
+        true,
         true,
     )?;
     let start = start as usize;
@@ -923,8 +931,11 @@ fn prim_concat_strings_sep(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], p
             el,
             pos,
             "while evaluating one element of the list of strings to concat passed to builtins.concatStringsSep",
+            // C++ `coerceToString` defaults: coerceMore=false, copyToStore=true,
+            // canonicalizePath=true. A path element (e.g. `./ldexpl.c`) is copied
+            // to the store and contributes string context, not stringified raw.
             false,
-            false,
+            true,
             true,
         )?;
         out.extend_from_slice(&part);
@@ -1043,8 +1054,10 @@ fn prim_discard_context(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
         args[0],
         pos,
         "while evaluating the argument passed to builtins.unsafeDiscardStringContext",
+        // C++ `coerceToString` default copyToStore=true: a path is copied to
+        // the store before its context is discarded.
         false,
-        false,
+        true,
         true,
     )?;
     Ok(mk_string(vm, &s))
@@ -1257,8 +1270,9 @@ fn prim_discard_output_dependency(
         args[0],
         pos,
         "while evaluating the argument passed to builtins.unsafeDiscardOutputDependency",
+        // C++ `coerceToString` default copyToStore=true.
         false,
-        false,
+        true,
         true,
     )?;
     let mut out: Vec<u32> = Vec::with_capacity(ids.len());
@@ -1284,8 +1298,9 @@ fn prim_add_drv_output_dependencies(
         args[0],
         pos,
         "while evaluating the argument passed to builtins.addDrvOutputDependencies",
+        // C++ `coerceToString` default copyToStore=true.
         false,
-        false,
+        true,
         true,
     )?;
     if ids.len() != 1 {
