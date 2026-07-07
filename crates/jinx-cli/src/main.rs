@@ -50,6 +50,13 @@ fn configure_jit(vm: &mut VM, flag: Option<bool>) {
     #[cfg(feature = "jit")]
     {
         vm.jit = Some(jinx_jit::new_compiler());
+        // Background compilation is ON by default when the JIT is active: hot
+        // chunks are compiled on a worker thread (own Cranelift module) while
+        // the eval thread keeps interpreting, keeping compile cost off the
+        // critical path. `JINX_JIT_BG=0` forces synchronous in-thread compile.
+        if std::env::var_os("JINX_JIT_BG").map(|v| v == "0") != Some(true) {
+            vm.jit_bg = Some(jinx_jit::spawn_bg_compiler());
+        }
     }
 }
 

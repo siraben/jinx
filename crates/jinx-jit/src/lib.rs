@@ -15,6 +15,33 @@ pub fn new_compiler() -> Box<dyn JitHook> {
     Box::new(Compiler::new())
 }
 
+/// perf-jit experiment: spawn a background compile worker owning its own
+/// Cranelift module. Receives `&'static CodeRef` addresses (as usize, since
+/// raw-pointer-bearing types aren't Send) and publishes compiled entry
+/// points into `chunk.jit.entry` with Release ordering; the eval thread
+/// keeps interpreting until it observes the entry (Acquire).
+pub fn spawn_bg_compiler() -> std::sync::mpsc::Sender<usize> {
+    let (tx, rx) = std::sync::mpsc::channel::<usize>();
+    std::thread::spawn(move || {
+        let mut c = Compiler::new();
+        while let Ok(addr) = rx.recv() {
+            // SAFETY: addresses are leaked immortal CodeRefs sent by the VM.
+            let code: &'static jinx_eval::chunk::CodeRef =
+                unsafe { &*(addr as *const jinx_eval::chunk::CodeRef) };
+            let chunk = code.chunk();
+            let entry = match JitHook::compile(&mut c, code) {
+                Some(p) => p as *mut (),
+                None => jinx_eval::chunk::JIT_UNCOMPILABLE,
+            };
+            chunk
+                .jit
+                .entry
+                .store(entry, std::sync::atomic::Ordering::Release);
+        }
+    });
+    tx
+}
+
 #[cfg(test)]
 mod smoke {
     use cranelift_codegen::ir::{types, AbiParam, InstBuilder};

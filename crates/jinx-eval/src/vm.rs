@@ -260,6 +260,10 @@ pub struct VM {
     /// Cranelift JIT backend (installed by the CLI when `--jit=on`). `None`
     /// disables tiering entirely (pure interpreter).
     pub jit: Option<Box<dyn crate::jit::JitHook>>,
+    /// Background compile queue (perf-jit experiment): when set, hot chunks
+    /// are sent to a worker thread (as `&'static CodeRef` addresses) instead
+    /// of being compiled synchronously on the eval thread.
+    pub jit_bg: Option<std::sync::mpsc::Sender<usize>>,
     /// Invocation count at which a chunk is handed to the JIT (0 = every
     /// chunk on first run; overridable via `JINX_JIT_THRESHOLD`).
     pub jit_threshold: u32,
@@ -317,6 +321,7 @@ impl VM {
             call_flake_fn: None,
             fetch_tree_final_fn: None,
             jit: None,
+            jit_bg: None,
             // Only hand hot chunks to the JIT: a higher trip count avoids
             // compiling chunks that never dominate runtime, cutting Cranelift
             // compile overhead. Measured faster on real nixpkgs evals
@@ -812,17 +817,29 @@ impl VM {
     /// threshold. Returns the native entry point if the chunk is (now)
     /// compiled, else `None` (interpret).
     fn jit_dispatch(&mut self, code: &'static CodeRef) -> Option<crate::jit::JitEntry> {
+        use std::sync::atomic::Ordering;
         let chunk = code.chunk();
-        if let Some(e) = chunk.jit.compiled_entry() {
+        let e = chunk.jit.entry.load(Ordering::Acquire);
+        if !(e == crate::chunk::JIT_NONE
+            || e == crate::chunk::JIT_UNCOMPILABLE
+            || e == crate::chunk::JIT_QUEUED)
+        {
             // SAFETY: only real entry pointers are stored (not the sentinels).
-            return Some(unsafe { std::mem::transmute::<*const (), crate::jit::JitEntry>(e) });
+            return Some(unsafe { std::mem::transmute::<*mut (), crate::jit::JitEntry>(e) });
         }
-        if chunk.jit.entry.get() == crate::chunk::JIT_UNCOMPILABLE {
+        if e == crate::chunk::JIT_UNCOMPILABLE || e == crate::chunk::JIT_QUEUED {
             return None;
         }
         let n = chunk.jit.counter.get().wrapping_add(1);
         chunk.jit.counter.set(n);
         if (n as u64) <= self.jit_threshold as u64 {
+            return None;
+        }
+        // Background tier: enqueue and keep interpreting until the compiled
+        // entry is published by the worker.
+        if let Some(tx) = &self.jit_bg {
+            chunk.jit.entry.store(crate::chunk::JIT_QUEUED, Ordering::Relaxed);
+            let _ = tx.send(code as *const CodeRef as usize);
             return None;
         }
         // Take the hook out to satisfy the borrow checker (it borrows nothing
@@ -832,12 +849,15 @@ impl VM {
         self.jit = hook;
         match res {
             Some(entry) => {
-                chunk.jit.entry.set(entry);
+                chunk.jit.entry.store(entry as *mut (), Ordering::Release);
                 // SAFETY: the backend returns a valid entry pointer.
                 Some(unsafe { std::mem::transmute::<*const (), crate::jit::JitEntry>(entry) })
             }
             None => {
-                chunk.jit.entry.set(crate::chunk::JIT_UNCOMPILABLE);
+                chunk
+                    .jit
+                    .entry
+                    .store(crate::chunk::JIT_UNCOMPILABLE, Ordering::Release);
                 None
             }
         }

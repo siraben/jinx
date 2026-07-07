@@ -193,20 +193,25 @@ pub struct JitState {
     /// threshold.
     pub counter: std::cell::Cell<u32>,
     /// `JIT_NONE` (not yet compiled), `JIT_UNCOMPILABLE` (attempted and
-    /// rejected — always interpret), or a real `extern "C"` entry pointer.
-    pub entry: std::cell::Cell<*const ()>,
+    /// rejected — always interpret), `JIT_QUEUED` (sent to the background
+    /// compiler), or a real `extern "C"` entry pointer. Atomic so a
+    /// background compile thread can publish entries (Release) that the
+    /// evaluation thread observes (Acquire).
+    pub entry: std::sync::atomic::AtomicPtr<()>,
 }
 
 /// `entry` sentinel: never attempted.
-pub const JIT_NONE: *const () = std::ptr::null();
+pub const JIT_NONE: *mut () = std::ptr::null_mut();
 /// `entry` sentinel: attempted, contains an op we don't lower — interpret.
-pub const JIT_UNCOMPILABLE: *const () = 1usize as *const ();
+pub const JIT_UNCOMPILABLE: *mut () = 1usize as *mut ();
+/// `entry` sentinel: queued for the background compiler; interpret meanwhile.
+pub const JIT_QUEUED: *mut () = 2usize as *mut ();
 
 impl Default for JitState {
     fn default() -> Self {
         JitState {
             counter: std::cell::Cell::new(0),
-            entry: std::cell::Cell::new(JIT_NONE),
+            entry: std::sync::atomic::AtomicPtr::new(JIT_NONE),
         }
     }
 }
@@ -214,11 +219,11 @@ impl Default for JitState {
 impl JitState {
     #[inline]
     pub fn compiled_entry(&self) -> Option<*const ()> {
-        let e = self.entry.get();
-        if e == JIT_NONE || e == JIT_UNCOMPILABLE {
+        let e = self.entry.load(std::sync::atomic::Ordering::Acquire);
+        if e == JIT_NONE || e == JIT_UNCOMPILABLE || e == JIT_QUEUED {
             None
         } else {
-            Some(e)
+            Some(e as *const ())
         }
     }
 }
