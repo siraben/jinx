@@ -8,6 +8,7 @@ pub mod error;
 pub mod flake;
 pub mod heap;
 pub mod immortal;
+pub mod jit;
 pub mod json;
 pub mod mem;
 pub mod print;

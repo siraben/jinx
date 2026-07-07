@@ -229,6 +229,12 @@ pub struct VM {
     pub call_flake_fn: Option<VRef>,
     /// Cached `fetchFinalTree` internal primop cell.
     pub fetch_tree_final_fn: Option<VRef>,
+    /// Cranelift JIT backend (installed by the CLI when `--jit=on`). `None`
+    /// disables tiering entirely (pure interpreter).
+    pub jit: Option<Box<dyn crate::jit::JitHook>>,
+    /// Invocation count at which a chunk is handed to the JIT (0 = every
+    /// chunk on first run; overridable via `JINX_JIT_THRESHOLD`).
+    pub jit_threshold: u32,
 }
 
 /// RAII guard for `temp_roots`.
@@ -277,6 +283,8 @@ impl VM {
             store_redirects: Vec::new(),
             call_flake_fn: None,
             fetch_tree_final_fn: None,
+            jit: None,
+            jit_threshold: 1000,
         }
     }
 
@@ -744,9 +752,61 @@ impl VM {
         Ok(self.alloc_cell(v))
     }
 
+    /// Decide whether frame `fi`'s chunk should run JIT-compiled code,
+    /// compiling it on demand once its invocation counter passes the
+    /// threshold. Returns the native entry point if the chunk is (now)
+    /// compiled, else `None` (interpret).
+    fn jit_dispatch(&mut self, chunk: &'static Chunk) -> Option<crate::jit::JitEntry> {
+        if let Some(e) = chunk.jit.compiled_entry() {
+            // SAFETY: only real entry pointers are stored (not the sentinels).
+            return Some(unsafe { std::mem::transmute::<*const (), crate::jit::JitEntry>(e) });
+        }
+        if chunk.jit.entry.get() == crate::chunk::JIT_UNCOMPILABLE {
+            return None;
+        }
+        let n = chunk.jit.counter.get().wrapping_add(1);
+        chunk.jit.counter.set(n);
+        if (n as u64) <= self.jit_threshold as u64 {
+            return None;
+        }
+        // Take the hook out to satisfy the borrow checker (it borrows nothing
+        // from `self`), compile, then restore it.
+        let mut hook = self.jit.take();
+        let res = hook.as_mut().and_then(|h| h.compile(chunk));
+        self.jit = hook;
+        match res {
+            Some(entry) => {
+                chunk.jit.entry.set(entry);
+                // SAFETY: the backend returns a valid entry pointer.
+                Some(unsafe { std::mem::transmute::<*const (), crate::jit::JitEntry>(entry) })
+            }
+            None => {
+                chunk.jit.entry.set(crate::chunk::JIT_UNCOMPILABLE);
+                None
+            }
+        }
+    }
+
+    /// Invoke a compiled chunk entry for frame `fi` and decode its status word.
+    #[inline]
+    fn run_jit(&mut self, entry: crate::jit::JitEntry, fi: usize) -> Result<VRef, ErrId> {
+        let r = entry(self as *mut VM, fi as u64);
+        if r & crate::jit::ERR_FLAG != 0 {
+            Err((r & 0xffff_ffff) as ErrId)
+        } else {
+            // SAFETY: success returns the result cell pointer (non-null).
+            Ok(unsafe { NonNull::new_unchecked(r as *mut Value) })
+        }
+    }
+
     fn run_top_frame(&mut self) -> Result<VRef, ErrId> {
         let fi = self.frames.len() - 1;
         let chunk: &'static Chunk = self.frames[fi].code.chunk();
+        if self.jit.is_some() {
+            if let Some(entry) = self.jit_dispatch(chunk) {
+                return self.run_jit(entry, fi);
+            }
+        }
         let mut ip = 0usize;
         macro_rules! pos {
             () => {

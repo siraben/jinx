@@ -1,5 +1,19 @@
-//! Cranelift JIT tier for jinx (M7). For now: the aarch64-darwin smoke test
-//! that validates RW->RX finalization + icache flushing on this platform.
+//! Cranelift JIT tier for jinx (M7): compiles hot `Chunk`s to native code
+//! that shares the interpreter's frame/operand-stack layout, so an
+//! uncompilable chunk (any op we don't lower) transparently falls back to
+//! `VM::run_top_frame`.
+
+mod codegen;
+mod rt;
+
+pub use codegen::Compiler;
+
+use jinx_eval::jit::JitHook;
+
+/// Construct the Cranelift backend for installation into a `VM`.
+pub fn new_compiler() -> Box<dyn JitHook> {
+    Box::new(Compiler::new())
+}
 
 #[cfg(test)]
 mod smoke {

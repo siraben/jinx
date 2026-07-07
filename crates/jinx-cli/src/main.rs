@@ -23,6 +23,29 @@ enum LintLevel {
     Fatal,
 }
 
+/// Install and configure the Cranelift JIT on `vm` according to the `--jit`
+/// flag (if given) and the `JINX_JIT` / `JINX_JIT_THRESHOLD` env vars. JIT is on
+/// by default; `--jit=off` or `JINX_JIT=0` disables tiering (pure interpreter).
+fn configure_jit(vm: &mut VM, flag: Option<bool>) {
+    let enabled = flag.unwrap_or_else(|| {
+        std::env::var_os("JINX_JIT")
+            .map(|v| v != "0" && v != "off")
+            .unwrap_or(true)
+    });
+    if !enabled {
+        return;
+    }
+    if let Ok(t) = std::env::var("JINX_JIT_THRESHOLD") {
+        if let Ok(n) = t.parse::<u32>() {
+            vm.jit_threshold = n;
+        }
+    }
+    #[cfg(feature = "jit")]
+    {
+        vm.jit = Some(jinx_jit::new_compiler());
+    }
+}
+
 struct Options {
     parse_only: bool,
     eval: bool,
@@ -56,6 +79,8 @@ struct Options {
     /// `--readonly-mode` (C++ `settings.readOnlyMode`): compute store paths but
     /// never write to the store. `--read-write-mode` turns it back off.
     readonly: bool,
+    /// `--jit=on|off`: force the JIT tier on or off. `None` = use env/default.
+    jit: Option<bool>,
 }
 
 fn parse_lint_level(v: &str) -> Result<LintLevel, String> {
@@ -95,6 +120,7 @@ fn parse_args() -> Result<Options, String> {
             Some("1") | Some("true") | Some("yes")
         ),
         readonly: false,
+        jit: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -141,6 +167,22 @@ fn parse_args() -> Result<Options, String> {
             "--no-abort-on-warn" => opts.abort_on_warn = false,
             "--readonly-mode" => opts.readonly = true,
             "--read-write-mode" => opts.readonly = false,
+            "--jit" => {
+                let v = need(&args, &mut i, a)?;
+                opts.jit = Some(match v.as_str() {
+                    "on" | "1" | "true" | "yes" => true,
+                    "off" | "0" | "false" | "no" => false,
+                    _ => return Err(format!("--jit expects on|off, got '{v}'")),
+                });
+            }
+            s if s.starts_with("--jit=") => {
+                let v = &s["--jit=".len()..];
+                opts.jit = Some(match v {
+                    "on" | "1" | "true" | "yes" => true,
+                    "off" | "0" | "false" | "no" => false,
+                    _ => return Err(format!("--jit expects on|off, got '{v}'")),
+                });
+            }
             "--dry-run" | "--indirect" => {}
             "--extra-experimental-features" | "--experimental-features" => {
                 let v = need(&args, &mut i, a)?;
@@ -513,6 +555,7 @@ fn run_eval(opts: Options) -> ExitCode {
     vm.show_trace = opts.show_trace;
     vm.trace_verbose = opts.trace_verbose;
     vm.abort_on_warn = opts.abort_on_warn;
+    configure_jit(&mut vm, opts.jit);
     for f in nix_conf_experimental_features() {
         vm.experimental.enable(&f);
     }
@@ -1216,6 +1259,7 @@ fn run_nix_eval(args: Vec<String>) -> ExitCode {
     for f in &experimental {
         vm.experimental.enable(f);
     }
+    configure_jit(&mut vm, None);
     builtins::register_globals(&mut vm);
 
     // Resolve the flake to its `result` attrset.

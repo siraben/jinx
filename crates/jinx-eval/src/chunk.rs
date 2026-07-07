@@ -184,6 +184,44 @@ pub struct LambdaSpec {
     pub formals: Option<FormalsSpec>,
 }
 
+/// Per-chunk JIT tier-up state (interior-mutable; evaluation is
+/// single-threaded so `Cell` suffices). `entry` holds the compiled native
+/// function pointer once available, or one of the sentinels below.
+pub struct JitState {
+    /// Invocation counter; tier-up is attempted when it reaches the VM's
+    /// threshold.
+    pub counter: std::cell::Cell<u32>,
+    /// `JIT_NONE` (not yet compiled), `JIT_UNCOMPILABLE` (attempted and
+    /// rejected — always interpret), or a real `extern "C"` entry pointer.
+    pub entry: std::cell::Cell<*const ()>,
+}
+
+/// `entry` sentinel: never attempted.
+pub const JIT_NONE: *const () = std::ptr::null();
+/// `entry` sentinel: attempted, contains an op we don't lower — interpret.
+pub const JIT_UNCOMPILABLE: *const () = 1usize as *const ();
+
+impl Default for JitState {
+    fn default() -> Self {
+        JitState {
+            counter: std::cell::Cell::new(0),
+            entry: std::cell::Cell::new(JIT_NONE),
+        }
+    }
+}
+
+impl JitState {
+    #[inline]
+    pub fn compiled_entry(&self) -> Option<*const ()> {
+        let e = self.entry.get();
+        if e == JIT_NONE || e == JIT_UNCOMPILABLE {
+            None
+        } else {
+            Some(e)
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Chunk {
     pub ops: Vec<Op>,
@@ -201,6 +239,8 @@ pub struct Chunk {
     pub name: Symbol,
     /// Lambda / chunk origin position.
     pub pos: PosIdx,
+    /// JIT tier-up state.
+    pub jit: JitState,
 }
 
 impl Chunk {
