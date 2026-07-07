@@ -84,16 +84,19 @@ fn unimplemented(vm: &mut VM, def: &'static PrimOpDef, _args: &[VRef], pos: PosI
     ))
 }
 
+// Builtins jinx recognizes but does not yet execute. Only names that are in the
+// C++ `builtins` set *by default* belong here — i.e. not gated behind an
+// experimental feature or the unsafe-native setting. `exec`/`importNative`
+// (unsafe-native), `fetchClosure` (fetch-closure), and `outputOf`
+// (dynamic-derivations) are absent from the default set, and
+// `fetchFinalTree`/`forceLazyFetcherAttr` are internal fetcher helpers Nix
+// never exposes — so none of them are registered, matching `builtins`
+// attrname parity with the oracle (adversarial-review finding: phantom
+// builtins broke `builtins ? exec` feature detection).
 const UNIMPLEMENTED: &[(&str, u8)] = &[
-    ("fetchFinalTree", 1),
     ("fetchGit", 1),
     ("fetchMercurial", 1),
     ("fetchTarball", 1),
-    ("__exec", 1),
-    ("__fetchClosure", 1),
-    ("__forceLazyFetcherAttr", 1),
-    ("__importNative", 2),
-    ("__outputOf", 2),
 ];
 
 pub fn register_globals(vm: &mut VM) {
