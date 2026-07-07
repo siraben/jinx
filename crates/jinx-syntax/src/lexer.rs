@@ -319,52 +319,101 @@ impl<'a> Lexer<'a> {
                 ("<|", 20),
                 ("|>", 21),
             ];
-            for (order, (s, id)) in FIXED.iter().enumerate() {
-                if rest.starts_with(s.as_bytes()) {
-                    consider(s.len(), order, Rule::Kw(s, *id), &mut best);
+            // First bytes of all FIXED entries.
+            const KW_FIRST: [bool; 256] = {
+                let mut t = [false; 256];
+                let firsts = b"itewalro.=!<>&|-/+";
+                let mut i = 0;
+                while i < firsts.len() {
+                    t[firsts[i] as usize] = true;
+                    i += 1;
+                }
+                t
+            };
+            // First-byte gating: every candidate rule's language constrains its
+            // first byte, so only enumerate rules whose first-byte class
+            // matches `c`. The `consider` calls (and their order arguments)
+            // are byte-for-byte the same as the ungated enumeration, so the
+            // longest-match + rule-order tie-break semantics are unchanged.
+            let c = rest[0];
+            if KW_FIRST[c as usize] {
+                for (order, (s, id)) in FIXED.iter().enumerate() {
+                    let sb = s.as_bytes();
+                    if sb[0] == c && rest.starts_with(sb) {
+                        consider(s.len(), order, Rule::Kw(s, *id), &mut best);
+                    }
                 }
             }
             let base = FIXED.len();
-            consider(match_id(rest), base, Rule::Id, &mut best);
-            consider(match_int(rest), base + 1, Rule::Int, &mut best);
-            consider(match_float(rest), base + 2, Rule::Float, &mut best);
-            if rest.starts_with(b"${") {
+            if is_id_start(c) {
+                consider(match_id(rest), base, Rule::Id, &mut best);
+            }
+            if c.is_ascii_digit() {
+                consider(match_int(rest), base + 1, Rule::Int, &mut best);
+            }
+            // FLOAT starts [0-9] (alt1 [1-9]..., alt2 0?\.) or '.' (alt2).
+            if c.is_ascii_digit() || c == b'.' {
+                consider(match_float(rest), base + 2, Rule::Float, &mut best);
+            }
+            if c == b'$' && rest.starts_with(b"${") {
                 consider(2, base + 3, Rule::DollarCurly, &mut best);
             }
-            if rest.starts_with(b"}") {
+            if c == b'}' {
                 consider(1, base + 4, Rule::CloseBrace, &mut best);
             }
-            if rest.starts_with(b"{") {
+            if c == b'{' {
                 consider(1, base + 5, Rule::OpenBrace, &mut best);
             }
-            if rest.starts_with(b"\"") {
+            if c == b'"' {
                 consider(1, base + 6, Rule::Quote, &mut best);
             }
-            consider(match_ind_open(rest), base + 7, Rule::IndOpen, &mut best);
-            consider(
-                match_path_seg_dollar(rest),
-                base + 8,
-                Rule::PathSegDollar,
-                &mut best,
-            );
-            consider(
-                match_hpath_start_dollar(rest),
-                base + 9,
-                Rule::HPathStartDollar,
-                &mut best,
-            );
-            consider(match_path(rest), base + 10, Rule::Path, &mut best);
-            consider(match_hpath(rest), base + 11, Rule::HPath, &mut best);
-            consider(match_spath(rest), base + 12, Rule::SPath, &mut best);
-            consider(match_uri(rest), base + 13, Rule::Uri, &mut best);
-            consider(match_ws(rest), base + 14, Rule::Ws, &mut best);
-            consider(match_line_comment(rest), base + 15, Rule::LineComment, &mut best);
-            consider(
-                match_block_comment(rest),
-                base + 16,
-                Rule::BlockComment,
-                &mut best,
-            );
+            if c == b'\'' {
+                consider(match_ind_open(rest), base + 7, Rule::IndOpen, &mut best);
+            }
+            // PATH / PATH_SEG${: {PATH_CHAR}* may be empty, so they can start
+            // with a path char or directly with '/'.
+            if is_path_char(c) || c == b'/' {
+                consider(
+                    match_path_seg_dollar(rest),
+                    base + 8,
+                    Rule::PathSegDollar,
+                    &mut best,
+                );
+            }
+            if c == b'~' {
+                consider(
+                    match_hpath_start_dollar(rest),
+                    base + 9,
+                    Rule::HPathStartDollar,
+                    &mut best,
+                );
+            }
+            if is_path_char(c) || c == b'/' {
+                consider(match_path(rest), base + 10, Rule::Path, &mut best);
+            }
+            if c == b'~' {
+                consider(match_hpath(rest), base + 11, Rule::HPath, &mut best);
+            }
+            if c == b'<' {
+                consider(match_spath(rest), base + 12, Rule::SPath, &mut best);
+            }
+            if c.is_ascii_alphabetic() {
+                consider(match_uri(rest), base + 13, Rule::Uri, &mut best);
+            }
+            if matches!(c, b' ' | b'\t' | b'\r' | b'\n') {
+                consider(match_ws(rest), base + 14, Rule::Ws, &mut best);
+            }
+            if c == b'#' {
+                consider(match_line_comment(rest), base + 15, Rule::LineComment, &mut best);
+            }
+            if c == b'/' {
+                consider(
+                    match_block_comment(rest),
+                    base + 16,
+                    Rule::BlockComment,
+                    &mut best,
+                );
+            }
             consider(1, base + 17, Rule::Any, &mut best);
 
             let (len, _, rule) = best.unwrap();
