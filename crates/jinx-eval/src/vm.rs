@@ -864,6 +864,13 @@ impl VM {
                 return self.run_jit(entry, fi);
             }
         }
+        // Frame constants, hoisted out of the dispatch loop: the program is
+        // leaked ('static), `locals_base` never changes for a live frame, and
+        // the upvalue array is a data object rooted by the frame for its whole
+        // lifetime. Nested calls push/pop frames *above* `fi` only.
+        let prog: &'static crate::chunk::Program = self.frames[fi].code.prog();
+        let base = self.frames[fi].locals_base;
+        let upvals: &'static [VRef] = self.frames[fi].upvals();
         let mut ip = 0usize;
         macro_rules! pos {
             () => {
@@ -879,16 +886,15 @@ impl VM {
             let op = chunk.ops[ip];
             match op {
                 Op::Const(i) => {
-                    let c = self.frames[fi].code.prog().consts[i as usize];
+                    let c = prog.consts[i as usize];
                     self.stack.push(c);
                 }
                 Op::GetLocal(s) => {
-                    let b = self.frames[fi].locals_base;
-                    let c = self.stack[b + s as usize];
+                    let c = self.stack[base + s as usize];
                     self.stack.push(c);
                 }
                 Op::GetUpval(i) => {
-                    let c = self.frames[fi].upvals()[i as usize];
+                    let c = upvals[i as usize];
                     self.stack.push(c);
                 }
                 Op::ResolveWith(sym) => {
@@ -933,8 +939,7 @@ impl VM {
                 }
                 Op::StoreLocal(s) => {
                     let c = self.stack.pop().unwrap();
-                    let b = self.frames[fi].locals_base;
-                    let dst = self.stack[b + s as usize];
+                    let dst = self.stack[base + s as usize];
                     set(dst, val(c));
                 }
                 Op::MakeThunk(cid) => {
@@ -958,7 +963,7 @@ impl VM {
                     // gc_check BEFORE building: the entry cells are still
                     // rooted on the operand stack while we fill the object.
                     self.gc_check();
-                    let desc = &self.frames[fi].code.prog().attrs_descs[d as usize];
+                    let desc = &prog.attrs_descs[d as usize];
                     let n = desc.names.len();
                     let start = self.stack.len() - n;
                     let (v, out) = self.heap.new_bindings_raw(n);
@@ -1046,7 +1051,6 @@ impl VM {
                     self.op_concat_strings(fi, d)?;
                 }
                 Op::Select { sym, cache } => {
-                    let prog = self.frames[fi].code.prog();
                     self.op_select(Symbol(sym), cache, prog, pos!())?;
                 }
                 Op::SelectForce(t) => {
@@ -1055,7 +1059,7 @@ impl VM {
                     self.force(c, p).map_err(|e| {
                         if p.is_set() && !self.pos_is_derivation_internal(p) {
                             let text =
-                                self.frames[fi].code.prog().texts[t as usize].clone();
+                                prog.texts[t as usize].clone();
                             self.add_trace(
                                 e,
                                 p,
@@ -1119,7 +1123,7 @@ impl VM {
                     if let Err(e) = step(self) {
                         if t != u32::MAX && sp.is_set() && !self.pos_is_derivation_internal(sp) {
                             let text =
-                                self.frames[fi].code.prog().texts[t as usize].clone();
+                                prog.texts[t as usize].clone();
                             self.add_trace(
                                 e,
                                 sp,
@@ -1213,7 +1217,7 @@ impl VM {
                     self.stack.push(c);
                 }
                 Op::AssertFail(t) => {
-                    let text = &self.frames[fi].code.prog().texts[t as usize];
+                    let text = &prog.texts[t as usize];
                     let msg = {
                         let mut m = b"assertion '".to_vec();
                         m.extend_from_slice(text);
@@ -1231,7 +1235,7 @@ impl VM {
                         self.assert_eq_values(lhs, rhs, NO_POS, "in an equality assertion")
                     {
                         let text =
-                            self.frames[fi].code.prog().texts[t as usize].clone();
+                            prog.texts[t as usize].clone();
                         self.add_trace(
                             e,
                             apos,
