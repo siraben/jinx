@@ -3821,11 +3821,21 @@ fn prim_intersect_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
     )?;
     let e1 = attrs_entries(&val(args[0]));
     let e2 = attrs_entries(&val(args[1]));
-    let entries: Vec<Attr> = e2
-        .iter()
-        .filter(|a| e1.binary_search_by(|x| x.sym.cmp(&a.sym)).is_ok())
-        .copied()
-        .collect();
+    // Both attrsets are sorted by symbol id: keep e2's entries whose name is
+    // also in e1 via a single linear merge (not a binary search per key).
+    let mut entries: Vec<Attr> = Vec::with_capacity(e1.len().min(e2.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < e1.len() && j < e2.len() {
+        match e1[i].sym.cmp(&e2[j].sym) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                entries.push(e2[j]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
     Ok(vm.new_bindings_value(&entries))
 }
 

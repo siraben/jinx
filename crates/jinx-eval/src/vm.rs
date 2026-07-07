@@ -1748,26 +1748,35 @@ impl VM {
 
     /// Apply a closure to one argument (the C++ lambda branch of
     /// callFunction).
+    /// Bare lambda name (`%1%` form) for "called without/with … argument"
+    /// errors; `"anonymous lambda"` when unnamed. Cold path only.
+    fn lambda_raw_name(&self, chunk: &Chunk) -> String {
+        if chunk.name.is_set() {
+            String::from_utf8_lossy(self.symbols.resolve(chunk.name)).into_owned()
+        } else {
+            "anonymous lambda".into()
+        }
+    }
+
+    /// Trace form (`'name'`, or unquoted `anonymous lambda`) for the
+    /// "while calling …" frame. Cold path only.
+    fn lambda_trace_name(&self, chunk: &Chunk) -> String {
+        if chunk.name.is_set() {
+            format!("'{}'", String::from_utf8_lossy(self.symbols.resolve(chunk.name)))
+        } else {
+            "anonymous lambda".into()
+        }
+    }
+
     fn call_closure(&mut self, vcur: Value, arg: VRef, pos: PosIdx) -> Result<Value, ErrId> {
         let (code, _) = thunk_code(&vcur);
         let chunk = code.chunk();
         let spec = chunk.lambda.as_ref().expect("closure without lambda spec");
         let base = self.stack.len();
 
-        // `raw_name` is the bare name (or "anonymous lambda"); the
-        // "called without/with … argument" errors quote it as '%1%'.
-        // `lambda_name` is the trace form: named lambdas are quoted, but the
-        // anonymous case is shown unquoted ("while calling anonymous lambda").
-        let raw_name: String = if chunk.name.is_set() {
-            String::from_utf8_lossy(self.symbols.resolve(chunk.name)).into_owned()
-        } else {
-            "anonymous lambda".into()
-        };
-        let lambda_name: String = if chunk.name.is_set() {
-            format!("'{raw_name}'")
-        } else {
-            "anonymous lambda".into()
-        };
+        // Display names (the bare "%1%" form and the quoted trace form) are
+        // computed lazily at the cold error sites — allocating them on every
+        // call showed up in profiles of real evaluations.
 
         let mut pending_defaults: Vec<(usize, u32)> = Vec::new(); // (stack idx, chunk)
 
@@ -1801,7 +1810,7 @@ impl VM {
                             self.stack.push(c);
                         }
                         None => {
-                            let name = raw_name.clone();
+                            let name = self.lambda_raw_name(chunk);
                             let fname =
                                 String::from_utf8_lossy(self.symbols.resolve(f.name)).into_owned();
                             let e = self.new_err(
@@ -1824,7 +1833,7 @@ impl VM {
             if !formals.ellipsis && attrs_used != attrs_entries(&attrs).len() {
                 for a in attrs_entries(&attrs) {
                     if !formals.formals.iter().any(|f| f.name.0 == a.sym) {
-                        let name = raw_name.clone();
+                        let name = self.lambda_raw_name(chunk);
                         let aname = String::from_utf8_lossy(self.symbols.resolve(Symbol(a.sym)))
                             .into_owned();
                         let cands: Vec<String> = formals
@@ -1881,6 +1890,7 @@ impl VM {
                 // <name>" at the lambda pos, then "from call site" at the
                 // application pos. C++ only adds these when `showTrace` is on.
                 if self.show_trace {
+                    let lambda_name = self.lambda_trace_name(chunk);
                     self.add_trace(e, chunk_pos, format!("while calling {lambda_name}"));
                     if pos.is_set() {
                         self.add_trace(e, pos, "from call site");

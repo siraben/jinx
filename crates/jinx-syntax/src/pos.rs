@@ -49,6 +49,10 @@ struct OriginEntry {
     origin: Origin,
     offset: u32,
     size: u32,
+    /// Memoized line-start table, computed on first position lookup into this
+    /// origin. Recomputing it per lookup (a full source scan) was a visible
+    /// eval-time cost for large source files.
+    line_starts: std::cell::OnceCell<Vec<u32>>,
 }
 
 /// A resolved position (1-based line/column) with its origin name.
@@ -89,6 +93,7 @@ impl PosTable {
             origin,
             offset,
             size: size as u32,
+            line_starts: std::cell::OnceCell::new(),
         });
         OriginId(self.origins.len() - 1)
     }
@@ -127,7 +132,9 @@ impl PosTable {
     /// Convert a `PosIdx` to line/column, like `PosTable::operator[]`.
     pub fn lookup(&self, p: PosIdx) -> Option<Pos> {
         let (entry, offset) = self.resolve_origin(p)?;
-        let starts = line_starts(entry.origin.source());
+        let starts = entry
+            .line_starts
+            .get_or_init(|| line_starts(entry.origin.source()));
         // last start <= offset
         let idx = match starts.binary_search(&offset) {
             Ok(i) => i,

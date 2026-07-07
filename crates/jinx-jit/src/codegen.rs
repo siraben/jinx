@@ -33,6 +33,21 @@ pub struct Compiler {
     fbc: cranelift_frontend::FunctionBuilderContext,
     /// Imported runtime-helper functions, by name.
     helpers: HashMap<&'static str, FuncId>,
+    /// Diagnostics (printed on drop under `JINX_JIT_STATS`).
+    n_compiled: u64,
+    compile_time: std::time::Duration,
+    stats_on: bool,
+}
+
+impl Drop for Compiler {
+    fn drop(&mut self) {
+        if self.stats_on {
+            eprintln!(
+                "jinx jit: {} chunks compiled, {:?} total compile time",
+                self.n_compiled, self.compile_time
+            );
+        }
+    }
 }
 
 impl Compiler {
@@ -73,6 +88,9 @@ impl Compiler {
             ctx,
             fbc: cranelift_frontend::FunctionBuilderContext::new(),
             helpers,
+            n_compiled: 0,
+            compile_time: std::time::Duration::ZERO,
+            stats_on: std::env::var_os("JINX_JIT_STATS").is_some_and(|v| v != "0"),
         }
     }
 }
@@ -87,7 +105,13 @@ impl JitHook for Compiler {
     fn compile(&mut self, code: &'static CodeRef) -> Option<*const ()> {
         let chunk: &Chunk = code.chunk();
         let prog: &Program = code.prog();
-        self.compile_chunk(chunk, prog)
+        let t0 = std::time::Instant::now();
+        let r = self.compile_chunk(chunk, prog);
+        self.compile_time += t0.elapsed();
+        if r.is_some() {
+            self.n_compiled += 1;
+        }
+        r
     }
 }
 
