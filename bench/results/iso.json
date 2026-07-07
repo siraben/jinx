@@ -1,0 +1,79 @@
+{
+  "results": [
+    {
+      "command": "$JINX_ROOT/.oracle/bin/nix-instantiate --readonly-mode $NIXPKGS/nixos/release.nix -A iso_minimal.x86_64-linux",
+      "mean": 9.4783627036,
+      "stddev": 0.23857514667918117,
+      "median": 9.3420675506,
+      "user": 6.187716286666666,
+      "system": 4.49735494,
+      "min": 9.3391800506,
+      "max": 9.7538405096,
+      "times": [
+        9.3391800506,
+        9.3420675506,
+        9.7538405096
+      ],
+      "memory_usage_byte": [
+        1233666048,
+        1233666048,
+        1239482368
+      ],
+      "exit_codes": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "command": "JINX_JIT=0 $JINX_ROOT/target/release/jinx --readonly-mode $NIXPKGS/nixos/release.nix -A iso_minimal.x86_64-linux",
+      "mean": 12.213679786933334,
+      "stddev": 0.16899578181897723,
+      "median": 12.2743075506,
+      "user": 7.663672619999999,
+      "system": 4.34001994,
+      "min": 12.0227334676,
+      "max": 12.3439983426,
+      "times": [
+        12.2743075506,
+        12.0227334676,
+        12.3439983426
+      ],
+      "memory_usage_byte": [
+        3538894848,
+        3543941120,
+        3543941120
+      ],
+      "exit_codes": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "command": "JINX_JIT=1 $JINX_ROOT/target/release/jinx --readonly-mode $NIXPKGS/nixos/release.nix -A iso_minimal.x86_64-linux",
+      "mean": 12.429054731599999,
+      "stddev": 0.08046869743429128,
+      "median": 12.4671596346,
+      "user": 7.862510286666666,
+      "system": 4.35195594,
+      "min": 12.3366113846,
+      "max": 12.4833931756,
+      "times": [
+        12.4671596346,
+        12.3366113846,
+        12.4833931756
+      ],
+      "memory_usage_byte": [
+        3573399552,
+        3573399552,
+        3573399552
+      ],
+      "exit_codes": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}
