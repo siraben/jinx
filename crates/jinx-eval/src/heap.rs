@@ -22,9 +22,12 @@ const STRESS_TRIGGER: usize = 4 << 10;
 
 pub struct GcStats {
     pub collections: u64,
+    pub majors: u64,
     pub total_pause: std::time::Duration,
+    pub max_pause: std::time::Duration,
     pub last_live_blocks: usize,
     pub peak_footprint: usize,
+    pub barrier_hits: u64,
 }
 
 pub struct Heap {
@@ -43,6 +46,23 @@ pub struct Heap {
     stats_on: bool,
     /// Base (highest address) of the mutator stack for conservative scanning.
     stack_base: usize,
+
+    // ---- generational (sticky mark bit) state ----
+    /// Generational collection disabled (JINX_GC_GEN=0): every GC is major.
+    gen_off: bool,
+    /// Blocks acquired since the last collection (the young generation).
+    young_blocks: Vec<usize>,
+    /// Old cells overwritten by the mutator since the last collection; their
+    /// mark bit was cleared by the write barrier, so a minor GC must treat
+    /// them as roots (they may now be the only path to young objects).
+    remset: Vec<VRef>,
+    /// True once any collection has run (before that everything is young and
+    /// the barrier has nothing to do).
+    gc_ran: bool,
+    /// Retained footprint at which the next collection is promoted to major.
+    major_watermark: usize,
+    /// Allocation volume between minor collections (JINX_GC_YOUNG_MB).
+    young_trigger: usize,
 }
 
 impl Default for Heap {
@@ -71,12 +91,55 @@ impl Heap {
             stress,
             stats: GcStats {
                 collections: 0,
+                majors: 0,
                 total_pause: std::time::Duration::ZERO,
+                max_pause: std::time::Duration::ZERO,
                 last_live_blocks: 0,
                 peak_footprint: 0,
+                barrier_hits: 0,
             },
             stats_on: std::env::var_os("JINX_GC_STATS").is_some_and(|v| v != "0"),
             stack_base: current_stack_base(),
+            gen_off: std::env::var_os("JINX_GC_GEN").is_some_and(|v| v == "0"),
+            young_blocks: Vec::new(),
+            remset: Vec::new(),
+            gc_ran: false,
+            major_watermark: 0,
+            // Allocation volume between minor collections. For a one-shot
+            // batch evaluator, over-collecting a monotonically growing heap is
+            // pure cost (minors leave old-gen floating garbage that bloats the
+            // next major), so the production default tracks `min_trigger`
+            // rather than a small REPL-style young gen. The stress gate is
+            // unaffected: under JINX_GC_STRESS `trigger()` uses `min_trigger`
+            // (4 KiB) directly, so minor collections still fire ~every 4 KiB
+            // and keep the ~8x cheaper stress gate. `JINX_GC_YOUNG_MB`
+            // overrides for interactive/incremental workloads.
+            young_trigger: std::env::var("JINX_GC_YOUNG_MB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|mb| mb << 20)
+                .unwrap_or(min_trigger),
+        }
+    }
+
+    /// Mutator write barrier: called before overwriting the value cell `c`.
+    /// If `c` survived a previous collection (its sticky mark bit is set), the
+    /// new value it now holds may be the only path to young objects, so the
+    /// cell is logged in the remembered set (and its mark cleared, which both
+    /// dedups the log and forces the next minor GC to re-trace it).
+    #[inline]
+    pub fn write_barrier(&mut self, c: VRef) {
+        if !self.gc_ran {
+            return;
+        }
+        let addr = c.as_ptr() as usize;
+        if let Some((idx, granule)) = self.space.locate(addr) {
+            let meta = self.space.meta_mut(idx).unwrap();
+            if meta.is_marked(granule) {
+                meta.clear_mark(granule);
+                self.remset.push(c);
+                self.stats.barrier_hits += 1;
+            }
         }
     }
 
@@ -89,10 +152,17 @@ impl Heap {
     #[inline]
     fn trigger(&self) -> usize {
         if self.stress {
-            self.min_trigger
-        } else {
-            self.min_trigger.max(self.retained * 2)
+            return self.min_trigger;
         }
+        if self.gen_off {
+            return self.min_trigger.max(self.retained * 2);
+        }
+        if !self.gc_ran {
+            // First collection: honor the min-trigger (avoids collecting at
+            // all on evals that finish under it).
+            return self.min_trigger.max(self.young_trigger);
+        }
+        self.young_trigger
     }
 
     // ---------------- allocation ----------------
@@ -103,6 +173,7 @@ impl Heap {
             Some(i) if self.space.meta(i).unwrap().bump + VALUE_SIZE <= BLOCK_SIZE => i,
             _ => {
                 let (_, i) = self.space.acquire(BlockKind::Value);
+                self.young_blocks.push(i);
                 self.cur_value = Some(i);
                 i
             }
@@ -136,6 +207,7 @@ impl Heap {
             Some(i) if self.space.meta(i).unwrap().bump + rounded <= BLOCK_SIZE => i,
             _ => {
                 let (_, i) = self.space.acquire(BlockKind::Data);
+                self.young_blocks.push(i);
                 self.cur_data = Some(i);
                 i
             }
@@ -325,23 +397,56 @@ impl Heap {
 
     // ---------------- collection ----------------
 
-    /// Run a full collection. `precise_roots` must mark every VM-reachable
-    /// cell; the native stack is additionally scanned conservatively (unless
-    /// `scan_stack` is false — used by deterministic unit tests).
+    /// Run a full (major) collection. `precise_roots` must mark every
+    /// VM-reachable cell; the native stack is additionally scanned
+    /// conservatively (unless `scan_stack` is false — used by deterministic
+    /// unit tests).
     pub fn collect(&mut self, precise_roots: impl FnOnce(&mut Marker), scan_stack: bool) {
+        self.collect_gen(precise_roots, scan_stack, true)
+    }
+
+    /// Policy entry point: run a minor (young-generation) collection, or a
+    /// major one when the old generation has grown past the watermark. Under
+    /// JINX_GC_STRESS, every 8th collection is promoted to major so both
+    /// paths are stress-covered.
+    pub fn collect_auto(&mut self, precise_roots: impl FnOnce(&mut Marker), scan_stack: bool) {
+        let major = self.gen_off
+            || !self.gc_ran
+            || self.retained >= self.major_watermark
+            || (self.stress && self.stats.collections % 8 == 7);
+        self.collect_gen(precise_roots, scan_stack, major)
+    }
+
+    fn collect_gen(
+        &mut self,
+        precise_roots: impl FnOnce(&mut Marker),
+        scan_stack: bool,
+        major: bool,
+    ) {
         let t0 = std::time::Instant::now();
-        // Clear all marks.
-        for idx in self.space.live_block_indices() {
-            self.space.meta_mut(idx).unwrap().clear_marks();
-        }
-        for lo in &mut self.space.large {
-            lo.marked = false;
+        if major {
+            // Clear all marks: everything is young again.
+            for idx in self.space.live_block_indices() {
+                self.space.meta_mut(idx).unwrap().clear_marks();
+            }
+            for lo in &mut self.space.large {
+                lo.marked = false;
+            }
+            // Every cell will be re-traced from scratch; the remset is moot.
+            self.remset.clear();
         }
 
         let mut marker = Marker {
             space: &mut self.space,
             worklist: Vec::with_capacity(1024),
         };
+        // Remembered set first (minor only; empty on major): old cells whose
+        // contents changed since the last GC. Marking them re-sets their mark
+        // bit and traces whatever they point to now.
+        let remset = std::mem::take(&mut self.remset);
+        for &c in &remset {
+            marker.mark_cell(c);
+        }
         precise_roots(&mut marker);
         if scan_stack {
             let base = self.stack_base;
@@ -351,20 +456,23 @@ impl Heap {
         }
         marker.drain();
 
-        // Sweep.
+        // Sweep. Minor collections only visit blocks allocated since the last
+        // collection (old blocks all contain sticky-marked survivors and are
+        // retained by construction; their dead space is reclaimed at the next
+        // major).
         let cur_v = self.cur_value;
         let cur_d = self.cur_data;
-        let mut retained = 0usize;
-        for idx in self.space.live_block_indices() {
+        let sweep_set: Vec<usize> = if major {
+            self.young_blocks.clear();
+            self.space.live_block_indices()
+        } else {
+            std::mem::take(&mut self.young_blocks)
+        };
+        let mut retained = if major { 0 } else { self.retained };
+        for idx in sweep_set {
             let meta = self.space.meta(idx).unwrap();
             let used_granules = meta.bump / GRANULE;
-            let mut any_live = false;
-            for g in 0..used_granules {
-                if meta.is_start(g) && meta.is_marked(g) {
-                    any_live = true;
-                    break;
-                }
-            }
+            let any_live = meta.any_marked(used_granules);
             if any_live || Some(idx) == cur_v || Some(idx) == cur_d {
                 retained += BLOCK_SIZE;
             } else {
@@ -379,11 +487,17 @@ impl Heap {
                 self.space.release(idx);
             }
         }
-        // Large objects.
+        // Large objects: minor sweeps only the un-aged (young) ones.
         let mut i = 0;
         while i < self.space.large.len() {
-            if self.space.large[i].marked {
-                retained += self.space.large[i].size;
+            let lo = &mut self.space.large[i];
+            if lo.marked || (!major && lo.aged) {
+                if major {
+                    retained += lo.size;
+                } else if !lo.aged {
+                    retained += lo.size; // young survivor, newly counted
+                }
+                lo.aged = true;
                 i += 1;
             } else {
                 let lo = self.space.large.swap_remove(i);
@@ -396,10 +510,29 @@ impl Heap {
 
         self.retained = retained;
         self.alloc_since_gc = 0;
+        self.gc_ran = true;
+        if major {
+            self.stats.majors += 1;
+            // Next major once the old generation has doubled (but at least
+            // half the min trigger of growth).
+            self.major_watermark = (retained * 2).max(retained + self.min_trigger / 2);
+        }
+        let pause = t0.elapsed();
         self.stats.collections += 1;
-        self.stats.total_pause += t0.elapsed();
+        self.stats.total_pause += pause;
+        self.stats.max_pause = self.stats.max_pause.max(pause);
         self.stats.last_live_blocks = retained / BLOCK_SIZE;
         self.stats.peak_footprint = self.stats.peak_footprint.max(retained);
+        if self.stats_on {
+            eprintln!(
+                "jinx gc #{} ({}): pause {:?} (remset {}); retained {} MiB",
+                self.stats.collections,
+                if major { "major" } else { "minor" },
+                pause,
+                remset.len(),
+                retained >> 20,
+            );
+        }
     }
 
     pub fn footprint(&self) -> usize {
@@ -411,11 +544,17 @@ impl Drop for Heap {
     fn drop(&mut self) {
         if self.stats_on {
             eprintln!(
-                "jinx gc: {} collections, {:?} total pause, retained {} blocks, peak footprint {} MiB",
+                "jinx gc: {} collections ({} major), {:?} total pause, {:?} max pause, retained {} blocks, peak footprint {} MiB, {} barrier hits, committed {} MiB (free pool {} MiB), large {} MiB",
                 self.stats.collections,
+                self.stats.majors,
                 self.stats.total_pause,
+                self.stats.max_pause,
                 self.stats.last_live_blocks,
                 self.stats.peak_footprint >> 20,
+                self.stats.barrier_hits,
+                self.space.committed_bytes() >> 20,
+                (self.space.free_blocks() * BLOCK_SIZE) >> 20,
+                self.space.large.iter().map(|l| l.size).sum::<usize>() >> 20,
             );
         }
     }

@@ -88,7 +88,6 @@ impl BlockMeta {
         self.marks[granule / 8] & (1 << (granule % 8)) != 0
     }
     #[inline]
-    #[allow(dead_code)]
     pub fn clear_mark(&mut self, granule: usize) {
         self.marks[granule / 8] &= !(1 << (granule % 8));
     }
@@ -96,7 +95,6 @@ impl BlockMeta {
         self.marks.fill(0);
     }
     /// Any mark bit set among the first `granules` granules?
-    #[allow(dead_code)]
     pub fn any_marked(&self, granules: usize) -> bool {
         let full = granules / 8;
         if self.marks[..full].iter().any(|&b| b != 0) {
@@ -126,6 +124,9 @@ pub struct LargeObject {
     pub ptr: NonNull<u8>,
     pub size: usize,
     pub marked: bool,
+    /// Survived at least one collection (old generation). Minor collections
+    /// only sweep un-aged (young) large objects.
+    pub aged: bool,
 }
 
 /// The raw block space: one big reservation divided into aligned blocks, a
@@ -273,6 +274,16 @@ impl BlockSpace {
         Some((idx, boff / GRANULE))
     }
 
+    /// Total bytes of block space ever committed (touched at least once).
+    pub fn committed_bytes(&self) -> usize {
+        self.committed
+    }
+
+    /// Blocks currently in the free pool.
+    pub fn free_blocks(&self) -> usize {
+        self.free.len()
+    }
+
     /// Locate a large object containing `addr`.
     pub fn locate_large(&self, addr: usize) -> Option<usize> {
         if addr < self.large_lo || addr >= self.large_hi {
@@ -303,6 +314,7 @@ impl BlockSpace {
             ptr,
             size: len,
             marked: false,
+            aged: false,
         });
         ptr
     }

@@ -16,7 +16,7 @@ use crate::chunk::CTX_STRINGS;
 use crate::error::ErrId;
 use crate::jit::ERR_FLAG;
 use crate::value::{Tag, VRef, Value};
-use crate::vm::{attrs_get, list_elems, set, val, VM};
+use crate::vm::{attrs_get, list_elems, val, VM};
 use jinx_syntax::pos::{PosIdx, NO_POS};
 use jinx_syntax::symbol::Symbol;
 
@@ -140,7 +140,7 @@ pub extern "C" fn jinx_store_local(vm: *mut VM, fi: u64, slot: u32) -> u64 {
     let c = vm.stack.pop().unwrap();
     let b = vm.frames[fi as usize].locals_base;
     let dst = vm.stack[b + slot as usize];
-    set(dst, val(c));
+    vm.set_b(dst, val(c));
     0
 }
 

@@ -302,7 +302,7 @@ pub fn register_globals(vm: &mut VM) {
     entries.dedup_by_key(|a| a.sym);
 
     let bv = immortal::bindings(&entries);
-    crate::vm::set(builtins_cell, bv);
+    vm.set_b(builtins_cell, bv);
     let bsym = vm.symbols.create(b"builtins");
     vm.globals.insert(bsym, builtins_cell);
 
@@ -336,7 +336,7 @@ pub fn register_globals(vm: &mut VM) {
         vm.empty_list_cell,
     );
     let cell = vm.run_program(prog).expect("derivation.nix evaluates");
-    crate::vm::set(derivation_cell, val(cell));
+    vm.set_b(derivation_cell, val(cell));
 }
 
 /// The `derivation` builtin's Nix implementation, vendored verbatim from

@@ -373,6 +373,17 @@ impl VM {
         }
     }
 
+    /// Overwrite a value cell WITH the generational write barrier. Every
+    /// mutation of a possibly-old cell must go through this (thunk
+    /// force/blackhole updates, rec backpatches, `__overrides`), otherwise a
+    /// minor collection can miss the only old->young edge and free a live
+    /// young object.
+    #[inline]
+    pub fn set_b(&mut self, c: VRef, v: Value) {
+        self.heap.write_barrier(c);
+        set(c, v);
+    }
+
     fn gc(&mut self) {
         let VM {
             heap,
@@ -383,7 +394,7 @@ impl VM {
             file_cache,
             ..
         } = self;
-        heap.collect(
+        heap.collect_auto(
             |m| {
                 for &c in stack.iter() {
                     m.mark_cell(c);
@@ -587,7 +598,7 @@ impl VM {
                     // expression being computed (C++ `Value::determinePos`
                     // over the blackholed thunk). The GC traces blackholes
                     // like thunks (see `has_heap_payload`).
-                    set(cell, Value::make(Tag::Blackhole, v.w1));
+                    self.set_b(cell, Value::make(Tag::Blackhole, v.w1));
                     let (code, _) = thunk_code(&v);
                     let saved_force_pos = self.force_pos;
                     self.force_pos = pos;
@@ -595,7 +606,7 @@ impl VM {
                     self.force_pos = saved_force_pos;
                     match run {
                         Ok(res) => {
-                            set(cell, res);
+                            self.set_b(cell, res);
                             // The chunk may itself return an (unforced)
                             // thunk value (e.g. a call result); keep going
                             // until WHNF, like C++ forceValue on tApp.
@@ -605,7 +616,7 @@ impl VM {
                             return Ok(());
                         }
                         Err(e) => {
-                            set(cell, Value::make(Tag::Failed, e as u64));
+                            self.set_b(cell, Value::make(Tag::Failed, e as u64));
                             return Err(e);
                         }
                     }
@@ -972,7 +983,7 @@ impl VM {
                 Op::StoreLocal(s) => {
                     let c = self.stack.pop().unwrap();
                     let dst = self.stack[base + s as usize];
-                    set(dst, val(c));
+                    self.set_b(dst, val(c));
                 }
                 Op::MakeThunk(cid) => {
                     let c = self.make_thunk(fi, cid, Tag::Thunk);
@@ -1400,7 +1411,7 @@ impl VM {
         // `value` and old entries stay rooted via the operand stack (value
         // was popped but remains in a native local; conservative scan).
         let v = self.new_bindings_value(&entries);
-        set(attrs_cell, v);
+        self.set_b(attrs_cell, v);
         Ok(())
     }
 
@@ -1427,7 +1438,7 @@ impl VM {
                 // Overwrite the rec binding cell so references through the
                 // rec scope see the override.
                 let cell = self.stack[base + k];
-                set(cell, val(o.val));
+                self.set_b(cell, val(o.val));
                 entries[k] = Attr {
                     sym: o.sym,
                     pos: o.pos,
@@ -1439,7 +1450,7 @@ impl VM {
             }
         }
         let v = self.new_bindings_value(&entries);
-        set(attrs_cell, v);
+        self.set_b(attrs_cell, v);
         Ok(())
     }
 
@@ -2044,7 +2055,7 @@ impl VM {
         for (slot_idx, cid) in pending_defaults {
             let t = self.make_thunk(fi, cid, Tag::Thunk);
             let dst = self.stack[slot_idx];
-            set(dst, val(t));
+            self.set_b(dst, val(t));
         }
         let chunk_pos = chunk.pos;
         let r = self.run_top_frame();
