@@ -164,6 +164,10 @@ pub struct VM {
     pub errors: Vec<EvalError>,
     pub globals: FxHashMap<Symbol, VRef>,
     pub file_cache: Vec<(std::path::PathBuf, VRef)>,
+    /// Port of C++ `EvalState::srcToStore` — memoize source-path -> store-path
+    /// coercions (keyed by the source path bytes) so repeated `copyPathToStore`
+    /// of the same path skips re-hashing the file/tree.
+    pub src_to_store: FxHashMap<Vec<u8>, (Vec<u8>, u32)>,
     pub call_depth: usize,
     pub max_call_depth: usize,
     /// (prefix, path) entries, from -I and NIX_PATH.
@@ -255,6 +259,7 @@ impl VM {
             errors: Vec::new(),
             globals: FxHashMap::default(),
             file_cache: Vec::new(),
+            src_to_store: FxHashMap::default(),
             call_depth: 0,
             max_call_depth: 10000,
             last_select_pos: NO_POS,
@@ -2291,6 +2296,9 @@ impl VM {
             );
             return Err(e);
         }
+        if let Some((printed, id)) = self.src_to_store.get(path) {
+            return Ok((printed.clone(), *id));
+        }
         let os = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
         let (hash, _sz) = match jinx_store::nar::hash_path(os, HashAlgorithm::Sha256) {
             Ok(r) => r,
@@ -2329,6 +2337,8 @@ impl VM {
         let id = self.intern_elem(&crate::context::ContextElem::Opaque {
             path: sp.to_string().as_bytes().to_vec(),
         });
+        self.src_to_store
+            .insert(path.to_vec(), (printed.clone(), id));
         Ok((printed, id))
     }
 
