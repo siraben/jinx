@@ -54,6 +54,11 @@ impl Compiler {
     pub fn new() -> Self {
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").unwrap();
+        // Cranelift's IR verifier defaults to ON — pure compile-time waste in
+        // production (JINX_JIT_VERIFY=1 re-enables for debugging).
+        if std::env::var_os("JINX_JIT_VERIFY").is_none() {
+            flags.set("enable_verifier", "false").unwrap();
+        }
         flags.set("use_colocated_libcalls", "false").unwrap();
         flags.set("is_pic", "false").unwrap();
         let isa = cranelift_codegen::isa::lookup(target_lexicon::Triple::host())
