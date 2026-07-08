@@ -2,3 +2,6 @@
 /.oracle
 /result*
 .DS_Store
+
+# local review docs (kept locally, not tracked)
+docs/REVIEW-*.md
