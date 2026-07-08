@@ -487,7 +487,18 @@ mod imp {
                 Err(_) => break, // sender dropped: no more work
             };
             let job = &shared.jobs[idx];
-            let res = read_file_whole(&job.path, job.size);
+            // Guard the read against an unexpected panic: it runs with no lock
+            // held, so a panicking worker would die WITHOUT filling slot[idx]
+            // and (the mutex being unpoisoned) the eval thread would wait on
+            // the condvar forever. Convert a panic into an error in the slot so
+            // the consumer always unblocks; catch_unwind also lets the worker
+            // survive and keep serving the queue.
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_file_whole(&job.path, job.size)
+            }))
+            .unwrap_or_else(|_| {
+                Err(io::Error::other("NAR read-ahead worker panicked"))
+            });
             let mut g = shared.slots.lock().unwrap();
             g[idx] = Some(res);
             shared.cv.notify_all();

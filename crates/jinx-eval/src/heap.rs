@@ -46,6 +46,12 @@ pub struct Heap {
     stats_on: bool,
     /// Base (highest address) of the mutator stack for conservative scanning.
     stack_base: usize,
+    /// The thread that constructed this heap. `stack_base` is that thread's
+    /// stack top, so the conservative `scan_range(sp, stack_base)` is only
+    /// valid if collection always runs on this same thread. Debug-asserted at
+    /// the collection entry to catch a future allocation from a worker thread.
+    #[cfg(debug_assertions)]
+    owner: std::thread::ThreadId,
 
     // ---- generational (sticky mark bit) state ----
     /// Generational collection disabled (JINX_GC_GEN=0): every GC is major.
@@ -100,6 +106,8 @@ impl Heap {
             },
             stats_on: std::env::var_os("JINX_GC_STATS").is_some_and(|v| v != "0"),
             stack_base: current_stack_base(),
+            #[cfg(debug_assertions)]
+            owner: std::thread::current().id(),
             gen_off: std::env::var_os("JINX_GC_GEN").is_some_and(|v| v == "0"),
             young_blocks: Vec::new(),
             remset: Vec::new(),
@@ -423,6 +431,17 @@ impl Heap {
         scan_stack: bool,
         major: bool,
     ) {
+        // The conservative stack scan uses `stack_base`, captured on the owning
+        // thread at construction. Collecting from any other thread would scan a
+        // bogus [sp, stack_base) range (miss real roots -> UAF, or read unmapped
+        // memory -> SIGSEGV). Nothing spawns a heap-touching worker today; this
+        // pins the invariant so a future one fails loudly in debug builds.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            std::thread::current().id(),
+            self.owner,
+            "jinx GC ran on a different thread than the one that built the heap"
+        );
         let t0 = std::time::Instant::now();
         if major {
             // Clear all marks: everything is young again.
@@ -791,6 +810,15 @@ extern "C" fn dump_callee_saved(buf: *mut usize) {
 /// scan performed by `f` covers both the mutator's stack and the registers.
 #[inline(never)]
 fn spill_registers_and(f: impl FnOnce(usize)) {
+    // A mutator heap pointer may live ONLY in a callee-saved register at GC
+    // time; without an arch-specific dump those registers are never scanned and
+    // the object is freed underneath us. Rather than silently mis-collect on an
+    // unsupported arch, fail to build there.
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    compile_error!(
+        "conservative GC register spill (dump_callee_saved) is only implemented \
+         for aarch64 and x86_64; add a variant before targeting another arch"
+    );
     let mut buf = [0usize; 12];
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     dump_callee_saved(buf.as_mut_ptr());
