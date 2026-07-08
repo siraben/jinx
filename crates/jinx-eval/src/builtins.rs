@@ -1395,6 +1395,30 @@ fn hash_placeholder(output_name: &[u8]) -> Vec<u8> {
     out
 }
 
+/// C++ `DownstreamPlaceholder::unknownCaOutput` (downstream-placeholder.cc):
+/// the `.outPath` for an output whose store path is not statically known
+/// (floating content-addressed / impure) is
+/// `/` + nix32(sha256("nix-upstream-output:" + drvPath.hashPart() + ":" +
+/// outputPathName(drvName, outputName))). This is NOT the same as
+/// `hashPlaceholder(name)` (which uses "nix-output:" + name); the interpreter
+/// returns the downstream placeholder for such outputs (`mkOutputStringRaw`).
+fn downstream_placeholder(
+    drv_path: &jinx_store::store_path::StorePath,
+    drv_name: &str,
+    output_name: &str,
+) -> Vec<u8> {
+    let mut clear = b"nix-upstream-output:".to_vec();
+    clear.extend_from_slice(drv_path.hash_part().as_bytes());
+    clear.push(b':');
+    clear.extend_from_slice(
+        jinx_store::store_path::output_path_name(drv_name, output_name).as_bytes(),
+    );
+    let h = hash_string(HashAlgorithm::Sha256, &clear);
+    let mut out = vec![b'/'];
+    out.extend_from_slice(h.to_string(HashFormat::Nix32, false).as_bytes());
+    out
+}
+
 fn prim_placeholder(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
     let name = vm.force_string_no_ctx(
         args[0],
@@ -1931,7 +1955,10 @@ fn derivation_strict_internal(
         .map(|(name, o)| {
             let s = match o.path(&store, &drv_name_s, name) {
                 Ok(Some(p)) => store.print_store_path(&p).into_bytes(),
-                _ => hash_placeholder(name.as_bytes()),
+                // Floating CA / impure / deferred: the path isn't statically
+                // known, so C++ returns the downstream placeholder for this
+                // (drvPath, output), not hashPlaceholder(name).
+                _ => downstream_placeholder(&drv_path, &drv_name_s, name),
             };
             (name.clone(), s)
         })
@@ -5124,21 +5151,21 @@ fn prim_convert_hash(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: Po
         vm.add_trace(
             e,
             NO_POS,
-            "while locating the attribute 'hash' passed to builtins.convertHash",
+            "while locating the attribute 'hash'",
         );
         return Err(e);
     };
     let hash_s = vm.force_string_no_ctx(
         h.val,
         pos,
-        "while evaluating the attribute 'hash' passed to builtins.convertHash",
+        "while evaluating the attribute 'hash'",
     )?;
     let algo = match attrs_get(&attrs, algo_sym) {
         Some(a) => {
             let s = vm.force_string_no_ctx(
                 a.val,
                 pos,
-                "while evaluating the attribute 'hashAlgo' passed to builtins.convertHash",
+                "while evaluating the attribute 'hashAlgo'",
             )?;
             Some(parse_hash_algo(vm, &s, pos)?)
         }
@@ -5149,7 +5176,7 @@ fn prim_convert_hash(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: Po
             let s = vm.force_string_no_ctx(
                 a.val,
                 pos,
-                "while evaluating the attribute 'toHashFormat' passed to builtins.convertHash",
+                "while evaluating the attribute 'toHashFormat'",
             )?;
             match s.as_slice() {
                 b"base16" => HashFormat::Base16,
