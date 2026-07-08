@@ -168,6 +168,18 @@ impl Frame {
     }
 }
 
+/// RAII owner of a jinx-created temp directory: removes it (recursively) on
+/// drop. Used for `git archive` exports of `git+file:` flake inputs so an
+/// evaluation doesn't leave source-tree copies behind in `$TMPDIR`.
+pub struct TempDirGuard(pub std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        // Best-effort: a failure to clean up must not panic during unwind.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 pub struct VM {
     pub heap: Heap,
     pub stack: crate::stack::Stack,
@@ -289,6 +301,12 @@ pub struct VM {
     /// prefix is served from the real directory instead. This stands in for
     /// C++ Nix's lazy trees / a realised store path.
     pub store_redirects: Vec<(Vec<u8>, std::path::PathBuf)>,
+    /// Temp directories jinx itself created during this evaluation (e.g. a
+    /// `git archive` export for a `git+file:` flake input). Dropped with the
+    /// VM, which removes each one, so evaluations don't leak source-tree copies
+    /// into `$TMPDIR`. (Only jinx-created dirs go here; `path:` redirects point
+    /// at the user's real directories and must never be removed.)
+    pub owned_temp_dirs: Vec<TempDirGuard>,
     /// Cached compiled `call-flake.nix` lambda (flake bootstrap).
     pub call_flake_fn: Option<VRef>,
     /// Cached `fetchFinalTree` internal primop cell.
@@ -356,6 +374,7 @@ impl VM {
             built_drvs: FxHashMap::default(),
             apply_prog: None,
             store_redirects: Vec::new(),
+            owned_temp_dirs: Vec::new(),
             call_flake_fn: None,
             fetch_tree_final_fn: None,
             jit: None,
@@ -372,6 +391,12 @@ impl VM {
     /// (an absolute store path) is served from `real_dir`.
     pub fn add_store_redirect(&mut self, store_prefix: Vec<u8>, real_dir: std::path::PathBuf) {
         self.store_redirects.push((store_prefix, real_dir));
+    }
+
+    /// Take ownership of a temp directory jinx created, so it is removed when
+    /// the VM is dropped (see [`TempDirGuard`]).
+    pub fn own_temp_dir(&mut self, dir: std::path::PathBuf) {
+        self.owned_temp_dirs.push(TempDirGuard(dir));
     }
 
     /// Translate a logical path to a real on-disk path, applying any registered

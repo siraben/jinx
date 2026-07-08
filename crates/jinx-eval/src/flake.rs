@@ -220,8 +220,12 @@ fn fetch_git(vm: &mut VM, attrs: &Attrs, store: &StoreDir, pos: PosIdx) -> Resul
             .map_err(|e| eval_err(vm, format!("determining git HEAD of '{local}': {e}"), pos))?,
     };
 
-    // Export the tree to a persistent temp dir and NAR content-address it.
+    // Export the tree to a temp dir and NAR content-address it. Hand the dir
+    // to the VM immediately so it is removed when the VM drops, even if the
+    // archive below fails -- otherwise every git-flake eval leaks a full
+    // source-tree copy into $TMPDIR.
     let export = make_temp_dir();
+    vm.own_temp_dir(export.clone());
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!(
