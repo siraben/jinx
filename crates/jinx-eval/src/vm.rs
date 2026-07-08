@@ -65,8 +65,10 @@ pub fn str_ctx(v: &Value) -> *mut u64 {
 
 /// The string-context ids attached to a string `Value` (empty if none).
 /// A context object stores `header_len` `u32` ids after its header word.
+///
+/// The slice borrows through `v`; callers needing to outlive the borrow copy it.
 #[inline]
-pub fn str_ctx_ids<'a>(v: &Value) -> &'a [u32] {
+pub fn str_ctx_ids<'a>(v: &'a Value) -> &'a [u32] {
     let cp = str_ctx(v);
     if cp.is_null() {
         return &[];

@@ -3963,18 +3963,11 @@ fn prim_cat_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
 fn prim_function_args(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
     vm.force(args[0], pos)?;
     let v = val(args[0]);
-    if v.tag() == Tag::Attrs {
-        if let Some(f) = attrs_get(&v, vm.syms.functor) {
-            let r = vm.call_function(f.val, &[args[0]], pos)?;
-            let rc = vm.alloc_cell(r);
-            let scope = vm.temp_scope();
-            vm.temp_roots.push(rc);
-            let def: &'static PrimOpDef = _d;
-            let out = prim_function_args(vm, def, &[rc], pos);
-            vm.temp_end(scope);
-            return out;
-        }
-    }
+    // C++ `prim_functionArgs` does NOT follow `__functor`: it requires a real
+    // lambda/primop and errors otherwise (even for a valid functor attrset).
+    // The previous `__functor`-following both diverged from that and recursed
+    // through the Rust stack with no depth accounting, so a self-returning
+    // functor (`{ __functor = self: self; }`) aborted with a stack overflow.
     if !matches!(v.tag(), Tag::Closure | Tag::PrimOp | Tag::PrimOpApp) {
         return Err(vm.new_err(ErrKind::Type, "'functionArgs' requires a function", pos));
     }
@@ -4744,12 +4737,24 @@ fn coerce_to_path(vm: &mut VM, cell: VRef, pos: PosIdx, ctx: &str) -> Result<Vec
     }
     if v.tag() == Tag::Attrs {
         if let Some(f) = attrs_get(&v, vm.syms.to_string) {
-            let r = vm.call_function(f.val, &[cell], pos)?;
-            let rc = vm.alloc_cell(r);
-            let scope = vm.temp_scope();
-            vm.temp_roots.push(rc);
-            let out = coerce_to_path(vm, rc, pos, ctx);
-            vm.temp_end(scope);
+            // Bound the __toString-following recursion with the call-depth
+            // counter: a self-returning __toString (`{ __toString = self: self; }`)
+            // would otherwise recurse through the Rust stack and abort. C++
+            // coerceToString hits max-call-depth here; match that.
+            vm.depth_check(pos)?;
+            vm.call_depth += 1;
+            let out = match vm.call_function(f.val, &[cell], pos) {
+                Ok(r) => {
+                    let rc = vm.alloc_cell(r);
+                    let scope = vm.temp_scope();
+                    vm.temp_roots.push(rc);
+                    let o = coerce_to_path(vm, rc, pos, ctx);
+                    vm.temp_end(scope);
+                    o
+                }
+                Err(e) => Err(e),
+            };
+            vm.call_depth -= 1;
             return out;
         }
     }

@@ -470,9 +470,18 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Rule::Float => {
-                    let s = std::str::from_utf8(&rest[..len]).unwrap().to_string();
+                    let s = std::str::from_utf8(&rest[..len]).unwrap();
                     let v: f64 = s.parse().unwrap_or(f64::INFINITY);
-                    if v.is_infinite() {
+                    // C++ Nix parses floats with strtod and rejects them on
+                    // errno==ERANGE, which fires on OVERFLOW (inf) *and*
+                    // UNDERFLOW (a subnormal result, or a nonzero literal that
+                    // flushes to zero). Rust's parse() silently rounds, so
+                    // replicate all three: `1e400` (inf), `1e-310` (subnormal)
+                    // and `1e-400` (flush-to-zero of a nonzero literal) are all
+                    // "invalid float" in C++.
+                    let flushed_to_zero =
+                        v == 0.0 && s.bytes().any(|b| b.is_ascii_digit() && b != b'0');
+                    if v.is_infinite() || v.is_subnormal() || flushed_to_zero {
                         self.adjust_loc(len);
                         self.pos += len;
                         return Err(ParseError::new(

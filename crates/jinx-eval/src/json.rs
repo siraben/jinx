@@ -402,7 +402,19 @@ fn json_to_value(vm: &mut VM, j: &serde_json::Value) -> Result<Value, ErrId> {
                     jinx_syntax::pos::NO_POS,
                 ));
             } else {
-                Value::float(n.as_f64().unwrap_or(f64::NAN))
+                // C++ Nix (nlohmann::json) rejects an out-of-range number
+                // rather than yielding a non-finite float; a bare `1e400`
+                // otherwise became a NaN value that even round-trips through
+                // toJSON as null. Error on any non-finite result.
+                let f = n.as_f64().unwrap_or(f64::NAN);
+                if !f.is_finite() {
+                    return Err(vm.new_err(
+                        ErrKind::Eval,
+                        format!("JSON number '{n}' is out of range for a Nix float"),
+                        jinx_syntax::pos::NO_POS,
+                    ));
+                }
+                Value::float(f)
             }
         }
         serde_json::Value::String(s) => {
