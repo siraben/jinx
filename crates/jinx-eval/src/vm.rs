@@ -63,6 +63,22 @@ pub fn str_ctx(v: &Value) -> *mut u64 {
     unsafe { value::str_parts(v.ptr() as *const u64).1 }
 }
 
+/// The string-context ids attached to a string `Value` (empty if none).
+/// A context object stores `header_len` `u32` ids after its header word.
+#[inline]
+pub fn str_ctx_ids<'a>(v: &Value) -> &'a [u32] {
+    let cp = str_ctx(v);
+    if cp.is_null() {
+        return &[];
+    }
+    // SAFETY: a non-null string-context object holds `header_len` u32 ids
+    // immediately after the header word (see `Heap::new_string`).
+    unsafe {
+        let len = value::header_len(*cp);
+        std::slice::from_raw_parts(cp.add(1) as *const u32, len)
+    }
+}
+
 #[inline]
 pub fn path_bytes<'a>(v: &Value) -> &'a [u8] {
     debug_assert_eq!(v.tag(), Tag::Path);
@@ -2804,19 +2820,7 @@ impl VM {
         self.force(cell, pos)?;
         let v = val(cell);
         match v.tag() {
-            Tag::String => {
-                let mut ctxs = Vec::new();
-                let cp = str_ctx(&v);
-                if !cp.is_null() {
-                    // SAFETY: ctx objects hold u32 ids.
-                    unsafe {
-                        let len = value::header_len(*cp);
-                        let ids = std::slice::from_raw_parts(cp.add(1) as *const u32, len);
-                        ctxs.extend_from_slice(ids);
-                    }
-                }
-                Ok((str_bytes(&v).to_vec(), ctxs))
-            }
+            Tag::String => Ok((str_bytes(&v).to_vec(), str_ctx_ids(&v).to_vec())),
             Tag::Path => {
                 if copy_to_store {
                     let path = path_bytes(&v).to_vec();

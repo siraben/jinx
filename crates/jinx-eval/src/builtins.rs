@@ -15,8 +15,8 @@ use crate::immortal;
 use crate::print;
 use crate::value::{Attr, Tag, VRef, Value};
 use crate::vm::{
-    attrs_entries, attrs_get, canon_path, list_elems, path_bytes, str_bytes, str_ctx, val, VM,
-    PrimOpDef,
+    attrs_entries, attrs_get, canon_path, list_elems, path_bytes, str_bytes, str_ctx, str_ctx_ids,
+    val, VM, PrimOpDef,
 };
 
 type R = Result<Value, ErrId>;
@@ -939,7 +939,12 @@ fn prim_concat_strings_sep(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], p
     )?;
     let elems = list_elems(&val(args[1]));
     let mut out: Vec<u8> = Vec::new();
-    let mut ctx: Vec<u32> = Vec::new();
+    // C++ seeds the string context from the separator UNCONDITIONALLY
+    // (`state.forceString(*args[0], context, ...)`), even when the separator is
+    // never emitted (empty or single-element list). Do the same, so a separator
+    // like `"${storePath}:"` keeps its store-path reference in the result and
+    // dependency closures stay correct.
+    let mut ctx: Vec<u32> = str_ctx_ids(&val(args[0])).to_vec();
     for (i, &el) in elems.iter().enumerate() {
         if i > 0 {
             out.extend_from_slice(&sep);
@@ -3465,8 +3470,16 @@ fn prim_gen_list(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx
         pos,
         "while evaluating the first argument passed to builtins.genList",
     )?;
+    // `len` is an untrusted Nix integer: `Vec::with_capacity` would *panic*
+    // with "capacity overflow" for an absurd count (e.g. `genList f 2^63-1`),
+    // aborting instead of producing a controlled error. A fallible reserve
+    // turns both capacity overflow and real allocation failure into the same
+    // clean evaluator error C++ Nix reports ("out of memory").
+    let mut out: Vec<VRef> = Vec::new();
+    if out.try_reserve_exact(len as usize).is_err() {
+        return Err(vm.new_err(ErrKind::Eval, "out of memory".to_string(), pos));
+    }
     let scope = vm.temp_scope();
-    let mut out: Vec<VRef> = Vec::with_capacity(len as usize);
     for n in 0..len {
         let idx = temp_cell(vm, Value::int(n));
         let t = vm.new_apply_thunk(args[0], &[idx]);
