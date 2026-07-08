@@ -248,10 +248,15 @@ pub extern "C" fn jinx_concat_lists(vm: *mut VM) -> u64 {
     } else if eb.is_empty() {
         va
     } else {
-        let mut items: Vec<VRef> = Vec::with_capacity(ea.len() + eb.len());
-        items.extend_from_slice(ea);
-        items.extend_from_slice(eb);
-        vm.new_list_value(&items)
+        // Mirror the interpreter's `Op::ConcatLists`: run gc_check FIRST, while
+        // `ea`/`eb` (slices into the `va`/`vb` list objects) are still live and
+        // therefore conservatively root the sources, then carve the new object
+        // with the raw `new_list_concat` (no intervening GC). Copying into a
+        // `Vec<VRef>` first and then allocating would leave the only references
+        // to the young elements in an unscanned buffer across the gc_check,
+        // where a collection could reclaim them. (review finding)
+        vm.gc_check();
+        vm.heap.new_list_concat(ea, eb)
     };
     let c = vm.alloc_cell(v);
     vm.stack.push(c);

@@ -660,17 +660,16 @@ fn translate_op(
         }
         Op::AllocCell => plain!("jinx_alloc_cell", &[tr.vm]),
         Op::StoreLocal(s) => {
-            // Inline: pop cell c; dst = stack[base + s]; *dst = *c (16 bytes).
-            let c = tr.pop();
-            let basev = tr.b.use_var(tr.base);
-            let idx = tr.b.ins().iadd_imm(basev, s as i64);
-            let ea = tr.slot_addr(idx);
-            let dst = tr.b.ins().load(I64, tr.flags, ea, 0);
-            let w0 = tr.b.ins().load(I64, tr.flags, c, 0);
-            let w1 = tr.b.ins().load(I64, tr.flags, c, 8);
-            tr.b.ins().store(tr.flags, w0, dst, 0);
-            tr.b.ins().store(tr.flags, w1, dst, 8);
-            false
+            // Must route through the generational write barrier, so call the
+            // `jinx_store_local` helper (which does `VM::set_b`) rather than
+            // storing the 16 bytes inline. `dst = stack[base + s]` can be an
+            // OLD (already-marked) heap cell, and the stored value may point at
+            // YOUNG data; an inline raw store skips logging that old->young
+            // edge in the remset, so a later minor GC would not scan it and
+            // could reclaim the live young data -> dangling pointer. The helper
+            // pops the source cell off the same `vm.stack` the JIT uses.
+            let s32 = tr.iconst32(s);
+            plain!("jinx_store_local", &[tr.vm, tr.fi, s32])
         }
         Op::MakeThunk(cid) => {
             let c = tr.iconst32(cid);
