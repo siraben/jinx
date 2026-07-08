@@ -51,7 +51,16 @@ pub fn to_chars_shortest(f: f64) -> String {
         exp.abs()
     );
 
-    let body = if fixed.len() <= sci.len() { fixed } else { sci };
+    // nlohmann::json::dump (which nix's value-to-json.cc feeds via
+    // `out = v.fpoint()`) chooses fixed vs scientific by the decimal-point
+    // position `dp` (= digits before the point = exp + 1), NOT by whichever
+    // string is shorter. Its `format_buffer` uses kMinExp = -4 and
+    // kMaxExp = numeric_limits<double>::digits10 = 15, printing fixed iff
+    // -4 < dp <= 15 and scientific (exponent dp-1, >=2 exponent digits)
+    // otherwise. Matches nlohmann 3.12.0 byte-for-byte: 100000.0 -> "100000.0"
+    // (fixed), 1e-6 -> "1e-06", 1234567890123456.0 -> "1.234567890123456e+15".
+    let dp = exp + 1;
+    let body = if -4 < dp && dp <= 15 { fixed } else { sci };
     if neg {
         format!("-{body}")
     } else {

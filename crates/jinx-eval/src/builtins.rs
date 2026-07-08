@@ -4905,7 +4905,13 @@ fn prim_read_file(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
     match std::fs::read(&real) {
         Ok(bytes) => Ok(mk_string(vm, &bytes)),
         Err(err) => {
-            let msg = format!("reading file '{}': {}", path, io_msg(&err));
+            // C++ reports a missing path as "path '%s' does not exist", not the
+            // raw OS error (matches prim_hash_file / prim_read_dir above).
+            let msg = if err.kind() == std::io::ErrorKind::NotFound {
+                format!("path '{path}' does not exist")
+            } else {
+                format!("reading file '{}': {}", path, io_msg(&err))
+            };
             Err(vm.new_err(ErrKind::Eval, msg, pos))
         }
     }
@@ -5024,11 +5030,11 @@ fn prim_read_file_type(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
     match path.symlink_metadata() {
         Ok(m) => Ok(mk_string(vm, file_type_str(&m).as_bytes())),
         Err(err) => {
-            let msg = format!(
-                "getting status of '{}': {}",
-                logical.display(),
-                io_msg(&err)
-            );
+            let msg = if err.kind() == std::io::ErrorKind::NotFound {
+                format!("path '{}' does not exist", logical.display())
+            } else {
+                format!("getting status of '{}': {}", logical.display(), io_msg(&err))
+            };
             Err(vm.new_err(ErrKind::Eval, msg, pos))
         }
     }
@@ -5281,11 +5287,12 @@ fn read_source(vm: &mut VM, resolved: &Path, pos: PosIdx) -> Result<Vec<u8>, Err
     }
     let real = vm.redirect_fs(resolved);
     std::fs::read(&real).map_err(|err| {
-        vm.new_err(
-            ErrKind::Eval,
-            format!("opening file '{}': {}", resolved.display(), io_msg(&err)),
-            pos,
-        )
+        let msg = if err.kind() == std::io::ErrorKind::NotFound {
+            format!("path '{}' does not exist", resolved.display())
+        } else {
+            format!("opening file '{}': {}", resolved.display(), io_msg(&err))
+        };
+        vm.new_err(ErrKind::Eval, msg, pos)
     })
 }
 

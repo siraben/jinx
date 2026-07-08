@@ -521,7 +521,12 @@ impl<'a> Compiler<'a> {
                 else_,
             } => {
                 let (pos, cond, then, else_) = (*pos, *cond, *then, *else_);
-                self.compile_expr(cond);
+                // Defer forcing to ForceBool (via a maybe-thunk) so a condition
+                // that throws/recurses gets the "while evaluating the condition"
+                // frame attached by ForceBool's map_err -- matching C++ evalBool,
+                // which wraps the whole condition evaluation, not just the final
+                // type check. Bare vars/literals stay allocation-free.
+                self.compile_maybe_thunk(cond, None);
                 self.emit(Op::ForceBool(0), pos);
                 let jf = self.emit_jump(Op::JumpIfFalse, pos);
                 self.bump(-1);
@@ -535,7 +540,9 @@ impl<'a> Compiler<'a> {
             }
             Expr::Assert { pos, cond, body } => {
                 let (pos, cond, body) = (*pos, *cond, *body);
-                self.compile_expr(cond);
+                // See the `if` case: defer forcing so the assertion condition's
+                // trace frame is attached on throw/recursion (matches evalBool).
+                self.compile_maybe_thunk(cond, None);
                 self.emit(Op::ForceBool(1), pos);
                 let jt = self.emit_jump(Op::JumpIfTrue, pos);
                 self.bump(-1);
@@ -676,7 +683,9 @@ impl<'a> Compiler<'a> {
         jump_on_true: bool,
         short_val: bool,
     ) {
-        self.compile_expr(a);
+        // Maybe-thunk both operands so an operand that throws/recurses gets its
+        // "in the left/right operand of the ... operator" frame from ForceBool.
+        self.compile_maybe_thunk(a, None);
         self.emit(Op::ForceBool(ctx_l), pos);
         let j = self.emit_jump(
             if jump_on_true {
@@ -688,7 +697,7 @@ impl<'a> Compiler<'a> {
         );
         self.bump(-1);
         let h = self.height();
-        self.compile_expr(b);
+        self.compile_maybe_thunk(b, None);
         self.emit(Op::ForceBool(ctx_r), pos);
         let jend = self.emit_jump(Op::Jump, NO_POS);
         self.patch_jump(j);

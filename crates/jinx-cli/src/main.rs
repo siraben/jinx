@@ -1157,7 +1157,10 @@ fn report_err(vm: &VM, e: ErrId) {
     // A UsageError triggers the arg-parser's help hint (main.cc), printed at
     // column 0 after the error block.
     if err.kind == ErrKind::Usage {
-        write_stderr_line(b"Try 'nix-instantiate --help' for more information.");
+        // C++ prints the program's own argv[0], not a fixed name (jinx is a
+        // drop-in that may be invoked under any path/symlink).
+        let argv0 = std::env::args().next().unwrap_or_else(|| "nix-instantiate".into());
+        write_stderr_line(format!("Try '{argv0} --help' for more information.").as_bytes());
     }
 }
 
