@@ -2542,7 +2542,7 @@ fn prim_flake_ref_to_string(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], 
     let entries = attrs_entries(&val(args[0])).to_vec();
     let mut map: std::collections::BTreeMap<String, FlakeVal> = std::collections::BTreeMap::new();
     for a in &entries {
-        let key = String::from_utf8_lossy(vm.symbols.resolve(Symbol(a.sym))).into_owned();
+        let key = vm.symbols.resolve_str_lossy(Symbol(a.sym));
         vm.force(a.val, PosIdx(a.pos))?;
         let v = val(a.val);
         let fv = match v.tag() {
@@ -4265,7 +4265,7 @@ fn prim_fetch_tree(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosI
             vm.force(a.val, PosIdx(a.pos))?;
             let v = val(a.val);
             if v.tag() == Tag::Int && v.as_int() < 0 {
-                let name = String::from_utf8_lossy(vm.symbols.resolve(Symbol(a.sym))).into_owned();
+                let name = vm.symbols.resolve_str_lossy(Symbol(a.sym));
                 let msg = format!(
                     "negative value given for 'fetchTree' argument '{}': {}",
                     name,

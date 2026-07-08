@@ -40,4 +40,10 @@ impl SymbolTable {
         assert!(sym.is_set());
         &self.names[(sym.0 - 1) as usize]
     }
+
+    /// The symbol's name as an owned, lossily-decoded `String` — the common
+    /// path when a name is needed for an error message, label, or JSON key.
+    pub fn resolve_str_lossy(&self, sym: Symbol) -> String {
+        String::from_utf8_lossy(self.resolve(sym)).into_owned()
+    }
 }

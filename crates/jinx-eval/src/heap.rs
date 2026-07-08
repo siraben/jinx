@@ -1,14 +1,21 @@
-//! The GC'd value heap: bump allocation into 32 KiB blocks, non-moving
-//! mark-sweep collection.
+//! The GC'd value heap: bump allocation into 32 KiB blocks over one large
+//! contiguous reservation, non-moving **sticky-mark generational** collection.
 //!
-//! Collection = clear marks -> mark from precise roots (VM structures,
-//! supplied by the caller) + conservative scan of the native stack (covers
-//! Rust builtin temporaries and, later, Cranelift JIT frames) -> sweep
-//! (whole blocks with no survivors return to the free pool; partial blocks
-//! are retained as-is and not re-bumped — mark-region style).
+//! A collection marks from precise roots (VM structures, supplied by the
+//! caller) plus a conservative scan of the native stack and callee-saved
+//! registers (covers Rust builtin temporaries and Cranelift JIT frames), then
+//! sweeps mark-region style (whole blocks with no survivors return to the free
+//! pool; partial blocks are retained, not re-bumped). Minor (young-only)
+//! collections additionally trace a remembered set of old cells mutated since
+//! the last GC — logged by a write barrier at the single `vm::set_b` choke
+//! point — and sweep only young blocks; majors run on the first GC, at a
+//! 2x-retained watermark, every 8th collection under stress, or with
+//! JINX_GC_GEN=0. The conservative scan requires collection to run on the same
+//! thread that built the heap (see the debug `owner` assert in `collect_gen`).
 //!
 //! Policy knobs (env): JINX_GC_OFF=1, JINX_GC_STRESS=1, JINX_GC_HEAP_MB=n,
-//! JINX_GC_STATS=1.
+//! JINX_GC_STATS=1, JINX_GC_GEN=0 (disable generational), JINX_GC_YOUNG_MB=n
+//! (young-collection trigger), JINX_GC_RESERVE_GB=n (reservation size).
 
 use crate::mem::{BlockKind, BlockSpace, BLOCK_SIZE, GRANULE, LARGE_OBJECT_MIN};
 use crate::value::{self, Attr, ObjKind, Tag, VRef, Value, VALUE_SIZE};

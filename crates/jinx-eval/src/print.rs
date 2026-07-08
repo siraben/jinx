@@ -121,7 +121,7 @@ fn deep_force_body(vm: &mut VM, cell: VRef, seen: &mut HashSet<usize>) -> Result
             for a in attrs_entries(&v) {
                 deep_force_rec(vm, a.val, seen).map_err(|e| {
                     let name =
-                        String::from_utf8_lossy(vm.symbols.resolve(Symbol(a.sym))).into_owned();
+                        vm.symbols.resolve_str_lossy(Symbol(a.sym));
                     vm.add_trace(
                         e,
                         PosIdx(a.pos),

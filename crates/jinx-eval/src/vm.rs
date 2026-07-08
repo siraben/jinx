@@ -1484,10 +1484,10 @@ impl VM {
     }
 
     pub(crate) fn missing_attr_err(&mut self, attrs: &Value, sym: Symbol, pos: PosIdx) -> ErrId {
-        let name = String::from_utf8_lossy(self.symbols.resolve(sym)).into_owned();
+        let name = self.symbols.resolve_str_lossy(sym);
         let cands: Vec<String> = attrs_entries(attrs)
             .iter()
-            .map(|a| String::from_utf8_lossy(self.symbols.resolve(Symbol(a.sym))).into_owned())
+            .map(|a| self.symbols.resolve_str_lossy(Symbol(a.sym)))
             .collect();
         let sugg = best_matches(cands.into_iter(), &name);
         let e = self.new_err(ErrKind::Eval, format!("attribute '{name}' missing"), pos);
@@ -1902,7 +1902,7 @@ impl VM {
                 return Ok(a.val);
             }
         }
-        let name = String::from_utf8_lossy(self.symbols.resolve(sym)).into_owned();
+        let name = self.symbols.resolve_str_lossy(sym);
         Err(self.new_err(
             ErrKind::UndefinedVar,
             format!("undefined variable '{name}'"),
@@ -2062,7 +2062,7 @@ impl VM {
                 return Ok(a.val);
             }
         }
-        let name = String::from_utf8_lossy(self.symbols.resolve(sym)).into_owned();
+        let name = self.symbols.resolve_str_lossy(sym);
         Err(self.new_err(
             ErrKind::UndefinedVar,
             format!("undefined variable '{name}'"),
@@ -2221,7 +2221,7 @@ impl VM {
     /// errors; `"anonymous lambda"` when unnamed. Cold path only.
     fn lambda_raw_name(&self, chunk: &Chunk) -> String {
         if chunk.name.is_set() {
-            String::from_utf8_lossy(self.symbols.resolve(chunk.name)).into_owned()
+            self.symbols.resolve_str_lossy(chunk.name)
         } else {
             "anonymous lambda".into()
         }
@@ -2292,7 +2292,7 @@ impl VM {
                         None => {
                             let name = self.lambda_raw_name(chunk);
                             let fname =
-                                String::from_utf8_lossy(self.symbols.resolve(f.name)).into_owned();
+                                self.symbols.resolve_str_lossy(f.name);
                             let e = self.new_err(
                                 ErrKind::Type,
                                 format!(
@@ -2314,13 +2314,12 @@ impl VM {
                 for a in attrs_entries(&attrs) {
                     if !formals.formals.iter().any(|f| f.name.0 == a.sym) {
                         let name = self.lambda_raw_name(chunk);
-                        let aname = String::from_utf8_lossy(self.symbols.resolve(Symbol(a.sym)))
-                            .into_owned();
+                        let aname = self.symbols.resolve_str_lossy(Symbol(a.sym));
                         let cands: Vec<String> = formals
                             .formals
                             .iter()
                             .map(|f| {
-                                String::from_utf8_lossy(self.symbols.resolve(f.name)).into_owned()
+                                self.symbols.resolve_str_lossy(f.name)
                             })
                             .collect();
                         let sugg = best_matches(cands.into_iter(), &aname);
@@ -2672,8 +2671,7 @@ impl VM {
                     let (iv, jv) = (ea[k].val, eb[k].val);
                     let (ipos, jpos) = (PosIdx(ea[k].pos), PosIdx(eb[k].pos));
                     let name =
-                        String::from_utf8_lossy(self.symbols.resolve(Symbol(ea[k].sym)))
-                            .into_owned();
+                        self.symbols.resolve_str_lossy(Symbol(ea[k].sym));
                     self.assert_eq_values(iv, jv, pos, ctx).map_err(|e| {
                         // Reversed order (push order): rhs, lhs, comparing.
                         if jpos.is_set() {

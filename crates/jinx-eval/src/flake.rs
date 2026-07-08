@@ -508,7 +508,7 @@ fn nix_attrs_to_fetch_attrs(vm: &mut VM, cell: VRef, pos: PosIdx) -> Result<Attr
     let entries = attrs_entries(&av).to_vec();
     let mut out = Attrs::new();
     for a in &entries {
-        let name = String::from_utf8_lossy(vm.symbols.resolve(Symbol(a.sym))).into_owned();
+        let name = vm.symbols.resolve_str_lossy(Symbol(a.sym));
         vm.force(a.val, pos)?;
         let v = val(a.val);
         match v.tag() {
