@@ -36,6 +36,9 @@ pub const BLOCK_SIZE: usize = 32 * 1024;
 pub const BLOCK_ALIGN: usize = BLOCK_SIZE;
 pub const BLOCK_SHIFT: usize = 15;
 pub const GRANULE: usize = 8;
+/// Value-cell size (bytes): uniform, headerless, 2 granules. Matches
+/// `value::VALUE_SIZE`; defined here so mem.rs stays free of a value.rs dep.
+pub const CELL_SIZE: usize = 2 * GRANULE; // 16
 /// Granules per block.
 pub const BLOCK_GRANULES: usize = BLOCK_SIZE / GRANULE; // 4096
 /// Bitmap bytes per block (1 bit per granule).
@@ -201,6 +204,16 @@ pub struct BlockSpace {
     /// granule g is live (only meaningful on start granules). Atomic so
     /// parallel markers can claim bits race-free during a stop-the-world mark.
     marks: Vec<AtomicU8>,
+    /// B1 allocation bitmap arena, same indexing. For a *recyclable* value block
+    /// it is a SNAPSHOT of the mark bitmap taken at the major sweep (bit set =
+    /// live/occupied at recycle time = NOT free). The cell-recycling allocator
+    /// (`next_free_cell`) reads THIS, never the live mark bitmap: the generational
+    /// write barrier clears a live old cell's *mark* bit between collections
+    /// (remset logging), so the mark bitmap does not stay a valid free/occupied
+    /// map during the mutator phase — but `allocs` is immutable until the next
+    /// major re-snapshots it, so a barrier-cleared live cell is never mistaken
+    /// for free (the exact bug the snapshot fixes; Go's allocBits vs gcmarkBits).
+    allocs: Vec<u8>,
     free: Vec<usize>, // indices of empty blocks available for reuse
     pub large: Vec<LargeObject>,
     /// Bounds of large-object mappings, for fast conservative filtering.
@@ -261,6 +274,7 @@ impl BlockSpace {
             bumps: Vec::new(),
             starts: Vec::new(),
             marks: Vec::new(),
+            allocs: Vec::new(),
             free: Vec::new(),
             large: Vec::new(),
             large_lo: usize::MAX,
@@ -277,6 +291,8 @@ impl BlockSpace {
         self.kinds.resize(start + BLOCKS_PER_CHUNK, KIND_FREE);
         self.bumps.resize(start + BLOCKS_PER_CHUNK, 0);
         self.starts
+            .resize((start + BLOCKS_PER_CHUNK) * BITMAP_BYTES, 0);
+        self.allocs
             .resize((start + BLOCKS_PER_CHUNK) * BITMAP_BYTES, 0);
         // AtomicU8 isn't Clone, so grow the marks arena element-by-element.
         self.marks
@@ -422,6 +438,102 @@ impl BlockSpace {
         find_start(&self.starts[Self::bm_range(idx)], granule)
     }
 
+    // ---- B1: value-block cell recycling (Go allocCache pattern) ----
+    //
+    // A recyclable value block is one that survived a *major* sweep with some
+    // (but not all) of its 16-byte cells still live. Its free set is exactly the
+    // complement of the mark bitmap among the cells below the high-water bump.
+    // The allocator drains it by scanning forward with a monotone cell cursor
+    // (Go's `freeindex`): we never revisit a cell behind the cursor within a
+    // mutator epoch, so a handed-out cell can't be handed out twice even though
+    // we never set its mark on allocation (marks are the collector's; they stay
+    // = survivors until the next major recomputes them).
+    //
+    // Cells are 16 B = 2 granules; a cell starting at byte `c*16` occupies the
+    // even granule `2*c`, so cell marks live only on even granules. We scan a
+    // 64-bit word of the mark arena at a time (`allocCache = !marks_word`) and
+    // ctz to the next free *even* granule.
+
+    /// Snapshot the mark bitmap of value block `idx` into its allocation bitmap
+    /// (`allocs[idx] = marks[idx]`). Called at major-sweep recycle classification
+    /// so the recycling allocator has an immutable free-set the generational
+    /// write barrier can't corrupt (see the `allocs` field doc).
+    pub fn snapshot_alloc_bitmap(&mut self, idx: usize) {
+        debug_assert_eq!(self.kinds[idx], KIND_VALUE);
+        let r = Self::bm_range(idx);
+        for k in 0..BITMAP_BYTES {
+            self.allocs[r.start + k] = self.marks[r.start + k].load(Ordering::Relaxed);
+        }
+    }
+
+    /// Next free 16-byte cell in value block `idx` at or after cell index
+    /// `from_cell` (i.e. even granule `2*from_cell`), scanning below the block's
+    /// high-water bump. Returns the byte offset of the cell within the block, or
+    /// `None` if the block is drained. Reads the immutable **allocation bitmap**
+    /// snapshot (not the live marks — the barrier mutates marks mid-mutator); a
+    /// clear alloc bit means the cell was dead at recycle time. The monotone
+    /// cursor guarantees each cell is handed out at most once per epoch.
+    pub fn next_free_cell(&self, idx: usize, from_cell: usize) -> Option<usize> {
+        debug_assert_eq!(self.kinds[idx], KIND_VALUE);
+        let bump_cells = (self.bumps[idx] as usize) / CELL_SIZE;
+        if from_cell >= bump_cells {
+            return None;
+        }
+        let allocs = &self.allocs[Self::bm_range(idx)];
+        let mut cell = from_cell;
+        while cell < bump_cells {
+            // The word of 64 granules (= 32 cells) containing granule 2*cell.
+            let granule = cell * 2;
+            let word_idx = granule / 64; // 8 alloc bytes per 64-granule word
+            // Load the 8-byte alloc word (little-endian) at this word.
+            let base = word_idx * 8;
+            let mut word = 0u64;
+            for k in 0..8 {
+                word |= (allocs[base + k] as u64) << (k * 8);
+            }
+            // Keep only even-granule bits (cell starts); complement so 1 = free.
+            const EVEN: u64 = 0x5555_5555_5555_5555;
+            let bit_in_word = granule % 64;
+            // Free even granules at or after our position within this word.
+            let free = (!word) & EVEN & (!0u64 << bit_in_word);
+            if free != 0 {
+                let g = word_idx * 64 + free.trailing_zeros() as usize;
+                let c = g / 2;
+                if c >= bump_cells {
+                    return None;
+                }
+                return Some(c * CELL_SIZE);
+            }
+            // Advance to the start of the next word.
+            cell = ((word_idx + 1) * 64) / 2;
+        }
+        None
+    }
+
+    /// Set the start bit for a recycled cell (cell start bits are per-granule
+    /// and persist across lives; re-setting is idempotent and keeps the
+    /// invariant "an allocated cell has its start bit set" exact even if a prior
+    /// occupant's start bit had somehow been cleared).
+    #[inline]
+    pub fn set_start_at(&mut self, idx: usize, byte_off: usize) {
+        let granule = byte_off / GRANULE;
+        let byte = idx * BITMAP_BYTES + granule / 8;
+        self.starts[byte] |= 1 << (granule % 8);
+    }
+
+    /// True iff block `idx` is a value block. Used by the sweeper to decide
+    /// recyclability. `idx` must be a live block.
+    #[inline]
+    pub fn is_value_block(&self, idx: usize) -> bool {
+        self.kinds[idx] == KIND_VALUE
+    }
+
+    /// Bump offset (bytes) of block `idx`. Cheap direct load for the recycler.
+    #[inline]
+    pub fn bump_of(&self, idx: usize) -> usize {
+        self.bumps[idx] as usize
+    }
+
     pub fn live_block_indices(&self) -> Vec<usize> {
         (0..self.kinds.len())
             .filter(|&i| self.kinds[i] != KIND_FREE)
@@ -493,5 +605,60 @@ impl BlockSpace {
             aged: false,
         });
         ptr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_free_cell_masking() {
+        let mut sp = BlockSpace::new();
+        let (_base, idx) = sp.acquire(BlockKind::Value);
+        // Simulate 10 allocated cells: bump = 10*16.
+        {
+            let mut m = sp.meta_mut(idx).unwrap();
+            m.set_bump(10 * CELL_SIZE);
+            for c in 0..10 {
+                m.set_start(c * 2); // start bits at even granules
+            }
+        }
+        // Mark cells 0,1,2 and 7 live (granules 0,2,4,14).
+        for &c in &[0usize, 1, 2, 7] {
+            assert!(sp.set_mark(idx, c * 2));
+        }
+        sp.snapshot_alloc_bitmap(idx);
+        // Free cells below bump: 3,4,5,6,8,9.
+        let mut got = Vec::new();
+        let mut cur = 0;
+        while let Some(off) = sp.next_free_cell(idx, cur) {
+            let c = off / CELL_SIZE;
+            got.push(c);
+            cur = c + 1;
+        }
+        assert_eq!(got, vec![3, 4, 5, 6, 8, 9]);
+    }
+
+    #[test]
+    fn next_free_cell_cross_word() {
+        let mut sp = BlockSpace::new();
+        let (_b, idx) = sp.acquire(BlockKind::Value);
+        // 40 cells; cell 32 lives in the 2nd 64-granule word (granule 64).
+        {
+            let mut m = sp.meta_mut(idx).unwrap();
+            m.set_bump(40 * CELL_SIZE);
+        }
+        sp.set_mark(idx, 32 * 2); // granule 64
+        sp.snapshot_alloc_bitmap(idx);
+        // From cell 30, free cells are 30,31,33,34,...,39 (32 is live).
+        let mut got = Vec::new();
+        let mut cur = 30;
+        while let Some(off) = sp.next_free_cell(idx, cur) {
+            let c = off / CELL_SIZE;
+            got.push(c);
+            cur = c + 1;
+        }
+        assert_eq!(got, vec![30, 31, 33, 34, 35, 36, 37, 38, 39]);
     }
 }

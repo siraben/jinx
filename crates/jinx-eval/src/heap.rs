@@ -63,6 +63,16 @@ pub struct Heap {
     /// Current bump blocks (meta indices), if any.
     cur_value: Option<usize>,
     cur_data: Option<usize>,
+    /// B1: value blocks that survived a *major* with free cells below their
+    /// high-water bump, awaiting cell-grain recycling. Drained before a fresh
+    /// block is acquired. Populated at major sweep; each entry is also pushed to
+    /// `young_blocks` so minors re-sweep the young cells recycled into it.
+    recycle_value: Vec<usize>,
+    /// The recyclable value block currently being drained, with a *monotone*
+    /// next-cell cursor (Go `freeindex`): (block idx, next cell index). The
+    /// cursor never moves backward within a mutator epoch, so a recycled cell is
+    /// handed out at most once even though allocation doesn't set its mark bit.
+    cur_value_recycle: Option<(usize, usize)>,
     /// Bytes allocated since the last collection.
     alloc_since_gc: usize,
     /// Footprint (bytes) of retained blocks + large objects after last GC.
@@ -127,6 +137,8 @@ impl Heap {
             space: BlockSpace::new(),
             cur_value: None,
             cur_data: None,
+            recycle_value: Vec::new(),
+            cur_value_recycle: None,
             alloc_since_gc: 0,
             retained: 0,
             min_trigger,
@@ -239,27 +251,76 @@ impl Heap {
 
     #[inline]
     pub fn alloc_value(&mut self, v: Value) -> VRef {
-        let idx = match self.cur_value {
-            Some(i) if self.space.meta(i).unwrap().bump() + VALUE_SIZE <= BLOCK_SIZE => i,
-            _ => {
-                let (_, i) = self.space.acquire(BlockKind::Value);
-                self.young_blocks.push(i);
-                self.cur_value = Some(i);
-                i
+        // Fast path: bump into the current fresh value block.
+        if let Some(i) = self.cur_value {
+            let mut meta = self.space.meta_mut(i).unwrap();
+            let off = meta.bump();
+            if off + VALUE_SIZE <= BLOCK_SIZE {
+                meta.set_bump(off + VALUE_SIZE);
+                meta.set_start(off / GRANULE);
+                self.alloc_since_gc += VALUE_SIZE;
+                let p = (self.space.base_of(i) + off) as *mut Value;
+                // SAFETY: freshly carved 16-byte cell inside a mapped block.
+                unsafe {
+                    p.write(v);
+                    return NonNull::new_unchecked(p);
+                }
             }
-        };
-        let base = self.space.base_of(idx);
-        let mut meta = self.space.meta_mut(idx).unwrap();
-        let off = meta.bump();
-        meta.set_bump(off + VALUE_SIZE);
-        meta.set_start(off / GRANULE);
+        }
+        self.alloc_value_slow(v)
+    }
+
+    /// Slow path for `alloc_value`: the current bump block is full (or absent).
+    /// B1: drain a recyclable value block's free cells (Immix "recycle before
+    /// fresh") before acquiring a new block. Recycled cells are found by
+    /// scanning the mark bitmap for 0-bits below the high-water bump; the
+    /// monotone cursor guarantees each is handed out once.
+    #[cold]
+    #[inline(never)]
+    fn alloc_value_slow(&mut self, v: Value) -> VRef {
+        let off_idx = self.recycle_or_fresh_value();
+        let (idx, off) = off_idx;
         self.alloc_since_gc += VALUE_SIZE;
-        let p = (base + off) as *mut Value;
-        // SAFETY: freshly carved 16-byte cell inside a mapped block.
+        let p = (self.space.base_of(idx) + off) as *mut Value;
+        // SAFETY: `off` is a fresh or recycled 16-byte cell in a mapped block;
+        // its start bit was set by the (re)allocation, its old contents (if any)
+        // are being overwritten now.
         unsafe {
             p.write(v);
             NonNull::new_unchecked(p)
         }
+    }
+
+    /// Return `(block idx, byte offset)` of a cell to allocate into: first from
+    /// the current recyclable block, then from the recycle list, then a fresh
+    /// block. Sets the cell's start bit.
+    fn recycle_or_fresh_value(&mut self) -> (usize, usize) {
+        // 1. Continue draining the current recyclable block.
+        if let Some((ridx, cursor)) = self.cur_value_recycle {
+            if let Some(off) = self.space.next_free_cell(ridx, cursor) {
+                self.space.set_start_at(ridx, off);
+                self.cur_value_recycle = Some((ridx, off / VALUE_SIZE + 1));
+                return (ridx, off);
+            }
+            self.cur_value_recycle = None; // fully drained
+        }
+        // 2. Pop the next recyclable block off the list.
+        while let Some(ridx) = self.recycle_value.pop() {
+            if let Some(off) = self.space.next_free_cell(ridx, 0) {
+                self.space.set_start_at(ridx, off);
+                self.cur_value_recycle = Some((ridx, off / VALUE_SIZE + 1));
+                return (ridx, off);
+            }
+        }
+        // 3. No recyclable space left: acquire a fresh block and bump.
+        let (_, i) = self.space.acquire(BlockKind::Value);
+        self.young_blocks.push(i);
+        self.cur_value = Some(i);
+        let mut meta = self.space.meta_mut(i).unwrap();
+        let off = meta.bump(); // 0
+        meta.set_bump(off + VALUE_SIZE);
+        meta.set_start(off / GRANULE);
+        (i, off)
     }
 
     /// Allocate a raw data object; returns pointer to its header word.
@@ -549,10 +610,32 @@ impl Heap {
             single_drain(&self.space, seed);
         }
 
+        // DEBUG verification: the mark set must be closed under trace. If a
+        // marked object has an outgoing edge to an unmarked cell/object, the
+        // marker missed a live object (which recycling would then reuse -> UAF).
+        #[cfg(debug_assertions)]
+        if std::env::var_os("JINX_GC_VERIFY").is_some() {
+            self.verify_mark_closure();
+        }
+
         // Sweep. Minor collections only visit blocks allocated since the last
         // collection (old blocks all contain sticky-marked survivors and are
         // retained by construction; their dead space is reclaimed at the next
         // major).
+        //
+        // B1 generational rule: value blocks are only classified as *recyclable*
+        // at MAJOR collections, when the mark bitmap == the exact live set. A
+        // recycled block is pushed to `young_blocks` so minors re-sweep the young
+        // cells allocated into it. To keep the recycle set disjoint from the
+        // bump pointers, we drop `cur_value`/`cur_value_recycle` at a major and
+        // let the allocator re-populate them from the fresh recycle list (the
+        // dropped bump block, if it has live cells, is itself picked back up as a
+        // recyclable block during the sweep loop below).
+        if major {
+            self.cur_value = None;
+            self.cur_value_recycle = None;
+            self.recycle_value.clear();
+        }
         let cur_v = self.cur_value;
         let cur_d = self.cur_data;
         let sweep_set: Vec<usize> = if major {
@@ -569,6 +652,27 @@ impl Heap {
             let any_live = meta.any_marked(used_granules);
             if any_live || Some(idx) == cur_v || Some(idx) == cur_d {
                 retained += BLOCK_SIZE;
+                // B1: a major-surviving value block with free cells below its
+                // bump is recyclable. Snapshot its live mark bitmap into the
+                // immutable allocation bitmap FIRST (the free-set the recycling
+                // allocator will read; the generational barrier mutates marks
+                // between now and reuse, so we can't read marks live), then
+                // `next_free_cell(idx, 0)` is the "has a free cell" test over
+                // that snapshot. Skip fully-full blocks (no gain) and any current
+                // bump block (none for value after the reset above).
+                if major && self.space.is_value_block(idx) {
+                    self.space.snapshot_alloc_bitmap(idx);
+                    if self.space.next_free_cell(idx, 0).is_some() {
+                        // Poison the *free* cells so a stale VRef into a recycled
+                        // hole is caught before the cell is reused. A pinned dead
+                        // cell is marked (in the snapshot), hence never free here,
+                        // so this never clobbers a retained cell. (Debug only.)
+                        #[cfg(debug_assertions)]
+                        self.poison_free_value_cells(idx);
+                        self.recycle_value.push(idx);
+                        self.young_blocks.push(idx);
+                    }
+                }
             } else {
                 if cfg!(debug_assertions) {
                     // Poison released blocks to catch use-after-free.
@@ -638,6 +742,102 @@ impl Heap {
 
     pub fn footprint(&self) -> usize {
         self.retained + self.alloc_since_gc
+    }
+
+    /// Debug (gated by `JINX_GC_VERIFY`): assert the mark bitmap is closed under
+    /// trace after the drain — every marked data object's outgoing cell edges are
+    /// themselves marked. This is the invariant a live-cell recycler depends on:
+    /// if it ever fails, marking missed a live object that recycling would then
+    /// reuse (a UAF). Kept as a first-class debugging tool for Stage B's
+    /// UAF-prone recyclers.
+    #[cfg(debug_assertions)]
+    fn verify_mark_closure(&self) {
+        let check_cell = |v: VRef, ctx: &str| {
+            let addr = v.as_ptr() as usize;
+            if let Some((idx, g)) = self.space.locate(addr) {
+                if self.space.kind_of(idx) == BlockKind::Value && self.space.is_start(idx, g) {
+                    assert!(
+                        self.space.is_marked(idx, g),
+                        "MARK-CLOSURE: {ctx}: marked object -> UNMARKED cell {:#x}",
+                        addr
+                    );
+                }
+            }
+        };
+        for idx in self.space.live_block_indices() {
+            if self.space.kind_of(idx) != BlockKind::Data {
+                continue;
+            }
+            let base = self.space.base_of(idx);
+            let bump = self.space.bump_of(idx);
+            let mut off = 0usize;
+            while off < bump {
+                let g = off / GRANULE;
+                if !self.space.is_start(idx, g) {
+                    off += GRANULE;
+                    continue;
+                }
+                let p = (base + off) as *const u64;
+                // SAFETY: object start below bump.
+                let h = unsafe { *p };
+                let sz = value::obj_size_bytes(h);
+                let rounded = sz.div_ceil(GRANULE) * GRANULE;
+                if self.space.is_marked(idx, g) {
+                    // Trace this object's edges and check each target is marked.
+                    let pm = p as *mut u64;
+                    // SAFETY: live object.
+                    unsafe {
+                        match value::header_kind(h) {
+                            ObjKind::List | ObjKind::Upvals => {
+                                for &e in value::elems(pm) {
+                                    check_cell(e, "list/upvals");
+                                }
+                            }
+                            ObjKind::Bindings => {
+                                for a in value::bindings(pm) {
+                                    check_cell(a.val, "bindings");
+                                }
+                            }
+                            ObjKind::Thunk | ObjKind::PrimApp => {
+                                let (_, elems) = value::code_and_elems(pm);
+                                for &e in elems {
+                                    check_cell(e, "thunk/primapp");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                off += rounded;
+            }
+        }
+    }
+
+    /// Debug-only: poison every free (dead-at-recycle) 16-byte cell of a
+    /// recyclable value block so a stale reference into a recycled hole is
+    /// caught before the cell is reused.
+    ///
+    /// A recyclable value block is RETAINED (locatable), so the conservative
+    /// stack scan of a *later* collection may legitimately pin one of these dead
+    /// cells via a stale stack word (spec R1: "safe leak" — a pinned dead cell is
+    /// simply not reused that cycle). The marker then reads the cell as a
+    /// `Value`, so the poison must be a VALID, inert `Value`, not raw 0x5A: we
+    /// write `Int(0x5A5A_5A5A_5A5A_5A5A)` — a valid tag with no heap payload, so
+    /// `has_heap_payload` is false and the marker ignores it, while the
+    /// distinctive `w1` still flags the corpse in a debugger and makes any
+    /// value-cell UAF read return an obviously-wrong sentinel int.
+    #[cfg(debug_assertions)]
+    fn poison_free_value_cells(&self, idx: usize) {
+        let base = self.space.base_of(idx);
+        let poison = Value::int(0x5A5A_5A5A_5A5A_5A5Au64 as i64);
+        let mut cell = 0usize;
+        while let Some(off) = self.space.next_free_cell(idx, cell) {
+            // SAFETY: `off` is a mapped, dead 16-byte cell being poisoned.
+            unsafe {
+                std::ptr::write((base + off) as *mut Value, poison);
+            }
+            cell = off / VALUE_SIZE + 1;
+        }
     }
 }
 
@@ -1226,11 +1426,192 @@ mod tests {
         // The collector ran to completion and left the keeper intact.
         assert_eq!(unsafe { (*keeper.as_ptr()).as_int() }, 7);
     }
+
+    /// B1: after a major collection leaves a value block partially live, the
+    /// allocator must recycle its free cells (draining the recycle list) instead
+    /// of acquiring fresh blocks — so the live block count stays flat across
+    /// alloc/collect cycles when the survivor set is bounded.
+    #[test]
+    fn b1_recycles_value_cells_across_cycles() {
+        let mut h = Heap::new();
+        // A small live set: a handful of survivor cells scattered so their
+        // blocks are retained but not full.
+        let survivors: Vec<VRef> = (0..8).map(|i| mk_int(&mut h, i)).collect();
+        let mark = |m: &mut Marker, s: &[VRef]| {
+            for &v in s {
+                m.mark_cell(v);
+            }
+        };
+        // Fill a couple of value blocks worth of garbage, then major-collect.
+        // (2048 cells per 32 KiB value block.)
+        for _ in 0..6000 {
+            let _ = mk_int(&mut h, 999);
+        }
+        let s2 = survivors.clone();
+        h.collect(move |m| mark(m, &s2), false);
+        assert!(
+            h.recycle_value_len() > 0,
+            "expected recyclable value blocks after major with survivors"
+        );
+        let blocks_after_first = h.live_block_count();
+
+        // Now churn many alloc/collect cycles. Because each major leaves the
+        // same ~8 survivors, recycling should keep the live block count from
+        // growing unboundedly.
+        for _ in 0..20 {
+            for _ in 0..6000 {
+                let _ = mk_int(&mut h, 999);
+            }
+            let s = survivors.clone();
+            h.collect(move |m| mark(m, &s), false);
+        }
+        let blocks_after_many = h.live_block_count();
+        assert!(
+            blocks_after_many <= blocks_after_first + 2,
+            "value blocks grew despite recycling: {blocks_after_first} -> {blocks_after_many}"
+        );
+        // Survivors intact.
+        for (i, &v) in survivors.iter().enumerate() {
+            assert_eq!(unsafe { (*v.as_ptr()).as_int() }, i as i64);
+        }
+    }
+
+    /// B1: a recycled cell handed out by the allocator must be a distinct,
+    /// writable location that does not alias a live survivor, and survivors must
+    /// keep their values after cells around them are recycled and rewritten.
+    #[test]
+    fn b1_recycled_cells_dont_alias_survivors() {
+        let mut h = Heap::new();
+        // Interleave survivors and garbage in one region so recycled holes sit
+        // between survivors.
+        let mut survivors = Vec::new();
+        for i in 0..1000 {
+            let v = mk_int(&mut h, i);
+            if i % 3 == 0 {
+                survivors.push(v);
+            }
+        }
+        // More garbage to force at least one full+partial block.
+        for _ in 0..4000 {
+            let _ = mk_int(&mut h, 999);
+        }
+        let s = survivors.clone();
+        h.collect(move |m| { for &v in &s { m.mark_cell(v); } }, false);
+
+        // Allocate a wave of new cells with a sentinel value; they land in
+        // recycled holes. None may overwrite a survivor.
+        let mut fresh = Vec::new();
+        for _ in 0..2000 {
+            fresh.push(h.alloc_value(Value::int(-42)));
+        }
+        // Survivors keep their original values (i where i%3==0).
+        for (k, &v) in survivors.iter().enumerate() {
+            assert_eq!(unsafe { (*v.as_ptr()).as_int() }, (k * 3) as i64);
+        }
+        // Fresh cells hold the sentinel and are distinct addresses.
+        for &v in &fresh {
+            assert_eq!(unsafe { (*v.as_ptr()).as_int() }, -42);
+        }
+        let mut addrs: Vec<usize> = fresh.iter().map(|v| v.as_ptr() as usize).collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+        assert_eq!(addrs.len(), fresh.len(), "recycled cells aliased each other");
+        // And fresh cells never alias a survivor.
+        let surv_addrs: std::collections::HashSet<usize> =
+            survivors.iter().map(|v| v.as_ptr() as usize).collect();
+        for &v in &fresh {
+            assert!(!surv_addrs.contains(&(v.as_ptr() as usize)));
+        }
+    }
+
+    /// B1 regression (the write-barrier hazard that motivated the separate
+    /// allocation bitmap): the generational write barrier CLEARS a survivor
+    /// cell's mark bit between collections (remset logging). If the recycler read
+    /// the live mark bitmap, that survivor would look "free" and be handed out,
+    /// aliasing a live cell. Reading the immutable alloc-bitmap SNAPSHOT prevents
+    /// this. Here we recycle a block, then fire the write barrier on a survivor
+    /// in it (clearing its mark), then allocate a wave into the block: the
+    /// survivor's cell must never be reused.
+    #[test]
+    fn b1_barrier_cleared_survivor_not_recycled() {
+        let mut h = Heap::new();
+        // Survivors scattered through a block so it becomes recyclable.
+        let survivors: Vec<VRef> = (0..2000).map(|i| mk_int(&mut h, i)).collect();
+        // Keep every 4th; the rest die.
+        let keep: Vec<VRef> = survivors.iter().copied().step_by(4).collect();
+        let k2 = keep.clone();
+        h.collect(move |m| { for &v in &k2 { m.mark_cell(v); } }, false);
+
+        // Fire the write barrier on each survivor: this clears its (sticky) mark
+        // bit and logs it in the remset — exactly what a thunk-force update does.
+        for &v in &keep {
+            h.write_barrier(v);
+        }
+
+        // Now allocate a large wave into the recyclable block(s). If the recycler
+        // used the live (barrier-cleared) marks, it would hand out a survivor's
+        // cell. With the alloc-bitmap snapshot it must not.
+        let keep_addrs: std::collections::HashSet<usize> =
+            keep.iter().map(|v| v.as_ptr() as usize).collect();
+        let mut fresh = Vec::new();
+        for _ in 0..3000 {
+            fresh.push(h.alloc_value(Value::int(-7)));
+        }
+        for &v in &fresh {
+            assert!(
+                !keep_addrs.contains(&(v.as_ptr() as usize)),
+                "recycled a barrier-cleared LIVE survivor cell"
+            );
+        }
+        // Survivors keep their values (barrier only cleared the mark, not data).
+        for (i, &v) in keep.iter().enumerate() {
+            assert_eq!(unsafe { (*v.as_ptr()).as_int() }, (i * 4) as i64);
+        }
+    }
+
+    /// B1 regression: a recycled-then-poisoned DEAD cell may be conservatively
+    /// pinned by a stale stack word in a *later* collection (spec R1 "safe
+    /// leak"). The marker then reads that cell as a `Value`; the debug poison
+    /// must be a valid, inert `Value` (not raw 0x5A) so this read neither panics
+    /// nor traces a bogus payload. We collect (recycling + poisoning dead cells),
+    /// then feed a dead-cell address back as a conservative root and collect
+    /// again: this must complete cleanly.
+    #[test]
+    fn b1_conservatively_pinned_recycled_dead_cell_is_safe() {
+        let mut h = Heap::new();
+        let keeper = mk_int(&mut h, 1);
+        // Allocate garbage and remember a dead cell's address.
+        let dead: VRef = mk_int(&mut h, 12345);
+        for _ in 0..4000 {
+            let _ = mk_int(&mut h, 999);
+        }
+        // Major collect: `dead` isn't a root, so it's recycled + poisoned.
+        h.collect(|m| m.mark_cell(keeper), false);
+        // Pin the (now dead/poisoned) cell as a conservative-style root and
+        // collect again. The marker reads it as a Value; must not panic/trace.
+        h.collect(
+            |m| {
+                m.mark_cell(keeper);
+                m.mark_cell(dead); // stale pointer to a recycled/poisoned cell
+            },
+            false,
+        );
+        assert_eq!(unsafe { (*keeper.as_ptr()).as_int() }, 1);
+    }
 }
 
 impl Heap {
     #[cfg(test)]
     fn space_large_count(&self) -> usize {
         self.space.large.len()
+    }
+    /// Number of live (allocated) blocks — committed minus free-pool.
+    #[cfg(test)]
+    fn live_block_count(&self) -> usize {
+        self.space.live_block_indices().len()
+    }
+    #[cfg(test)]
+    fn recycle_value_len(&self) -> usize {
+        self.recycle_value.len()
     }
 }
