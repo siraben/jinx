@@ -664,6 +664,39 @@ impl Drop for Heap {
 // ---- shared tracing primitives (over a `&BlockSpace`; mark bits are atomic
 // so these are safe to run from several marker threads at once) ------------
 
+/// Software prefetch (temporal, read) of the cache line at `addr`. Used by the
+/// mark drain to fetch a cell a few pops ahead while the current one is being
+/// traced — the pointer chase into cold cells is the mark loop's dominant cost
+/// (Garner, Blackburn, Frampton, ISMM 2007: the FIFO-buffered prefetch attacks
+/// exactly this miss).
+///
+/// x86_64 has a stable `_mm_prefetch`. aarch64's `_prefetch` intrinsic is still
+/// unstable (rust-lang/rust#117217) and this project builds on stable, so there
+/// the address is simply cache-hint-touched by a volatile read of one word —
+/// `addr` here is always a live, mapped cell (a `VRef` on the worklist), so the
+/// read is non-faulting. On any other arch this is a no-op.
+#[inline(always)]
+fn prefetch_cell(addr: *const Value) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: _mm_prefetch is a pure hint; the pointer is never dereferenced.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(addr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `addr` is a live worklist cell (mapped, non-null); a one-word
+    // volatile read cannot fault and only warms the line.
+    unsafe {
+        let _ = core::ptr::read_volatile(addr as *const u64);
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = addr;
+}
+
+/// FIFO prefetch distance: how many pops ahead to warm a cell. A small window
+/// (Garner et al. use 4-8) gives the hardware prefetcher a bounded, predictable
+/// lead without spilling the hot loop.
+const PREFETCH_DIST: usize = 6;
+
 /// Mark a value cell live; if newly marked, `push` it for later tracing.
 #[inline]
 fn mark_cell_into<F: FnMut(VRef)>(space: &BlockSpace, v: VRef, push: &mut F) {
@@ -811,8 +844,19 @@ impl Marker<'_> {
 }
 
 /// Single-threaded transitive-closure drain of the seed worklist.
+///
+/// The loop pops LIFO (best locality: children just pushed are traced next),
+/// and issues a software prefetch for the cell `PREFETCH_DIST` pops ahead so its
+/// cache line is warm by the time we reach it (R3 / Garner ISMM'07). The window
+/// is bounded by the current worklist length, so it self-limits near the end.
 fn single_drain(space: &BlockSpace, mut worklist: Vec<VRef>) {
     while let Some(v) = worklist.pop() {
+        // Warm the cell we'll pop PREFETCH_DIST iterations from now (if the
+        // worklist is that deep) while this one's payload is being traced.
+        let len = worklist.len();
+        if len > PREFETCH_DIST {
+            prefetch_cell(worklist[len - 1 - PREFETCH_DIST].as_ptr());
+        }
         // SAFETY: v was verified to be an allocated cell when pushed.
         let val = unsafe { *v.as_ptr() };
         if val.has_heap_payload() {
@@ -890,6 +934,14 @@ fn parallel_drain(space: &BlockSpace, seed: Vec<VRef>, nthreads: usize) {
                             // SAFETY: v was an allocated cell when pushed.
                             let val = unsafe { *v.as_ptr() };
                             if val.has_heap_payload() {
+                                // NB: no software prefetch here. A prefetch-
+                                // on-push warms the child too late (crossbeam's
+                                // LIFO Worker pops it almost immediately, and it
+                                // can't be peeked N-ahead like single_drain's
+                                // Vec), and the parallel drain is already
+                                // memory-bandwidth bound (~2-thread saturation),
+                                // so it measured within noise — kept out to
+                                // leave the hot loop small.
                                 trace_data(space, val.ptr(), &mut |c| {
                                     in_flight.fetch_add(1, Ordering::Relaxed);
                                     worker.push(Task(c));
