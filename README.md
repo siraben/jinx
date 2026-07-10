@@ -21,7 +21,7 @@ honestly in [`KNOWN_DIVERGENCES.md`](KNOWN_DIVERGENCES.md).
 | nixpkgs derivation parity | `hello`, `firefox`, ISO, 49-package sample — **byte-identical `.drv` paths** vs C++ Nix |
 | Flakes | `nix eval` parity; `flake.lock` v5–7, `path` + `git+file` fetchers, registry (no lock *generation*) |
 | Store | real writes via `nix-daemon` — `.drv`, `toFile`, `path`/`filterSource`, IFD builds |
-| GC | non-moving sticky-mark generational mark-sweep; passes the suite under forced collection |
+| GC | non-moving sticky-mark generational mark-sweep, **parallel work-stealing mark**; passes the suite under forced collection |
 | JIT | Cranelift, all 40 opcodes; off by default — `--jit` gives **~1.8× on `fib`** |
 | Performance | `parse` **~5×**, nixpkgs evals **~1.2–1.5×** faster than C++ Nix; x86_64-linux validated ([benchmarks](#benchmarks)) |
 
@@ -62,7 +62,8 @@ cargo build --release -p jinx-cli
 Knobs: `--jit=on|off` / `JINX_JIT` / `JINX_JIT_THRESHOLD` (JIT off by default),
 `JINX_JIT_BG=0` (disable background compilation); `JINX_GC_OFF`, `JINX_GC_STRESS`,
 `JINX_GC_STATS`, `JINX_GC_HEAP_MB` (GC min-trigger 1 GiB), `JINX_GC_GEN=0`
-(disable generational collection), `JINX_GC_YOUNG_MB` (young-gen trigger).
+(disable generational collection), `JINX_GC_YOUNG_MB` (young-gen trigger),
+`JINX_GC_THREADS` (parallel marker threads; 1 = single-threaded).
 
 For the benchmark numbers above, build with PGO: `bash bench/pgo-build.sh`
 (instrument → train → merge → rebuild; see `bench/REPORT.md`).
@@ -81,6 +82,13 @@ resident set than C++ Nix's Boehm collector (deliberate; `JINX_GC_GEN=0` /
 `JINX_GC_HEAP_MB` trade it back):
 
 <div align="center"><img src="bench/graphs/rss.svg" alt="Peak RSS: jinx vs C++ Nix" width="660"></div>
+
+The GC's mark phase runs in parallel (work-stealing markers, atomic mark bits;
+`JINX_GC_THREADS`, default up to 4). On a GC-heavy workload it nearly halves the
+mark pause; scaling saturates at ~2 threads (pointer-chasing is memory-bandwidth
+bound):
+
+<div align="center"><img src="bench/graphs/parallel-gc.svg" alt="Parallel GC: single vs parallel marking" width="660"></div>
 
 ### Reproduce
 

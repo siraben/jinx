@@ -1,0 +1,5 @@
+{
+ "workload": "search-workload (nixpkgs metadata walk), 8-core x86_64, idle host",
+ "single":   { "threads": 1, "gc_pause_s": 8.27, "wall_ms": 35384 },
+ "parallel": { "threads": 2, "gc_pause_s": 4.52, "wall_ms": 31219 }
+}

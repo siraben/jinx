@@ -15,6 +15,7 @@
 //! tracked individually.
 
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub const BLOCK_SIZE: usize = 32 * 1024;
 pub const BLOCK_ALIGN: usize = BLOCK_SIZE;
@@ -51,8 +52,11 @@ pub struct BlockMeta {
     /// Object-start bitmap: bit i set iff an object starts at granule i.
     pub starts: Box<[u8; BITMAP_BYTES]>,
     /// Mark bitmap: bit i set iff the object starting at granule i is live.
-    /// (Only meaningful on start granules.)
-    pub marks: Box<[u8; BITMAP_BYTES]>,
+    /// (Only meaningful on start granules.) Atomic so parallel markers can
+    /// claim bits race-free during a stop-the-world mark; `Relaxed` suffices
+    /// because the mutator is paused (object contents are already stable) and
+    /// the only synchronization needed is the atomic claim of the bit itself.
+    pub marks: Box<[AtomicU8; BITMAP_BYTES]>,
     /// Current bump offset (bytes) for the allocator.
     pub bump: usize,
 }
@@ -62,7 +66,7 @@ impl BlockMeta {
         BlockMeta {
             kind,
             starts: Box::new([0u8; BITMAP_BYTES]),
-            marks: Box::new([0u8; BITMAP_BYTES]),
+            marks: Box::new(std::array::from_fn(|_| AtomicU8::new(0))),
             bump: 0,
         }
     }
@@ -75,33 +79,34 @@ impl BlockMeta {
     pub fn is_start(&self, granule: usize) -> bool {
         self.starts[granule / 8] & (1 << (granule % 8)) != 0
     }
+    /// Atomically claim the mark bit; returns `true` iff it was newly set (so
+    /// exactly one marker traces the object even under parallel marking).
     #[inline]
-    pub fn set_mark(&mut self, granule: usize) -> bool {
-        let b = &mut self.marks[granule / 8];
-        let bit = 1 << (granule % 8);
-        let was = *b & bit != 0;
-        *b |= bit;
-        !was
+    pub fn set_mark(&self, granule: usize) -> bool {
+        let bit = 1u8 << (granule % 8);
+        self.marks[granule / 8].fetch_or(bit, Ordering::Relaxed) & bit == 0
     }
     #[inline]
     pub fn is_marked(&self, granule: usize) -> bool {
-        self.marks[granule / 8] & (1 << (granule % 8)) != 0
+        self.marks[granule / 8].load(Ordering::Relaxed) & (1 << (granule % 8)) != 0
     }
     #[inline]
-    pub fn clear_mark(&mut self, granule: usize) {
-        self.marks[granule / 8] &= !(1 << (granule % 8));
+    pub fn clear_mark(&self, granule: usize) {
+        self.marks[granule / 8].fetch_and(!(1u8 << (granule % 8)), Ordering::Relaxed);
     }
-    pub fn clear_marks(&mut self) {
-        self.marks.fill(0);
+    pub fn clear_marks(&self) {
+        for b in self.marks.iter() {
+            b.store(0, Ordering::Relaxed);
+        }
     }
     /// Any mark bit set among the first `granules` granules?
     pub fn any_marked(&self, granules: usize) -> bool {
         let full = granules / 8;
-        if self.marks[..full].iter().any(|&b| b != 0) {
+        if self.marks[..full].iter().any(|b| b.load(Ordering::Relaxed) != 0) {
             return true;
         }
         let rem = granules % 8;
-        rem != 0 && self.marks[full] & ((1u8 << rem) - 1) != 0
+        rem != 0 && self.marks[full].load(Ordering::Relaxed) & ((1u8 << rem) - 1) != 0
     }
     /// Find the granule of the object containing `granule` (scan back for a
     /// start bit). Returns None if no start bit at or before it.
@@ -123,7 +128,8 @@ impl BlockMeta {
 pub struct LargeObject {
     pub ptr: NonNull<u8>,
     pub size: usize,
-    pub marked: bool,
+    /// Atomic so parallel markers can claim it race-free (see `BlockMeta::marks`).
+    pub marked: AtomicBool,
     /// Survived at least one collection (old generation). Minor collections
     /// only sweep un-aged (young) large objects.
     pub aged: bool,
@@ -313,7 +319,7 @@ impl BlockSpace {
         self.large.push(LargeObject {
             ptr,
             size: len,
-            marked: false,
+            marked: AtomicBool::new(false),
             aged: false,
         });
         ptr

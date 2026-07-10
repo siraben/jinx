@@ -521,6 +521,7 @@ name = "jinx-eval"
 version = "0.1.0"
 dependencies = [
  "bstr",
+ "crossbeam-deque",
  "jinx-fetch",
  "jinx-flake",
  "jinx-store",

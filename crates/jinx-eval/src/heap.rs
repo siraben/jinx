@@ -26,6 +26,9 @@ use std::ptr::NonNull;
 // is unaffected (retained*2 growth passes 1 GiB anyway after the first GC).
 const DEFAULT_MIN_TRIGGER: usize = 1024 << 20; // 1 GiB
 const STRESS_TRIGGER: usize = 4 << 10;
+/// Seed size below which parallel marking's thread-spawn overhead isn't worth
+/// it (minor collections trace little); above it, a major trace parallelizes.
+const PAR_MARK_MIN: usize = 50_000;
 
 pub struct GcStats {
     pub collections: u64,
@@ -76,6 +79,12 @@ pub struct Heap {
     major_watermark: usize,
     /// Allocation volume between minor collections (JINX_GC_YOUNG_MB).
     young_trigger: usize,
+    /// Marker threads for the parallel transitive-closure drain (1 = the
+    /// original single-threaded marker). `JINX_GC_THREADS` overrides.
+    mark_threads: usize,
+    /// Seed size above which a trace parallelizes (`JINX_GC_PAR_MIN`; default
+    /// [`PAR_MARK_MIN`]). Set to 0 to force parallel marking (test/stress).
+    par_mark_min: usize,
 }
 
 impl Default for Heap {
@@ -134,6 +143,24 @@ impl Heap {
                 .and_then(|s| s.parse::<usize>().ok())
                 .map(|mb| mb << 20)
                 .unwrap_or(min_trigger),
+            // Default cap of 4: parallel marking is memory-bandwidth bound and
+            // saturates by ~2 threads (measured), so more threads only risk
+            // contention on a loaded host. JINX_GC_THREADS overrides;
+            // JINX_GC_THREADS=1 forces the original single-threaded marker.
+            mark_threads: std::env::var("JINX_GC_THREADS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                        .min(4)
+                }),
+            par_mark_min: std::env::var("JINX_GC_PAR_MIN")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(PAR_MARK_MIN),
         }
     }
 
@@ -455,32 +482,44 @@ impl Heap {
             for idx in self.space.live_block_indices() {
                 self.space.meta_mut(idx).unwrap().clear_marks();
             }
-            for lo in &mut self.space.large {
-                lo.marked = false;
+            for lo in &self.space.large {
+                lo.marked.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             // Every cell will be re-traced from scratch; the remset is moot.
             self.remset.clear();
         }
 
-        let mut marker = Marker {
-            space: &mut self.space,
-            worklist: Vec::with_capacity(1024),
-        };
-        // Remembered set first (minor only; empty on major): old cells whose
-        // contents changed since the last GC. Marking them re-sets their mark
-        // bit and traces whatever they point to now.
+        // Root phase (single-threaded): seed the worklist with directly-reachable
+        // cells from the remembered set, precise VM roots, and the conservative
+        // native-stack scan.
         let remset = std::mem::take(&mut self.remset);
-        for &c in &remset {
-            marker.mark_cell(c);
+        let seed = {
+            let mut marker = Marker {
+                space: &self.space,
+                worklist: Vec::with_capacity(1024),
+            };
+            // Remembered set first (minor only; empty on major): old cells whose
+            // contents changed since the last GC. Marking them re-sets their mark
+            // bit and traces whatever they point to now.
+            for &c in &remset {
+                marker.mark_cell(c);
+            }
+            precise_roots(&mut marker);
+            if scan_stack {
+                let base = self.stack_base;
+                spill_registers_and(|sp| {
+                    marker.scan_range(sp, base);
+                });
+            }
+            std::mem::take(&mut marker.worklist)
+        };
+        // Transitive closure: parallelize a large trace (majors) across marker
+        // threads; small traces (minors) stay single-threaded to avoid overhead.
+        if self.mark_threads > 1 && seed.len() >= self.par_mark_min {
+            parallel_drain(&self.space, seed, self.mark_threads);
+        } else {
+            single_drain(&self.space, seed);
         }
-        precise_roots(&mut marker);
-        if scan_stack {
-            let base = self.stack_base;
-            spill_registers_and(|sp| {
-                marker.scan_range(sp, base);
-            });
-        }
-        marker.drain();
 
         // Sweep. Minor collections only visit blocks allocated since the last
         // collection (old blocks all contain sticky-marked survivors and are
@@ -517,7 +556,7 @@ impl Heap {
         let mut i = 0;
         while i < self.space.large.len() {
             let lo = &mut self.space.large[i];
-            if lo.marked || (!major && lo.aged) {
+            if lo.marked.load(std::sync::atomic::Ordering::Relaxed) || (!major && lo.aged) {
                 if major {
                     retained += lo.size;
                 } else if !lo.aged {
@@ -586,9 +625,119 @@ impl Drop for Heap {
     }
 }
 
-/// Marking context handed to root providers.
+// ---- shared tracing primitives (over a `&BlockSpace`; mark bits are atomic
+// so these are safe to run from several marker threads at once) ------------
+
+/// Mark a value cell live; if newly marked, `push` it for later tracing.
+#[inline]
+fn mark_cell_into<F: FnMut(VRef)>(space: &BlockSpace, v: VRef, push: &mut F) {
+    let addr = v.as_ptr() as usize;
+    if let Some((idx, granule)) = space.locate(addr) {
+        let meta = space.meta(idx).unwrap();
+        // A VRef must resolve to a value-block cell start; a stale field read
+        // from a conservatively-pinned dead object can point elsewhere.
+        if meta.kind == BlockKind::Value && meta.is_start(granule) && meta.set_mark(granule) {
+            push(v);
+        }
+    }
+}
+
+/// Mark a data object live and trace its outgoing cells (pushing newly-marked
+/// ones). Robustness against conservatively-pinned *dead* cells: only follow
+/// genuine data-object starts, else a stale/reused word would be read as an
+/// `ObjHeader` and walked with a bogus length.
+fn trace_data<F: FnMut(VRef)>(space: &BlockSpace, p: *mut u64, push: &mut F) {
+    if p.is_null() {
+        return;
+    }
+    let addr = p as usize;
+    let newly = if let Some((idx, granule)) = space.locate(addr) {
+        let meta = space.meta(idx).unwrap();
+        if meta.kind != BlockKind::Data || !meta.is_start(granule) {
+            return;
+        }
+        meta.set_mark(granule)
+    } else if let Some(li) = space.locate_large(addr) {
+        if space.large[li].ptr.as_ptr() as usize != addr {
+            return;
+        }
+        !space.large[li]
+            .marked
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    } else {
+        return; // immortal (symbol table, code, statics)
+    };
+    if !newly {
+        return;
+    }
+    // SAFETY: p is a live data object header.
+    unsafe {
+        let h = *p;
+        match value::header_kind(h) {
+            ObjKind::Str => {
+                let ctx = *p.add(1) as *mut u64;
+                if !ctx.is_null() {
+                    trace_data(space, ctx, push);
+                }
+            }
+            ObjKind::Ctx | ObjKind::Path => {}
+            ObjKind::List | ObjKind::Upvals => {
+                for &e in value::elems(p) {
+                    mark_cell_into(space, e, push);
+                }
+            }
+            ObjKind::Bindings => {
+                for a in value::bindings(p) {
+                    mark_cell_into(space, a.val, push);
+                }
+            }
+            ObjKind::Thunk | ObjKind::PrimApp => {
+                let (_, elems) = value::code_and_elems(p);
+                for &e in elems {
+                    mark_cell_into(space, e, push);
+                }
+            }
+        }
+    }
+}
+
+/// Resolve an ambiguous stack word to object start(s) and mark them.
+#[inline]
+fn scan_word<F: FnMut(VRef)>(space: &BlockSpace, word: usize, push: &mut F) {
+    if word % GRANULE != 0 {
+        return;
+    }
+    if let Some((idx, granule)) = space.locate(word) {
+        let meta = space.meta(idx).unwrap();
+        match meta.kind {
+            BlockKind::Value => {
+                // Cells are 16 bytes: resolve to the cell start granule.
+                let g = granule & !1;
+                if meta.is_start(g) {
+                    let base = space.base_of(idx);
+                    let cell = (base + g * GRANULE) as *mut Value;
+                    // SAFETY: g is a valid allocated cell start.
+                    mark_cell_into(space, unsafe { NonNull::new_unchecked(cell) }, push);
+                }
+            }
+            BlockKind::Data => {
+                if let Some(g) = meta.find_start(granule) {
+                    let base = space.base_of(idx);
+                    trace_data(space, (base + g * GRANULE) as *mut u64, push);
+                }
+            }
+        }
+    } else if let Some(li) = space.locate_large(word) {
+        let p = space.large[li].ptr.as_ptr() as *mut u64;
+        trace_data(space, p, push);
+    }
+}
+
+/// Marking context handed to root providers. Root marking is single-threaded;
+/// it seeds `worklist` with the directly-reachable cells, and the drain (below,
+/// optionally parallel) computes the transitive closure.
 pub struct Marker<'h> {
-    space: &'h mut BlockSpace,
+    space: &'h BlockSpace,
     worklist: Vec<VRef>,
 }
 
@@ -596,98 +745,17 @@ impl Marker<'_> {
     /// Mark a value cell as live (precise root).
     #[inline]
     pub fn mark_cell(&mut self, v: VRef) {
-        let addr = v.as_ptr() as usize;
-        if let Some((idx, granule)) = self.space.locate(addr) {
-            let meta = self.space.meta_mut(idx).unwrap();
-            // A VRef must resolve to a value-block cell start. A stale field
-            // read from a conservatively-pinned dead object can point elsewhere
-            // (a reused data block); refuse to treat it as a cell then.
-            // A VRef must resolve to a value-block cell start. A stale field
-            // read from a conservatively-pinned dead object can point elsewhere
-            // (a reused data block); refuse to treat it as a cell then.
-            if meta.kind == BlockKind::Value && meta.is_start(granule) && meta.set_mark(granule) {
-                self.worklist.push(v);
-            }
-        }
+        let space = self.space;
+        mark_cell_into(space, v, &mut |c| self.worklist.push(c));
     }
 
     /// Mark a value held by-copy in VM structures (frames, constants): its
-    /// payload data object (if any) is marked directly, without needing the
-    /// value to live in a heap cell.
+    /// payload data object (if any) is traced directly.
     #[inline]
     pub fn mark_value(&mut self, v: &Value) {
         if v.has_heap_payload() {
-            self.mark_data(v.ptr());
-        }
-    }
-
-    /// Mark a data object (header pointer) live; trace its outgoing cells.
-    fn mark_data(&mut self, p: *mut u64) {
-        if p.is_null() {
-            return;
-        }
-        let addr = p as usize;
-        let newly = if let Some((idx, granule)) = self.space.locate(addr) {
-            let meta = self.space.meta_mut(idx).unwrap();
-            // Robustness against conservatively-pinned *dead* cells: the native
-            // stack scan can pin a value cell via a stale word, and that dead
-            // cell may still hold a stale payload pointer whose data object was
-            // already freed (its block released and re-bumped/reused). Precise
-            // roots and live objects always point at a genuine data-object
-            // start, so refuse to follow anything that does not resolve to a
-            // data-block object start — otherwise we would read a reused/interior
-            // location as an ObjHeader and walk a bogus length. (Mirrors the
-            // `find_start`/`is_start` validation the conservative root scan
-            // already applies; here we extend it to precise-content tracing,
-            // which is unsafe once a pinned holder can be stale.)
-            if meta.kind != BlockKind::Data || !meta.is_start(granule) {
-                return;
-            }
-            meta.set_mark(granule)
-        } else if let Some(li) = self.space.locate_large(addr) {
-            // Only a pointer to the large object's start is a genuine object;
-            // a stale interior pointer must not be read as a header.
-            if self.space.large[li].ptr.as_ptr() as usize != addr {
-                return;
-            }
-            let lo = &mut self.space.large[li];
-            let newly = !lo.marked;
-            lo.marked = true;
-            newly
-        } else {
-            return; // immortal (symbol table, code, statics)
-        };
-        if !newly {
-            return;
-        }
-        // SAFETY: p is a live data object header.
-        unsafe {
-            let h = *p;
-            match value::header_kind(h) {
-                ObjKind::Str => {
-                    let ctx = *p.add(1) as *mut u64;
-                    if !ctx.is_null() {
-                        self.mark_data(ctx);
-                    }
-                }
-                ObjKind::Ctx | ObjKind::Path => {}
-                ObjKind::List | ObjKind::Upvals => {
-                    for &e in value::elems(p) {
-                        self.mark_cell(e);
-                    }
-                }
-                ObjKind::Bindings => {
-                    for a in value::bindings(p) {
-                        self.mark_cell(a.val);
-                    }
-                }
-                ObjKind::Thunk | ObjKind::PrimApp => {
-                    let (_, elems) = value::code_and_elems(p);
-                    for &e in elems {
-                        self.mark_cell(e);
-                    }
-                }
-            }
+            let space = self.space;
+            trace_data(space, v.ptr(), &mut |c| self.worklist.push(c));
         }
     }
 
@@ -695,58 +763,118 @@ impl Marker<'_> {
     /// pins the containing object.
     fn scan_range(&mut self, lo: usize, hi: usize) {
         debug_assert!(lo <= hi);
+        let space = self.space;
         let mut a = lo & !(GRANULE - 1);
         while a + 8 <= hi {
             // SAFETY: scanning our own thread's stack memory.
             let word = unsafe { *(a as *const usize) };
-            self.mark_ambiguous(word);
+            scan_word(space, word, &mut |c| self.worklist.push(c));
             a += 8;
         }
     }
+}
 
-    /// A possibly-pointer word from the stack: resolve interior pointers to
-    /// object starts in both value and data blocks.
-    fn mark_ambiguous(&mut self, word: usize) {
-        // Fast reject before locate() (also rejects unaligned).
-        if word % GRANULE != 0 {
-            return;
-        }
-        if let Some((idx, granule)) = self.space.locate(word) {
-            let meta = self.space.meta(idx).unwrap();
-            match meta.kind {
-                BlockKind::Value => {
-                    // Cells are 16 bytes: resolve to the cell start granule.
-                    let g = granule & !1;
-                    if meta.is_start(g) {
-                        let base = self.space.base_of(idx);
-                        let cell = (base + g * GRANULE) as *mut Value;
-                        // SAFETY: g is a valid allocated cell start.
-                        self.mark_cell(unsafe { NonNull::new_unchecked(cell) });
-                    }
-                }
-                BlockKind::Data => {
-                    if let Some(g) = meta.find_start(granule) {
-                        let base = self.space.base_of(idx);
-                        self.mark_data((base + g * GRANULE) as *mut u64);
-                    }
-                }
-            }
-        } else if let Some(li) = self.space.locate_large(word) {
-            let p = self.space.large[li].ptr.as_ptr() as *mut u64;
-            self.mark_data(p);
+/// Single-threaded transitive-closure drain of the seed worklist.
+fn single_drain(space: &BlockSpace, mut worklist: Vec<VRef>) {
+    while let Some(v) = worklist.pop() {
+        // SAFETY: v was verified to be an allocated cell when pushed.
+        let val = unsafe { *v.as_ptr() };
+        if val.has_heap_payload() {
+            trace_data(space, val.ptr(), &mut |c| worklist.push(c));
         }
     }
+}
 
-    /// Process the worklist to a fixpoint.
-    fn drain(&mut self) {
-        while let Some(v) = self.worklist.pop() {
-            // SAFETY: v was verified to be an allocated cell when pushed.
-            let val = unsafe { *v.as_ptr() };
-            if val.has_heap_payload() {
-                self.mark_data(val.ptr());
-            }
-        }
+/// A `VRef` that can cross marker threads. Safe during stop-the-world marking:
+/// the heap is non-moving and paused, so a cell address is stable and only ever
+/// read (mark bits mutate atomically).
+#[derive(Clone, Copy)]
+struct Task(VRef);
+// SAFETY: see above — sending a cell address between markers is sound while the
+// mutator is stopped and the heap is non-moving.
+unsafe impl Send for Task {}
+
+/// Parallel transitive-closure drain: `nthreads` work-stealing markers.
+///
+/// Correct because the mutator is stopped for the whole collection, so the only
+/// cross-thread mutation is the atomic claim of mark bits / large-object flags
+/// (each object is traced by exactly one marker), and the block-space structure
+/// (metas, bump pointers, large vec) is immutable for the duration.
+fn parallel_drain(space: &BlockSpace, seed: Vec<VRef>, nthreads: usize) {
+    use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let injector = Injector::<Task>::new();
+    // Count of pushed-but-not-yet-completed tasks: hits 0 exactly when the
+    // closure is complete (a task is counted before it becomes findable and
+    // uncounted only after all its children are pushed).
+    let in_flight = AtomicUsize::new(seed.len());
+    for v in seed {
+        injector.push(Task(v));
     }
+    let workers: Vec<Worker<Task>> = (0..nthreads).map(|_| Worker::new_lifo()).collect();
+    let stealers: Vec<Stealer<Task>> = workers.iter().map(|w| w.stealer()).collect();
+
+    // The block space is only atomically mutated during marking and is
+    // otherwise immutable, so a shared `&` may cross threads for this scope.
+    struct SyncSpace<'a>(&'a BlockSpace);
+    // SAFETY: no thread mutates the block-space structure during marking.
+    unsafe impl Sync for SyncSpace<'_> {}
+    let shared = SyncSpace(space);
+
+    std::thread::scope(|scope| {
+        for worker in workers {
+            let injector = &injector;
+            let stealers = &stealers;
+            let in_flight = &in_flight;
+            let shared = &shared;
+            scope.spawn(move || {
+                let space = shared.0;
+                loop {
+                    let task = worker.pop().or_else(|| loop {
+                        match injector.steal_batch_and_pop(&worker) {
+                            Steal::Success(t) => return Some(t),
+                            Steal::Retry => continue,
+                            Steal::Empty => {}
+                        }
+                        let mut retry = false;
+                        for s in stealers.iter() {
+                            match s.steal() {
+                                Steal::Success(t) => return Some(t),
+                                Steal::Retry => retry = true,
+                                Steal::Empty => {}
+                            }
+                        }
+                        if !retry {
+                            return None;
+                        }
+                    });
+                    match task {
+                        Some(Task(v)) => {
+                            // SAFETY: v was an allocated cell when pushed.
+                            let val = unsafe { *v.as_ptr() };
+                            if val.has_heap_payload() {
+                                trace_data(space, val.ptr(), &mut |c| {
+                                    in_flight.fetch_add(1, Ordering::Relaxed);
+                                    worker.push(Task(c));
+                                });
+                            }
+                            in_flight.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        None => {
+                            if in_flight.load(Ordering::Relaxed) == 0 {
+                                break;
+                            }
+                            // No local/stealable work yet but the closure isn't
+                            // done — yield rather than busy-spin so we don't burn
+                            // a core (esp. on an oversubscribed host).
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// Highest scannable address of the current thread's stack.

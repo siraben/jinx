@@ -21,3 +21,4 @@ serde_json = { workspace = true, features = ["arbitrary_precision"] }
 toml.workspace = true
 regex.workspace = true
 libc.workspace = true
+crossbeam-deque.workspace = true
