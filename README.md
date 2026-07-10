@@ -21,9 +21,9 @@ honestly in [`KNOWN_DIVERGENCES.md`](KNOWN_DIVERGENCES.md).
 | nixpkgs derivation parity | `hello`, `firefox`, ISO, 49-package sample — **byte-identical `.drv` paths** vs C++ Nix |
 | Flakes | `nix eval` parity; `flake.lock` v5–7, `path` + `git+file` fetchers, registry (no lock *generation*) |
 | Store | real writes via `nix-daemon` — `.drv`, `toFile`, `path`/`filterSource`, IFD builds |
-| GC | non-moving sticky-mark generational mark-sweep, **parallel work-stealing mark**; passes the suite under forced collection |
-| JIT | Cranelift, all 40 opcodes; off by default — `--jit` gives **~1.8× on `fib`** |
-| Performance | `parse` **~5×**, nixpkgs evals **~1.2–1.5×** faster than C++ Nix; x86_64-linux validated ([benchmarks](#benchmarks)) |
+| GC | non-moving sticky-mark generational mark-region (Immix-style cell recycling, flat block metadata, prefetched **parallel work-stealing mark**, geometric growth policy); passes the suite under forced collection |
+| JIT | Cranelift, all 40 opcodes; off by default — `--jit` wins only on compute-dense code |
+| Performance | `parse` **~4.7×**, nixpkgs evals **~1.3×**, NixOS ISO **~1.7×** faster than C++ Nix; x86_64-linux validated ([benchmarks](#benchmarks)) |
 
 ## Layout
 
@@ -63,7 +63,8 @@ Knobs: `--jit=on|off` / `JINX_JIT` / `JINX_JIT_THRESHOLD` (JIT off by default),
 `JINX_JIT_BG=0` (disable background compilation); `JINX_GC_OFF`, `JINX_GC_STRESS`,
 `JINX_GC_STATS`, `JINX_GC_HEAP_MB` (GC min-trigger 1 GiB), `JINX_GC_GEN=0`
 (disable generational collection), `JINX_GC_YOUNG_MB` (young-gen trigger),
-`JINX_GC_THREADS` (parallel marker threads; 1 = single-threaded).
+`JINX_GC_THREADS` (parallel marker threads), `JINX_GC_GROW` (major growth
+watermark, percent).
 
 For the benchmark numbers above, build with PGO: `bash bench/pgo-build.sh`
 (instrument → train → merge → rebuild; see `bench/REPORT.md`).
@@ -82,13 +83,6 @@ resident set than C++ Nix's Boehm collector (deliberate; `JINX_GC_GEN=0` /
 `JINX_GC_HEAP_MB` trade it back):
 
 <div align="center"><img src="bench/graphs/rss.svg" alt="Peak RSS: jinx vs C++ Nix" width="660"></div>
-
-The GC's mark phase runs in parallel (work-stealing markers, atomic mark bits;
-`JINX_GC_THREADS`, default up to 4). On a GC-heavy workload it nearly halves the
-mark pause; scaling saturates at ~2 threads (pointer-chasing is memory-bandwidth
-bound):
-
-<div align="center"><img src="bench/graphs/parallel-gc.svg" alt="Parallel GC: single vs parallel marking" width="660"></div>
 
 ### Reproduce
 
@@ -111,23 +105,20 @@ is in `bench/REPORT.md`.
 replicates that walk as a plain expression both engines run identically (same
 result, same ~51M thunks):
 
-| cold (no cache) | wall | user CPU | total CPU |
-|---|---|---|---|
-| C++ Nix | 16.6 s | 20.9 s | 22.6 s |
-| **jinx** | 19.9 s | **11.8 s** | **15.1 s** |
+| cold (no cache) | wall | total CPU |
+|---|---|---|
+| C++ Nix | 12.5 s | 19.7 s |
+| **jinx** | 14.4 s | **17.4 s** |
 
-jinx does the eval in **~33% less CPU**, but is slower on wall because C++ Nix
-parallelizes Boehm GC across cores while jinx's collector is single-threaded.
-
-Both are dominated by the fact that it's *cold*. `jinx search` (like `nix search`)
-solves that with a **hot/cold eval cache** stored in **Nix's exact SQLite schema**
+Cold is the wrong way to search, though. `jinx search` (like `nix search`)
+uses a **hot/cold eval cache** stored in **Nix's exact SQLite schema**
 (`Attributes(parent, name, type, value, context)` + the `AttrType` encoding, so
 the DB is format-compatible): the first search evaluates and populates the cache,
 later searches read it back and skip evaluation:
 
 ```
-jinx search: cold (evaluated), 113918 packages, 8 matches in 22.4s
-jinx search: hot (cache),      113918 packages, 8 matches in 0.32s   # 70× faster
+jinx search: cold (evaluated), 113918 packages, 8 matches in 14.8s
+jinx search: hot (cache),      113918 packages, 8 matches in 0.35s   # 42× faster
 ```
 
 jinx's matches are identical to `nix search`'s. Sharing Nix's *exact* cache file
@@ -137,12 +128,15 @@ tree shape (a follow-up); the on-disk schema is already interoperable.
 ## Conformance
 
 ```sh
-# language suite (expects the Nix source tree at /path/to/nix)
-cargo run -q -p jinx-conformance -- --engine ./target/release/jinx
+# language suite (corpus = a NixOS/nix checkout's tests/functional;
+# --corpus or $JINX_CONFORMANCE_CORPUS)
+cargo run -q -p jinx-conformance -- --engine ./target/release/jinx \
+  --corpus /path/to/nix/tests/functional
 
 # strictest correctness gate: every chunk JIT-compiled + GC every ~4 KB
 JINX_JIT=1 JINX_JIT_THRESHOLD=0 JINX_GC_STRESS=1 \
-  cargo run -q -p jinx-conformance -- --engine ./target/release/jinx
+  cargo run -q -p jinx-conformance -- --engine ./target/release/jinx \
+  --corpus /path/to/nix/tests/functional
 ```
 
 ## Known limitations
@@ -169,5 +163,5 @@ LGPL-2.1-or-later (see `COPYING`), matching upstream Nix. jinx is an independent
 reimplementation whose semantics were ported by reading the
 [NixOS/nix](https://github.com/NixOS/nix) sources; a few Nix-language files
 (`derivation.nix`, `call-flake.nix`) are vendored verbatim from that repository.
-Conformance fixtures live in the upstream repo and are read at test time (expected at
-`/path/to/nix`), not vendored.
+Conformance fixtures live in the upstream repo and are read at test time (point
+`--corpus` / `$JINX_CONFORMANCE_CORPUS` at a checkout), not vendored.

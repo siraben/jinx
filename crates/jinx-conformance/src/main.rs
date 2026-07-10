@@ -1,5 +1,5 @@
-//! Conformance runner for the Nix language test suite
-//! (`/path/to/nix/tests/functional/lang`), replicating `lang.sh` semantics
+//! Conformance runner for the Nix language test suite (the `tests/functional/
+//! lang` directory of a NixOS/nix checkout), replicating `lang.sh` semantics
 //! exactly: same env, same flags handling, same pwd-substitution, same
 //! missing-expected-file-means-empty rule, same `.postprocess` hooks.
 //!
@@ -14,8 +14,9 @@ use std::process::{Command, Stdio};
 
 #[derive(Parser)]
 struct Args {
-    /// Path to the tests/functional directory (corpus root; tests live in lang/)
-    #[arg(long, default_value = "$NIX_SRC/tests/functional")]
+    /// Path to a NixOS/nix checkout's tests/functional directory (corpus
+    /// root; tests live in lang/). Defaults to $JINX_CONFORMANCE_CORPUS.
+    #[arg(long, env = "JINX_CONFORMANCE_CORPUS")]
     corpus: PathBuf,
     /// nix-instantiate-compatible binary under test
     #[arg(long)]

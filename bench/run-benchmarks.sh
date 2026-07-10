@@ -10,7 +10,7 @@ set -euo pipefail
 JINX_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 JINX="$JINX_ROOT/target/release/jinx"
 ORACLE="$JINX_ROOT/.oracle/bin/nix-instantiate"
-NIXPKGS="$NIXPKGS"
+NIXPKGS="${NIXPKGS:?set NIXPKGS to a nixpkgs checkout}"
 OUTDIR="${1:-$JINX_ROOT/bench/results}"
 mkdir -p "$OUTDIR"
 

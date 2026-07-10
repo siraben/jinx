@@ -1213,7 +1213,12 @@ mod tests {
     // Ignored by default; run manually with:
     //   cargo test -p jinx-eval regex::tests::fuzz_against_oracle -- --ignored --nocapture
 
-    const ORACLE: &str = "$JINX_ROOT/.oracle/bin/nix-instantiate";
+    /// The pinned oracle in the repo root (`.oracle/`), resolved relative to
+    /// this crate so the ignored fuzz test needs no hardcoded absolute path.
+    const ORACLE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.oracle/bin/nix-instantiate"
+    );
 
     fn oracle_eval(expr: &str) -> Result<String, String> {
         let out = Command::new(ORACLE)

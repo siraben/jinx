@@ -14,7 +14,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NIXPKGS="${NIXPKGS:-$NIXPKGS}"
+NIXPKGS="${NIXPKGS:?set NIXPKGS to a nixpkgs checkout}"
 PGO_DIR="${PGO_DIR:-$ROOT/target/pgo-data}"
 PROFDATA="${PROFDATA:-xcrun llvm-profdata}"
 

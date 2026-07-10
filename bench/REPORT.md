@@ -92,8 +92,8 @@ because C++ nix pays more fixed startup there.)
 **Machine:** Apple M-series (aarch64-darwin), macOS (Darwin 25.3.0)
 **jinx:** release build, **PGO-optimized** (`bench/pgo-build.sh`). **JIT is off
 by default** (see "JIT policy"); jit rows set `JINX_JIT` explicitly.
-**Oracle:** C++ Nix built from `/path/to/nix` master (2.36.0pre, cff1f1138)
-**Workload source:** `/path/to/nixpkgs`
+**Oracle:** C++ Nix built from NixOS/nix master (2.36.0pre, cff1f1138)
+**Workload source:** a nixpkgs checkout
 **Method:** `bench/run-benchmarks.sh` — hyperfine (warmups + multiple runs, raw
 JSON in `bench/results/`) plus interleaved A/B for per-phase deltas, peak RSS
 via `/usr/bin/time -l`, all evals `--readonly-mode` with `NIX_REMOTE=dummy://`.

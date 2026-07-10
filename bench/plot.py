@@ -185,39 +185,7 @@ def chart_rss():
     write("rss.svg", L)
 
 
-# ---- chart 4: parallel GC (single vs parallel marking) ---------------------
-def chart_parallel_gc():
-    p = os.path.join(RES, "parallel-gc.json")
-    if not os.path.exists(p):
-        return
-    d = json.load(open(p))
-    s, par = d["single"], d["parallel"]
-    metrics = [
-        ("GC mark pause", s["gc_pause_s"], par["gc_pause_s"], "s"),
-        ("total wall", s["wall_ms"] / 1000, par["wall_ms"] / 1000, "s"),
-    ]
-    pw, gap, top = 220, 46, 74
-    H, W = 300, len(metrics) * pw + (len(metrics) + 1) * gap
-    L = svg_header(W, H, "Parallel GC: single vs parallel marking (search workload)")
-    baseY, barmax = H - 46, H - 46 - top
-    for i, (label, sv, pv, unit) in enumerate(metrics):
-        cx = gap + i * (pw + gap) + pw / 2
-        m = max(sv, pv) * 1.16
-        sh, ph = barmax * sv / m, barmax * pv / m
-        bw = 62
-        L.append(bar(cx - bw - 8, baseY - sh, bw, sh, ORACLE))
-        L.append(bar(cx + 8, baseY - ph, bw, ph, JINX))
-        L.append(txt(cx - bw / 2 - 8, baseY - sh - 7, f"{sv:.2f}{unit}", 11.5, MUT))
-        L.append(txt(cx + bw / 2 + 8, baseY - ph - 7, f"{pv:.2f}{unit}", 11.5, INK, weight="700"))
-        L.append(txt(cx, baseY + 18, label, 13, INK))
-        L.append(txt(cx, baseY + 34, f"{sv/pv:.2f}× faster", 11, JINX, weight="700"))
-    L.append(bar(W - 250, 44, 12, 12, ORACLE)); L.append(txt(W - 232, 54, "single-threaded", 11.5, MUT, "start"))
-    L.append(bar(W - 118, 44, 12, 12, JINX)); L.append(txt(W - 100, 54, f"parallel ({par['threads']}×)", 11.5, INK, "start"))
-    write("parallel-gc.svg", L)
-
-
 if __name__ == "__main__":
     chart_speedup()
     chart_walltime()
     chart_rss()
-    chart_parallel_gc()

@@ -23,7 +23,7 @@ use jinx_syntax::symbol::Symbol;
 use jinx_syntax::Origin;
 
 /// The `call-flake.nix` helper, vendored verbatim from upstream Nix
-/// `src/libflake/call-flake.nix`. Provenance: /path/to/nix/src/libflake/call-flake.nix.
+/// `src/libflake/call-flake.nix`. Provenance: the NixOS/nix source tree.
 pub const CALL_FLAKE_NIX: &[u8] = include_bytes!("call-flake.nix");
 
 /// Origin name Nix shows for the embedded `call-flake.nix` (the memory source

@@ -17,8 +17,9 @@ is bisected down to the single culprit.
 """
 import random, subprocess, sys, time, os
 
-JINX = os.path.expanduser("/path/to/jinx/target/release/jinx")
-ORACLE = os.path.expanduser("/path/to/jinx/.oracle/bin/nix-instantiate")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+JINX = os.environ.get("JINX", os.path.join(_ROOT, "target/release/jinx"))
+ORACLE = os.environ.get("ORACLE", os.path.join(_ROOT, ".oracle/bin/nix-instantiate"))
 if not os.path.exists(ORACLE):
     ORACLE = "nix-instantiate"
 

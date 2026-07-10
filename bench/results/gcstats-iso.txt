@@ -1,5 +1,5 @@
-jinx gc #1 (major): pause 92.685917ms (remset 0); retained 754 MiB
-jinx gc #2 (minor): pause 95.700833ms (remset 136974); retained 1457 MiB
-jinx gc #3 (minor): pause 91.121042ms (remset 64635); retained 2228 MiB
+jinx gc #1 (major): pause 84.029458ms (remset 0); retained 754 MiB
+jinx gc #2 (minor): pause 102.042417ms (remset 136974); retained 1584 MiB
+jinx gc #3 (minor): pause 92.168208ms (remset 64635); retained 2355 MiB
 warning: you did not specify '--add-root'; the result might be removed by the garbage collector
-jinx gc: 3 collections (1 major), 279.507792ms total pause, 95.700833ms max pause, retained 71325 blocks, peak footprint 2228 MiB, 234532 barrier hits, committed 2256 MiB (free pool 129 MiB), large 210 MiB
+jinx gc: 3 collections (1 major), 278.240083ms total pause, 102.042417ms max pause, retained 75375 blocks, peak footprint 2355 MiB, 234532 barrier hits, committed 2160 MiB (free pool 128 MiB), large 210 MiB

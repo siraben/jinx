@@ -345,7 +345,7 @@ pub fn register_globals(vm: &mut VM) {
 /// The `derivation` builtin's Nix implementation, vendored verbatim from
 /// upstream Nix `src/libexpr/primops/derivation.nix` (comments and doc-comment
 /// included) so that error-trace positions and source excerpts match Nix
-/// exactly. Provenance: copied from /path/to/nix/src/libexpr/primops/derivation.nix.
+/// exactly. Provenance: copied from the NixOS/nix source tree.
 pub(crate) const DERIVATION_NIX_FILE: &[u8] = include_bytes!("derivation-internal.nix");
 
 /// Origin name Nix uses for the embedded derivation wrapper.
