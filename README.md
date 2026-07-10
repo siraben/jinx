@@ -1,33 +1,29 @@
+<div align="center">
+
 # jinx
 
-A JIT-compiling, garbage-collected Nix evaluator in Rust, wire-compatible with
-[Nix](https://github.com/NixOS/nix) where it counts: byte-identical `.drv` files and
-store paths, the daemon worker protocol as a client, and byte-exact evaluation output —
-including error messages and traces — across the entire language conformance corpus, for
-the evaluator surface of `nix-instantiate` and `nix eval` (flakes included).
+**A JIT-compiling, garbage-collected [Nix](https://github.com/NixOS/nix) evaluator in Rust** — byte-identical `.drv` files, store paths, and evaluation output (error messages and traces included) across the entire language conformance corpus.
 
-"Byte-exact" is measured against all 467 upstream `tests/functional/lang` fixtures and
-derivation outputs, not asserted globally: CLI-surface behaviors outside that corpus that
-still differ are enumerated honestly in [`KNOWN_DIVERGENCES.md`](KNOWN_DIVERGENCES.md)
-(mostly upstream position quirks, out-of-scope fetchers, and library-driven parse-error
-wording). Correctness was hardened by two rounds of adversarial differential review.
+<img src="bench/graphs/speedup.svg" alt="jinx speedup vs C++ Nix" width="660">
 
-Built and validated against Nix master (2.36.0pre, worker protocol 1.39) on
-aarch64-darwin.
+</div>
+
+Wire-compatible for the `nix-instantiate` and `nix eval` surface (flakes included),
+built and validated against Nix master (2.36.0pre, worker protocol 1.39) on
+aarch64-darwin. Behaviors outside the 467-fixture corpus that still differ are listed
+honestly in [`KNOWN_DIVERGENCES.md`](KNOWN_DIVERGENCES.md).
 
 ## Status
 
 | Surface | Result |
 |---|---|
-| Nix language test suite (`tests/functional/lang`, 467 fixtures) | **466 pass / 0 fail / 1 skip** (the skip is disabled upstream), byte-exact stdout+stderr incl. `--show-trace` traces |
-| Upstream `lang.sh` harness via PATH shim | passes (EXIT 0, incl. inline assertions) |
-| nixpkgs derivation parity (readonly) | `hello`, `firefox`, 49-package sample: **byte-identical drv paths** vs C++ Nix |
-| NixOS minimal ISO eval (`nixos/release.nix -A iso_minimal.x86_64-linux`) | **byte-identical drv path** (full module system + x86_64-linux from-source bootstrap) |
-| Flakes | `jinx eval --raw /path/to/nixpkgs#hello.drvPath` == `nix eval`; `flake.lock` v5–7, path + git+file fetchers, registry; lock *generation* not implemented |
-| Store | real writes via `nix-daemon` (AddToStore/FramedSink at protocol 1.38): `.drv` files, `toFile`, `path`/`filterSource`; import-from-derivation triggers builds via `BuildPaths` |
-| GC | custom non-moving **sticky-mark generational** mark-sweep (32 KiB blocks over one contiguous reservation with O(1) locate, precise VM roots + conservative native/JIT stack scan, write barrier at a single cell-mutation choke point); minor/major policy with `JINX_GC_GEN=0` escape hatch; full suite passes with forced collections every ~4 KB |
-| JIT | Cranelift tier: all 40 opcodes lowered, entry-point tiering with **background compilation** (worker thread, on by default when the JIT is active; `JINX_JIT_BG=0` for synchronous). Tiering is **off by default** — still a small regression on real nixpkgs evals; `--jit` / `JINX_JIT=1` enables it at threshold 4000 for compute-heavy code, **~1.8× on `fib`**; full suite passes with **every chunk compiled**, alone and combined with GC stress |
-| Performance vs C++ Nix ([graphs](#benchmarks), `bench/REPORT.md`) | PGO build, aarch64-darwin: `parse` **~5× faster**; nixpkgs `-A hello`/`-A firefox` **~1.2–1.3× faster**, NixOS minimal ISO **~1.2–1.5× faster** (load-sensitive). Higher RSS than C++ Nix's Boehm GC (deliberate; `JINX_GC_HEAP_MB` / `JINX_GC_GEN=0` trade it back). Cross-platform: x86_64-linux validated on AMD Ryzen (conformance 466/0/1, byte-identical drv, hello **1.39× faster**). `JINX_NAR_JOBS` opts into parallel NAR IO for cold-cache/CI |
+| Language test suite (467 fixtures) | **466 pass / 0 fail / 1 skip**, byte-exact stdout + stderr (incl. `--show-trace`) |
+| nixpkgs derivation parity | `hello`, `firefox`, ISO, 49-package sample — **byte-identical `.drv` paths** vs C++ Nix |
+| Flakes | `nix eval` parity; `flake.lock` v5–7, `path` + `git+file` fetchers, registry (no lock *generation*) |
+| Store | real writes via `nix-daemon` — `.drv`, `toFile`, `path`/`filterSource`, IFD builds |
+| GC | non-moving sticky-mark generational mark-sweep; passes the suite under forced collection |
+| JIT | Cranelift, all 40 opcodes; off by default — `--jit` gives **~1.8× on `fib`** |
+| Performance | `parse` **~5×**, nixpkgs evals **~1.2–1.5×** faster than C++ Nix; x86_64-linux validated ([benchmarks](#benchmarks)) |
 
 ## Layout
 
@@ -78,15 +74,13 @@ pinned C++ Nix oracle (`.oracle/bin/nix-instantiate`) on nixpkgs, PGO build,
 aarch64-darwin. `parse` and the `-A` evals run jinx's shipping default (JIT
 off); the compute micro-benchmarks show the opt-in JIT.
 
-![jinx speedup vs C++ Nix](bench/graphs/speedup.svg)
-
-![Wall time: jinx vs C++ Nix on real evals](bench/graphs/walltime.svg)
+<div align="center"><img src="bench/graphs/walltime.svg" alt="Wall time: jinx vs C++ Nix on real evals" width="660"></div>
 
 jinx trades memory for speed — its non-moving generational GC keeps a larger
-resident set than C++ Nix's Boehm collector (a deliberate choice; `JINX_GC_GEN=0`
-/ `JINX_GC_HEAP_MB` trade it back):
+resident set than C++ Nix's Boehm collector (deliberate; `JINX_GC_GEN=0` /
+`JINX_GC_HEAP_MB` trade it back):
 
-![Peak RSS: jinx vs C++ Nix](bench/graphs/rss.svg)
+<div align="center"><img src="bench/graphs/rss.svg" alt="Peak RSS: jinx vs C++ Nix" width="660"></div>
 
 ### Reproduce
 
