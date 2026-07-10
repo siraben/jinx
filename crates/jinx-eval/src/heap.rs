@@ -26,6 +26,24 @@ use std::ptr::NonNull;
 // is unaffected (retained*2 growth passes 1 GiB anyway after the first GC).
 const DEFAULT_MIN_TRIGGER: usize = 1024 << 20; // 1 GiB
 const STRESS_TRIGGER: usize = 4 << 10;
+/// Major-collection growth watermark, as a percentage of the retained old
+/// generation: the next major fires once the heap has grown to
+/// `retained * GROW / 100`. 300 (3x) is the R2 default; the geometric-sum
+/// accounting (total major mark work ~= P*a/(a-1) for peak live P and growth
+/// factor a) makes 3x do ~1.5*P total mark work vs 2x's 2*P — deleting ~25% of
+/// total major mark time relative to the old 2x watermark. Override with the
+/// `JINX_GC_GROW` env var (percent; e.g. 400 for 4x). Clamped to >= 150 so a
+/// pathological value can't make majors fire before the heap has grown at all.
+const DEFAULT_GROW_PERCENT: usize = 300;
+/// Floor for the *first* major's next-major watermark. The first major on a
+/// tiny heap (e.g. under stress, or an eval that just crossed the min trigger)
+/// leaves a small `retained`; without a floor the next major would fire almost
+/// immediately (retained * 3 of a few MiB), re-tracing constantly. Anchor the
+/// first watermark at least this far out so early majors are spaced sensibly.
+/// (Stress is unaffected: its 4 KiB `min_trigger` gate still fires minors long
+/// before this watermark, and the every-8th-collection promotion keeps majors
+/// stress-covered.)
+const FIRST_MAJOR_FLOOR: usize = DEFAULT_MIN_TRIGGER;
 /// Seed size below which parallel marking's thread-spawn overhead isn't worth
 /// it (minor collections trace little); above it, a major trace parallelizes.
 const PAR_MARK_MIN: usize = 50_000;
@@ -85,6 +103,9 @@ pub struct Heap {
     /// Seed size above which a trace parallelizes (`JINX_GC_PAR_MIN`; default
     /// [`PAR_MARK_MIN`]). Set to 0 to force parallel marking (test/stress).
     par_mark_min: usize,
+    /// Major-growth watermark as a percent of retained (`JINX_GC_GROW`; default
+    /// [`DEFAULT_GROW_PERCENT`] = 3x). See the constant for the rationale.
+    grow_percent: usize,
 }
 
 impl Default for Heap {
@@ -161,6 +182,11 @@ impl Heap {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(PAR_MARK_MIN),
+            grow_percent: std::env::var("JINX_GC_GROW")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_GROW_PERCENT)
+                .max(150),
         }
     }
 
@@ -197,7 +223,10 @@ impl Heap {
             return self.min_trigger;
         }
         if self.gen_off {
-            return self.min_trigger.max(self.retained * 2);
+            // Non-generational: every GC is major, so gate on the same growth
+            // watermark policy (R2) rather than a hard-coded 2x.
+            let grown = self.retained + self.retained * (self.grow_percent - 100) / 100;
+            return self.min_trigger.max(grown);
         }
         if !self.gc_ran {
             // First collection: honor the min-trigger (avoids collecting at
@@ -578,9 +607,16 @@ impl Heap {
         self.gc_ran = true;
         if major {
             self.stats.majors += 1;
-            // Next major once the old generation has doubled (but at least
-            // half the min trigger of growth).
-            self.major_watermark = (retained * 2).max(retained + self.min_trigger / 2);
+            // Next major once the old generation has grown by `grow_percent`
+            // (R2: geometric growth >= 3x does less total major mark work than
+            // the old 2x). Guarantee at least half the min trigger of absolute
+            // growth so a small retained heap doesn't schedule majors too
+            // tightly, and anchor the *first* major's watermark at the floor so
+            // early majors (esp. on a tiny post-first-major heap) stay spaced.
+            let grown = retained + retained * (self.grow_percent - 100) / 100;
+            self.major_watermark = grown
+                .max(retained + self.min_trigger / 2)
+                .max(if self.stats.majors == 1 { FIRST_MAJOR_FLOOR } else { 0 });
         }
         let pause = t0.elapsed();
         self.stats.collections += 1;
