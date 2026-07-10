@@ -202,9 +202,8 @@ impl Heap {
         }
         let addr = c.as_ptr() as usize;
         if let Some((idx, granule)) = self.space.locate(addr) {
-            let meta = self.space.meta_mut(idx).unwrap();
-            if meta.is_marked(granule) {
-                meta.clear_mark(granule);
+            if self.space.is_marked(idx, granule) {
+                self.space.clear_mark(idx, granule);
                 self.remset.push(c);
                 self.stats.barrier_hits += 1;
             }
@@ -241,7 +240,7 @@ impl Heap {
     #[inline]
     pub fn alloc_value(&mut self, v: Value) -> VRef {
         let idx = match self.cur_value {
-            Some(i) if self.space.meta(i).unwrap().bump + VALUE_SIZE <= BLOCK_SIZE => i,
+            Some(i) if self.space.meta(i).unwrap().bump() + VALUE_SIZE <= BLOCK_SIZE => i,
             _ => {
                 let (_, i) = self.space.acquire(BlockKind::Value);
                 self.young_blocks.push(i);
@@ -250,9 +249,9 @@ impl Heap {
             }
         };
         let base = self.space.base_of(idx);
-        let meta = self.space.meta_mut(idx).unwrap();
-        let off = meta.bump;
-        meta.bump = off + VALUE_SIZE;
+        let mut meta = self.space.meta_mut(idx).unwrap();
+        let off = meta.bump();
+        meta.set_bump(off + VALUE_SIZE);
         meta.set_start(off / GRANULE);
         self.alloc_since_gc += VALUE_SIZE;
         let p = (base + off) as *mut Value;
@@ -275,7 +274,7 @@ impl Heap {
             return p;
         }
         let idx = match self.cur_data {
-            Some(i) if self.space.meta(i).unwrap().bump + rounded <= BLOCK_SIZE => i,
+            Some(i) if self.space.meta(i).unwrap().bump() + rounded <= BLOCK_SIZE => i,
             _ => {
                 let (_, i) = self.space.acquire(BlockKind::Data);
                 self.young_blocks.push(i);
@@ -284,9 +283,9 @@ impl Heap {
             }
         };
         let base = self.space.base_of(idx);
-        let meta = self.space.meta_mut(idx).unwrap();
-        let off = meta.bump;
-        meta.bump = off + rounded;
+        let mut meta = self.space.meta_mut(idx).unwrap();
+        let off = meta.bump();
+        meta.set_bump(off + rounded);
         meta.set_start(off / GRANULE);
         let p = (base + off) as *mut u64;
         // SAFETY: freshly carved region inside a mapped block.
@@ -509,7 +508,7 @@ impl Heap {
         if major {
             // Clear all marks: everything is young again.
             for idx in self.space.live_block_indices() {
-                self.space.meta_mut(idx).unwrap().clear_marks();
+                self.space.clear_marks(idx);
             }
             for lo in &self.space.large {
                 lo.marked.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -565,7 +564,8 @@ impl Heap {
         let mut retained = if major { 0 } else { self.retained };
         for idx in sweep_set {
             let meta = self.space.meta(idx).unwrap();
-            let used_granules = meta.bump / GRANULE;
+            let bump = meta.bump();
+            let used_granules = bump / GRANULE;
             let any_live = meta.any_marked(used_granules);
             if any_live || Some(idx) == cur_v || Some(idx) == cur_d {
                 retained += BLOCK_SIZE;
@@ -575,7 +575,7 @@ impl Heap {
                     let base = self.space.base_of(idx);
                     // SAFETY: block is mapped and being released.
                     unsafe {
-                        std::ptr::write_bytes(base as *mut u8, 0x5A, meta.bump);
+                        std::ptr::write_bytes(base as *mut u8, 0x5A, bump);
                     }
                 }
                 self.space.release(idx);
@@ -669,10 +669,12 @@ impl Drop for Heap {
 fn mark_cell_into<F: FnMut(VRef)>(space: &BlockSpace, v: VRef, push: &mut F) {
     let addr = v.as_ptr() as usize;
     if let Some((idx, granule)) = space.locate(addr) {
-        let meta = space.meta(idx).unwrap();
         // A VRef must resolve to a value-block cell start; a stale field read
         // from a conservatively-pinned dead object can point elsewhere.
-        if meta.kind == BlockKind::Value && meta.is_start(granule) && meta.set_mark(granule) {
+        if space.kind_of(idx) == BlockKind::Value
+            && space.is_start(idx, granule)
+            && space.set_mark(idx, granule)
+        {
             push(v);
         }
     }
@@ -688,11 +690,10 @@ fn trace_data<F: FnMut(VRef)>(space: &BlockSpace, p: *mut u64, push: &mut F) {
     }
     let addr = p as usize;
     let newly = if let Some((idx, granule)) = space.locate(addr) {
-        let meta = space.meta(idx).unwrap();
-        if meta.kind != BlockKind::Data || !meta.is_start(granule) {
+        if space.kind_of(idx) != BlockKind::Data || !space.is_start(idx, granule) {
             return;
         }
-        meta.set_mark(granule)
+        space.set_mark(idx, granule)
     } else if let Some(li) = space.locate_large(addr) {
         if space.large[li].ptr.as_ptr() as usize != addr {
             return;
@@ -744,12 +745,11 @@ fn scan_word<F: FnMut(VRef)>(space: &BlockSpace, word: usize, push: &mut F) {
         return;
     }
     if let Some((idx, granule)) = space.locate(word) {
-        let meta = space.meta(idx).unwrap();
-        match meta.kind {
+        match space.kind_of(idx) {
             BlockKind::Value => {
                 // Cells are 16 bytes: resolve to the cell start granule.
                 let g = granule & !1;
-                if meta.is_start(g) {
+                if space.is_start(idx, g) {
                     let base = space.base_of(idx);
                     let cell = (base + g * GRANULE) as *mut Value;
                     // SAFETY: g is a valid allocated cell start.
@@ -757,7 +757,7 @@ fn scan_word<F: FnMut(VRef)>(space: &BlockSpace, word: usize, push: &mut F) {
                 }
             }
             BlockKind::Data => {
-                if let Some(g) = meta.find_start(granule) {
+                if let Some(g) = space.find_start(idx, granule) {
                     let base = space.base_of(idx);
                     trace_data(space, (base + g * GRANULE) as *mut u64, push);
                 }
