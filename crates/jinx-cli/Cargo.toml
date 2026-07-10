@@ -17,6 +17,7 @@ jinx-flake.workspace = true
 jinx-jit = { workspace = true, optional = true }
 clap.workspace = true
 bstr.workspace = true
+rusqlite.workspace = true
 mimalloc = "0.1.52"
 
 [features]

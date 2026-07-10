@@ -57,6 +57,10 @@ cargo build --release -p jinx-cli
 # nix eval personality (flakes)
 ./target/release/jinx eval --extra-experimental-features 'nix-command flakes' \
   --raw /path/to/nixpkgs#hello.drvPath
+
+# nix search personality — hot/cold eval cache (first run evaluates + caches
+# the whole package set; later runs read the cache and skip evaluation)
+./target/release/jinx search /path/to/nixpkgs ripgrep
 ```
 
 Knobs: `--jit=on|off` / `JINX_JIT` / `JINX_JIT_THRESHOLD` (JIT off by default),
@@ -96,6 +100,37 @@ python3 bench/plot.py                                # bench/results/ -> bench/g
 stats; `plot.py` is zero-dependency (standard library only). Wall-time ratios are
 load-sensitive — run on a quiet machine. Full methodology + per-phase attribution
 is in `bench/REPORT.md`.
+
+### `nix search` workload + eval cache
+
+`nix search` is the heaviest common eval: to match a query it forces `name` +
+`meta.description` for the **entire** recursively-expanded package set
+(~114k–119k derivations, ~52M thunks, ~7 GB allocated). `bench/search-workload.nix`
+replicates that walk as a plain expression both engines run identically (same
+result, same ~51M thunks):
+
+| cold (no cache) | wall | user CPU | total CPU |
+|---|---|---|---|
+| C++ Nix | 16.6 s | 20.9 s | 22.6 s |
+| **jinx** | 19.9 s | **11.8 s** | **15.1 s** |
+
+jinx does the eval in **~33% less CPU**, but is slower on wall because C++ Nix
+parallelizes Boehm GC across cores while jinx's collector is single-threaded.
+
+Both are dominated by the fact that it's *cold*. `jinx search` (like `nix search`)
+solves that with a **hot/cold eval cache** stored in **Nix's exact SQLite schema**
+(`Attributes(parent, name, type, value, context)` + the `AttrType` encoding, so
+the DB is format-compatible): the first search evaluates and populates the cache,
+later searches read it back and skip evaluation:
+
+```
+jinx search: cold (evaluated), 113918 packages, 8 matches in 22.4s
+jinx search: hot (cache),      113918 packages, 8 matches in 0.32s   # 70× faster
+```
+
+jinx's matches are identical to `nix search`'s. Sharing Nix's *exact* cache file
+additionally needs `LockedFlake::getFingerprint` + Nix's precise `AttrCursor`
+tree shape (a follow-up); the on-disk schema is already interoperable.
 
 ## Conformance
 

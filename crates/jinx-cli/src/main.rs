@@ -9,6 +9,9 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod eval_cache;
+mod search;
+
 use jinx_eval::builtins;
 use jinx_eval::error::{best_matches, ErrId, ErrKind};
 use jinx_eval::print;
@@ -259,6 +262,14 @@ fn main() -> ExitCode {
             .stack_size(1 << 29)
             .spawn(move || run_nix_eval(sub))
             .expect("spawn eval thread");
+        return child.join().unwrap_or(ExitCode::FAILURE);
+    }
+    if raw_args.first().map(|s| s.as_str()) == Some("search") {
+        let sub: Vec<String> = raw_args[1..].to_vec();
+        let child = std::thread::Builder::new()
+            .stack_size(1 << 29)
+            .spawn(move || search::run_search(sub))
+            .expect("spawn search thread");
         return child.join().unwrap_or(ExitCode::FAILURE);
     }
 

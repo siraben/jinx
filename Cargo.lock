@@ -502,6 +502,7 @@ dependencies = [
  "jinx-store",
  "jinx-syntax",
  "mimalloc",
+ "rusqlite",
 ]
 
 [[package]]
