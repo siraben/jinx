@@ -28,13 +28,18 @@ const DEFAULT_MIN_TRIGGER: usize = 1024 << 20; // 1 GiB
 const STRESS_TRIGGER: usize = 4 << 10;
 /// Major-collection growth watermark, as a percentage of the retained old
 /// generation: the next major fires once the heap has grown to
-/// `retained * GROW / 100`. 300 (3x) is the R2 default; the geometric-sum
-/// accounting (total major mark work ~= P*a/(a-1) for peak live P and growth
-/// factor a) makes 3x do ~1.5*P total mark work vs 2x's 2*P — deleting ~25% of
-/// total major mark time relative to the old 2x watermark. Override with the
-/// `JINX_GC_GROW` env var (percent; e.g. 400 for 4x). Clamped to >= 150 so a
-/// pathological value can't make majors fire before the heap has grown at all.
-const DEFAULT_GROW_PERCENT: usize = 300;
+/// `retained * GROW / 100`. The geometric-sum accounting (total major mark
+/// work ~= P*a/(a-1) for peak live P and growth factor a) makes 3x do ~1.5*P
+/// total mark work vs 2x's 2*P — deleting ~25% of total major mark time
+/// relative to the old 2x watermark. Default 350 rather than 300: with
+/// value-cell recycling (B1) lowering `retained` at each major, a 3.0x
+/// watermark sits right on the boundary where a batch eval's final
+/// allocations promote one last collect-before-exit into a full-heap major
+/// (measured on the search workload: 2 -> 3 majors, ~2x total pause); 3.5x
+/// clears that boundary with the same asymptotics (~1.4*P). Override with
+/// `JINX_GC_GROW` (percent); clamped to >= 150 so a pathological value can't
+/// make majors fire before the heap has grown at all.
+const DEFAULT_GROW_PERCENT: usize = 350;
 /// Floor for the *first* major's next-major watermark. The first major on a
 /// tiny heap (e.g. under stress, or an eval that just crossed the min trigger)
 /// leaves a small `retained`; without a floor the next major would fire almost
