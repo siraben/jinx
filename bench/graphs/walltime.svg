@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" font-family="-apple-system,Segoe UI,Roboto,sans-serif">
+<rect width="760" height="300" fill="#ffffff"/>
+<text x="380.0" y="28" text-anchor="middle" font-size="17" font-weight="700" fill="#1a1a2e">Wall time: jinx vs C++ Nix on real nixpkgs evals</text>
+<rect x="74.0" y="94.0" width="58.0" height="160.0" rx="3" fill="#9ca3af"/>
+<rect x="148.0" y="120.2" width="58.0" height="133.8" rx="3" fill="#2563eb"/>
+<text x="103.0" y="87.0" text-anchor="middle" font-size="11.5" font-weight="400" fill="#6b7280">214ms</text>
+<text x="177.0" y="113.2" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a1a2e">179ms</text>
+<text x="140.0" y="272.0" text-anchor="middle" font-size="13" font-weight="400" fill="#1a1a2e">hello</text>
+<text x="140.0" y="288.0" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">1.20× faster</text>
+<rect x="314.0" y="94.0" width="58.0" height="160.0" rx="3" fill="#9ca3af"/>
+<rect x="388.0" y="127.6" width="58.0" height="126.4" rx="3" fill="#2563eb"/>
+<text x="343.0" y="87.0" text-anchor="middle" font-size="11.5" font-weight="400" fill="#6b7280">611ms</text>
+<text x="417.0" y="120.6" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a1a2e">483ms</text>
+<text x="380.0" y="272.0" text-anchor="middle" font-size="13" font-weight="400" fill="#1a1a2e">firefox</text>
+<text x="380.0" y="288.0" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">1.27× faster</text>
+<rect x="554.0" y="94.0" width="58.0" height="160.0" rx="3" fill="#9ca3af"/>
+<rect x="628.0" y="146.2" width="58.0" height="107.8" rx="3" fill="#2563eb"/>
+<text x="583.0" y="87.0" text-anchor="middle" font-size="11.5" font-weight="400" fill="#6b7280">10.59s</text>
+<text x="657.0" y="139.2" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a1a2e">7.14s</text>
+<text x="620.0" y="272.0" text-anchor="middle" font-size="13" font-weight="400" fill="#1a1a2e">NixOS ISO</text>
+<text x="620.0" y="288.0" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">1.48× faster</text>
+<rect x="560.0" y="44.0" width="12.0" height="12.0" rx="3" fill="#9ca3af"/>
+<text x="578.0" y="54.0" text-anchor="start" font-size="11.5" font-weight="400" fill="#6b7280">C++ Nix</text>
+<rect x="650.0" y="44.0" width="12.0" height="12.0" rx="3" fill="#2563eb"/>
+<text x="668.0" y="54.0" text-anchor="start" font-size="11.5" font-weight="400" fill="#1a1a2e">jinx</text>
+</svg>

@@ -5,3 +5,4 @@
 
 # local review docs (kept locally, not tracked)
 docs/REVIEW-*.md
+__pycache__/

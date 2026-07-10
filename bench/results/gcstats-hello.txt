@@ -1,2 +1,2 @@
 warning: you did not specify '--add-root'; the result might be removed by the garbage collector
-jinx gc: 0 collections (0 major), 0ns total pause, 0ns max pause, retained 0 blocks, peak footprint 0 MiB, 0 barrier hits, committed 112 MiB (free pool 10 MiB), large 53 MiB
+jinx gc: 0 collections (0 major), 0ns total pause, 0ns max pause, retained 0 blocks, peak footprint 0 MiB, 0 barrier hits, committed 80 MiB (free pool 5 MiB), large 54 MiB

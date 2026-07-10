@@ -27,7 +27,7 @@ aarch64-darwin.
 | Store | real writes via `nix-daemon` (AddToStore/FramedSink at protocol 1.38): `.drv` files, `toFile`, `path`/`filterSource`; import-from-derivation triggers builds via `BuildPaths` |
 | GC | custom non-moving **sticky-mark generational** mark-sweep (32 KiB blocks over one contiguous reservation with O(1) locate, precise VM roots + conservative native/JIT stack scan, write barrier at a single cell-mutation choke point); minor/major policy with `JINX_GC_GEN=0` escape hatch; full suite passes with forced collections every ~4 KB |
 | JIT | Cranelift tier: all 40 opcodes lowered, entry-point tiering with **background compilation** (worker thread, on by default when the JIT is active; `JINX_JIT_BG=0` for synchronous). Tiering is **off by default** — still a small regression on real nixpkgs evals; `--jit` / `JINX_JIT=1` enables it at threshold 4000 for compute-heavy code, **~1.8× on `fib`**; full suite passes with **every chunk compiled**, alone and combined with GC stress |
-| Performance vs C++ Nix (see `bench/REPORT.md`) | PGO build: parse **~4.1× faster**; nixpkgs `-A hello` **1.18× faster**, `-A firefox` **1.19× faster**, NixOS minimal ISO **1.18× faster**; ISO peak RSS cut **−841 MiB** in wave 5 (2.77 GiB). Cross-platform: x86_64-linux validated on AMD Ryzen (conformance 466/0/1, byte-identical drv, hello **1.39× faster**). `JINX_GC_HEAP_MB` / `JINX_GC_GEN=0` trade RSS back; `JINX_NAR_JOBS` opts into parallel NAR IO for cold-cache/CI |
+| Performance vs C++ Nix ([graphs](#benchmarks), `bench/REPORT.md`) | PGO build, aarch64-darwin: `parse` **~5× faster**; nixpkgs `-A hello`/`-A firefox` **~1.2–1.3× faster**, NixOS minimal ISO **~1.2–1.5× faster** (load-sensitive). Higher RSS than C++ Nix's Boehm GC (deliberate; `JINX_GC_HEAP_MB` / `JINX_GC_GEN=0` trade it back). Cross-platform: x86_64-linux validated on AMD Ryzen (conformance 466/0/1, byte-identical drv, hello **1.39× faster**). `JINX_NAR_JOBS` opts into parallel NAR IO for cold-cache/CI |
 
 ## Layout
 
@@ -67,7 +67,37 @@ Knobs: `--jit=on|off` / `JINX_JIT` / `JINX_JIT_THRESHOLD` (JIT off by default),
 For the benchmark numbers above, build with PGO: `bash bench/pgo-build.sh`
 (instrument → train → merge → rebuild; see `bench/REPORT.md`).
 
-## Conformance & benchmarks
+## Benchmarks
+
+Measured with [hyperfine](https://github.com/sharkdp/hyperfine) against the
+pinned C++ Nix oracle (`.oracle/bin/nix-instantiate`) on nixpkgs, PGO build,
+aarch64-darwin. `parse` and the `-A` evals run jinx's shipping default (JIT
+off); the compute micro-benchmarks show the opt-in JIT.
+
+![jinx speedup vs C++ Nix](bench/graphs/speedup.svg)
+
+![Wall time: jinx vs C++ Nix on real evals](bench/graphs/walltime.svg)
+
+jinx trades memory for speed — its non-moving generational GC keeps a larger
+resident set than C++ Nix's Boehm collector (a deliberate choice; `JINX_GC_GEN=0`
+/ `JINX_GC_HEAP_MB` trade it back):
+
+![Peak RSS: jinx vs C++ Nix](bench/graphs/rss.svg)
+
+### Reproduce
+
+```sh
+bash bench/pgo-build.sh                              # PGO binary (the numbers above)
+nix shell nixpkgs#hyperfine -c bash bench/run-benchmarks.sh   # -> bench/results/*.json + rss.txt
+python3 bench/plot.py                                # bench/results/ -> bench/graphs/*.svg
+```
+
+`run-benchmarks.sh` writes per-benchmark hyperfine JSON, a peak-RSS table, and GC
+stats; `plot.py` is zero-dependency (standard library only). Wall-time ratios are
+load-sensitive — run on a quiet machine. Full methodology + per-phase attribution
+is in `bench/REPORT.md`.
+
+## Conformance
 
 ```sh
 # language suite (expects the Nix source tree at /path/to/nix)
@@ -76,9 +106,6 @@ cargo run -q -p jinx-conformance -- --engine ./target/release/jinx
 # strictest correctness gate: every chunk JIT-compiled + GC every ~4 KB
 JINX_JIT=1 JINX_JIT_THRESHOLD=0 JINX_GC_STRESS=1 \
   cargo run -q -p jinx-conformance -- --engine ./target/release/jinx
-
-# benchmark suite vs the C++ oracle (see bench/REPORT.md for results)
-nix shell nixpkgs#hyperfine -c bash bench/run-benchmarks.sh
 ```
 
 ## Known limitations
