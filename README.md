@@ -21,9 +21,9 @@ honestly in [`KNOWN_DIVERGENCES.md`](KNOWN_DIVERGENCES.md).
 | nixpkgs derivation parity | `hello`, `firefox`, ISO, 49-package sample — **byte-identical `.drv` paths** vs C++ Nix |
 | Flakes | `nix eval` parity; `flake.lock` v5–7, `path` + `git+file` fetchers, registry (no lock *generation*) |
 | Store | real writes via `nix-daemon` — `.drv`, `toFile`, `path`/`filterSource`, IFD builds |
-| GC | non-moving sticky-mark generational mark-region (Immix-style cell recycling, flat block metadata, prefetched **parallel work-stealing mark**, geometric growth policy); passes the suite under forced collection |
+| GC | non-moving sticky-mark generational mark-region (Immix-style value-cell + 128-byte data-line recycling, precise execution safepoints, prefetched **parallel work-stealing mark**); passes the suite under forced collection |
 | JIT | Cranelift, all 40 opcodes; off by default — `--jit` wins only on compute-dense code |
-| Performance | `parse` **~4.7×**, nixpkgs evals **~1.3×**, NixOS ISO **~1.7×** faster than C++ Nix; x86_64-linux validated ([benchmarks](#benchmarks)) |
+| Performance | `parse` **~7.4×**, `hello` **~1.50×**, `firefox` **~1.41×**, NixOS ISO **~1.49×** faster than C++ Nix; x86_64-linux validated ([benchmarks](#benchmarks)) |
 
 ## Layout
 
@@ -78,6 +78,21 @@ off); the compute micro-benchmarks show the opt-in JIT.
 
 <div align="center"><img src="bench/graphs/walltime.svg" alt="Wall time: jinx vs C++ Nix on real evals" width="660"></div>
 
+The parity-checked evaluator-strength suite highlights the shapes where jinx's
+specialized representations and builtins have a clear advantage. Each command
+must produce byte-identical stdout before it is timed; see
+[`bench/STRENGTHS.md`](bench/STRENGTHS.md).
+
+<div align="center"><img src="bench/graphs/eval-strengths.svg" alt="Evaluator workloads where jinx materially outperforms C++ Nix" width="700"></div>
+
+The self-contained [compute suite](bench/COMPUTE.md) separately exercises
+strict numerical folds, stable sorting, prime scanning, naive recursion, and
+combinatorial search, plus repeated static-record construction and equality.
+Every published workload outperforms C++ Nix with the shipping interpreter;
+the opt-in JIT extends those wins further.
+
+<div align="center"><img src="bench/graphs/compute.svg" alt="Compute-heavy Nix evaluation: jinx interpreter and JIT relative to C++ Nix" width="700"></div>
+
 jinx trades memory for speed — its non-moving generational GC keeps a larger
 resident set than C++ Nix's Boehm collector (deliberate; `JINX_GC_GEN=0` /
 `JINX_GC_HEAP_MB` trade it back):
@@ -89,6 +104,7 @@ resident set than C++ Nix's Boehm collector (deliberate; `JINX_GC_GEN=0` /
 ```sh
 bash bench/pgo-build.sh                              # PGO binary (the numbers above)
 nix shell nixpkgs#hyperfine -c bash bench/run-benchmarks.sh   # -> bench/results/*.json + rss.txt
+bash bench/run-compute-benchmarks.sh                 # self-contained compute kernels
 python3 bench/plot.py                                # bench/results/ -> bench/graphs/*.svg
 ```
 

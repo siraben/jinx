@@ -93,9 +93,13 @@ def chart_speedup():
         d = load(key)
         if not d or "oracle" not in d:
             continue
-        # For the compute micros (fib/ops) the JIT is the intended config
-        # (labeled below); the real evals show jinx's shipping default (JIT off).
-        jkey = "jit" if key in ("fib", "ops") and "jit" in d else "jinx"
+        # For compute micros show the faster measured jinx configuration and
+        # label it when that is the opt-in JIT. Real evals always show the
+        # shipping default (JIT off).
+        if key in ("fib", "ops") and "jit" in d and "jinx" in d:
+            jkey = min(("jinx", "jit"), key=lambda k: d[k][0])
+        else:
+            jkey = "jinx"
         if jkey not in d:
             jkey = "jinx" if "jinx" in d else "jit"
         speed = d["oracle"][0] / d[jkey][0]

@@ -1,0 +1,10 @@
+timestamp_utc=2026-07-15T00:36:13Z
+system=Darwin siraben-mbp.tail09906.ts.net 25.3.0 Darwin Kernel Version 25.3.0: Wed Jan 28 20:54:38 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T6050 arm64
+jinx=/Users/siraben/Git/jinx/target/release/jinx
+jinx_commit=fe7760e2e40775a414aa50ec84b38065e267bb8e
+jinx_dirty=no
+oracle=/nix/var/nix/profiles/default/bin/nix-instantiate
+oracle_version=nix-instantiate (Determinate Nix 3.17.3) 2.33.3
+nixpkgs=/Users/siraben/Git/nixpkgs
+nixpkgs_commit=96751110ddff6936ea9295e86f4df3b24fa08b3e
+hyperfine=hyperfine 1.20.0

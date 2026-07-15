@@ -9,14 +9,15 @@
 #   PROFDATA="$(nix build --print-out-paths nixpkgs#llvmPackages_21.libllvm)/bin/llvm-profdata"
 #
 # Usage: bash bench/pgo-build.sh
-# Produces target/release/jinx (PGO-optimized). Training data in $PGO_DIR;
-# the merged profile is written to bench/jinx.profdata for reproducibility.
+# Produces target/release/jinx (PGO-optimized). The raw and merged profiles are
+# compiler- and source-specific generated data kept under $PGO_DIR.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NIXPKGS="${NIXPKGS:?set NIXPKGS to a nixpkgs checkout}"
 PGO_DIR="${PGO_DIR:-$ROOT/target/pgo-data}"
 PROFDATA="${PROFDATA:-xcrun llvm-profdata}"
+PROFILE="${PGO_PROFILE:-$PGO_DIR/jinx.profdata}"
 
 export NIX_REMOTE=dummy:// NIX_STORE_DIR=/nix/store
 
@@ -25,17 +26,21 @@ rm -rf "$PGO_DIR"
 RUSTFLAGS="-Cprofile-generate=$PGO_DIR" cargo build --release -p jinx-cli
 J="$ROOT/target/release/jinx"
 
-echo "== 2/3 train (parse, fib jit-off/on, ops, hello, firefox, ISO)"
+echo "== 2/3 train (parse, compute kernels, ops, hello, firefox, ISO)"
 "$J" --parse "$NIXPKGS/pkgs/top-level/all-packages.nix" >/dev/null
 "$J" --readonly-mode --eval --strict "$ROOT/bench/fib.nix" >/dev/null
 JINX_JIT=1 "$J" --readonly-mode --eval --strict "$ROOT/bench/fib.nix" >/dev/null
+for compute in compute-fib compute-fold compute-nqueens compute-primes compute-records compute-sort; do
+  "$J" --jit=off --readonly-mode --eval --strict "$ROOT/bench/$compute.nix" >/dev/null
+  "$J" --jit=on --readonly-mode --eval --strict "$ROOT/bench/$compute.nix" >/dev/null
+done
 "$J" --readonly-mode --eval --strict "$ROOT/bench/ops.nix" >/dev/null
 "$J" --readonly-mode "$NIXPKGS" -A hello >/dev/null
 "$J" --readonly-mode "$NIXPKGS" -A firefox >/dev/null
 "$J" --readonly-mode "$NIXPKGS/nixos/release.nix" -A iso_minimal.x86_64-linux >/dev/null
 
 echo "== 3/3 merge + rebuild optimized"
-$PROFDATA merge -o "$ROOT/bench/jinx.profdata" "$PGO_DIR"/*.profraw
-RUSTFLAGS="-Cprofile-use=$ROOT/bench/jinx.profdata" cargo build --release -p jinx-cli
+$PROFDATA merge -o "$PROFILE" "$PGO_DIR"/*.profraw
+RUSTFLAGS="-Cprofile-use=$PROFILE" cargo build --release -p jinx-cli
 echo "PGO binary: $ROOT/target/release/jinx"
-echo "Profile:    $ROOT/bench/jinx.profdata"
+echo "Profile:    $PROFILE"
