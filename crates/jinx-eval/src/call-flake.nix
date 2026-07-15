@@ -16,7 +16,48 @@ fetchTreeFinal:
 let
   inherit (builtins) mapAttrs;
 
-  lockFile = builtins.fromJSON lockFileStr;
+  rawLockFile = builtins.fromJSON lockFileStr;
+
+  # Return one representative node name for each equivalent key. Lock files
+  # retain duplicate nodes for fidelity; this evaluation-only rewrite shares
+  # their lazy result graph without changing the on-disk format.
+  deduplicationMap = f: m:
+    builtins.listToAttrs (builtins.attrValues (builtins.mapAttrs
+      (name: value: { name = f value; value = name; })
+      m
+    ));
+
+  # Locked inputs with identical fetch descriptions are equivalent. An
+  # override deliberately makes its node unique so overriding one input never
+  # changes another input that happened to be equivalent before the override.
+  nodeDeduplicationKey = { nodeKey, node }:
+    if overrides ? ${nodeKey}
+    then builtins.toJSON { overriddenAs = nodeKey; }
+    else builtins.toJSON node.locked;
+
+  nodeKeyByDeduplicationKey =
+    deduplicationMap nodeDeduplicationKey
+      (builtins.mapAttrs (nodeKey: node: { inherit nodeKey node; }) rawLockFile.nodes);
+
+  # Resolve follows paths before choosing the representative, preserving the
+  # existing follows semantics while sharing their final locked node.
+  deduplicateInputName = inputSpec:
+    let
+      resolvedInputName = resolveInput inputSpec;
+      resolvedInputDeduplicationKey = nodeDeduplicationKey {
+        nodeKey = resolvedInputName;
+        node = lockFile.nodes.${resolvedInputName};
+      };
+    in
+    nodeKeyByDeduplicationKey.${resolvedInputDeduplicationKey};
+
+  lockFile = rawLockFile // {
+    nodes = builtins.mapAttrs
+      (key: node: node // {
+        inputs = builtins.mapAttrs (_: deduplicateInputName) (node.inputs or { });
+      })
+      rawLockFile.nodes;
+  };
 
   # Resolve a input spec into a node name. An input spec is
   # either a node name, or a 'follows' path from the root

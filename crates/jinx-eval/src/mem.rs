@@ -43,6 +43,11 @@ pub const CELL_SIZE: usize = 2 * GRANULE; // 16
 pub const BLOCK_GRANULES: usize = BLOCK_SIZE / GRANULE; // 4096
 /// Bitmap bytes per block (1 bit per granule).
 pub const BITMAP_BYTES: usize = BLOCK_GRANULES / 8; // 512
+/// Immix-style allocation line for variable-sized data-object recycling.
+/// 128 B gives 256 lines per block and bounds internal fragmentation while
+/// keeping the sweep bitmap tiny enough to live on the collector stack.
+pub const DATA_LINE_SIZE: usize = 128;
+pub const DATA_LINES_PER_BLOCK: usize = BLOCK_SIZE / DATA_LINE_SIZE;
 
 /// Objects at or above this size go to the large-object space.
 pub const LARGE_OBJECT_MIN: usize = 8 * 1024;
@@ -521,11 +526,74 @@ impl BlockSpace {
         self.starts[byte] |= 1 << (granule % 8);
     }
 
+    /// After a completed major mark, remove dead data-object starts and return runs
+    /// of complete 128-byte lines untouched by any live object. Objects that
+    /// cross a line protect every line they touch. The caller may subsequently
+    /// allocate within these runs without moving survivors.
+    pub fn recyclable_data_runs(&mut self, idx: usize) -> Vec<(usize, usize)> {
+        debug_assert_eq!(self.kinds[idx], KIND_DATA);
+        let bump = self.bumps[idx] as usize;
+        let base = self.base_of(idx);
+        let mut occupied = [false; DATA_LINES_PER_BLOCK];
+        let mut off = 0usize;
+        while off < bump {
+            let g = off / GRANULE;
+            if !self.is_start(idx, g) {
+                off += GRANULE;
+                continue;
+            }
+            // SAFETY: start bits are installed only for allocated data
+            // objects, whose header remains valid until this major sweep.
+            let h = unsafe { *((base + off) as *const u64) };
+            let rounded = crate::value::obj_size_bytes(h).div_ceil(GRANULE) * GRANULE;
+            debug_assert!(rounded > 0 && off + rounded <= bump);
+            if self.is_marked(idx, g) {
+                let first = off / DATA_LINE_SIZE;
+                let last = (off + rounded - 1) / DATA_LINE_SIZE;
+                for line in &mut occupied[first..=last] {
+                    *line = true;
+                }
+            } else {
+                let byte = idx * BITMAP_BYTES + g / 8;
+                self.starts[byte] &= !(1 << (g % 8));
+            }
+            off += rounded;
+        }
+
+        let mut runs = Vec::new();
+        let mut line = 0usize;
+        while line < DATA_LINES_PER_BLOCK {
+            if occupied[line] {
+                line += 1;
+                continue;
+            }
+            let start = line;
+            while line < DATA_LINES_PER_BLOCK && !occupied[line] {
+                line += 1;
+            }
+            runs.push((start * DATA_LINE_SIZE, line * DATA_LINE_SIZE));
+        }
+        runs
+    }
+
+    /// Expand a data block's used extent after allocating from recycled lines
+    /// that may lie above its former bump frontier.
+    #[inline]
+    pub fn raise_bump(&mut self, idx: usize, end: usize) {
+        debug_assert!(end <= BLOCK_SIZE);
+        self.bumps[idx] = self.bumps[idx].max(end as u32);
+    }
+
     /// True iff block `idx` is a value block. Used by the sweeper to decide
     /// recyclability. `idx` must be a live block.
     #[inline]
     pub fn is_value_block(&self, idx: usize) -> bool {
         self.kinds[idx] == KIND_VALUE
+    }
+
+    #[inline]
+    pub fn is_data_block(&self, idx: usize) -> bool {
+        self.kinds[idx] == KIND_DATA
     }
 
     /// Bump offset (bytes) of block `idx`. Cheap direct load for the recycler.
@@ -661,4 +729,5 @@ mod tests {
         }
         assert_eq!(got, vec![30, 31, 33, 34, 35, 36, 37, 38, 39]);
     }
+
 }

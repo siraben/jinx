@@ -1,23 +1,23 @@
 {
   "results": [
     {
-      "command": "$JINX_ROOT/.oracle/bin/nix-instantiate --readonly-mode $NIXPKGS/nixos/release.nix -A iso_minimal.x86_64-linux",
-      "mean": 7.87963245504,
-      "stddev": 0.023480393208786126,
-      "median": 7.874576219040001,
-      "user": 5.1783195866666665,
-      "system": 3.766855166666667,
-      "min": 7.85909209404,
-      "max": 7.90522905204,
+      "command": "/nix/var/nix/profiles/default/bin/nix-instantiate --readonly-mode /Users/siraben/Git/nixpkgs/nixos/release.nix -A iso_minimal.x86_64-linux",
+      "mean": 6.648911590373333,
+      "stddev": 0.06349437961876257,
+      "median": 6.66011849304,
+      "user": 3.706808533333333,
+      "system": 4.202641666666666,
+      "min": 6.58055991004,
+      "max": 6.70605636804,
       "times": [
-        7.85909209404,
-        7.90522905204,
-        7.874576219040001
+        6.70605636804,
+        6.66011849304,
+        6.58055991004
       ],
       "memory_usage_byte": [
-        1211613184,
-        1211613184,
-        1211613184
+        1852243968,
+        1852243968,
+        1852243968
       ],
       "exit_codes": [
         0,
@@ -26,23 +26,23 @@
       ]
     },
     {
-      "command": "JINX_JIT=0 $JINX_ROOT/target/release/jinx --readonly-mode $NIXPKGS/nixos/release.nix -A iso_minimal.x86_64-linux",
-      "mean": 4.595098469040001,
-      "stddev": 0.02314755017881867,
-      "median": 4.58200230204,
-      "user": 3.3109682533333333,
-      "system": 1.833156833333333,
-      "min": 4.58146792804,
-      "max": 4.621825177040001,
+      "command": "JINX_JIT=0 /Users/siraben/Git/jinx/target/release/jinx --readonly-mode /Users/siraben/Git/nixpkgs/nixos/release.nix -A iso_minimal.x86_64-linux",
+      "mean": 4.472769618373333,
+      "stddev": 0.02976788658896502,
+      "median": 4.4595760350399996,
+      "user": 3.5504402,
+      "system": 1.6726903333333334,
+      "min": 4.451878702039999,
+      "max": 4.50685411804,
       "times": [
-        4.58200230204,
-        4.58146792804,
-        4.621825177040001
+        4.4595760350399996,
+        4.50685411804,
+        4.451878702039999
       ],
       "memory_usage_byte": [
-        3122118656,
-        3122675712,
-        3122675712
+        1949974528,
+        1949974528,
+        1949974528
       ],
       "exit_codes": [
         0,
@@ -51,23 +51,23 @@
       ]
     },
     {
-      "command": "JINX_JIT=1 $JINX_ROOT/target/release/jinx --readonly-mode $NIXPKGS/nixos/release.nix -A iso_minimal.x86_64-linux",
-      "mean": 4.649744983040001,
-      "stddev": 0.020604259320368037,
-      "median": 4.6404928860400005,
-      "user": 3.4026825866666663,
-      "system": 1.8442371666666666,
-      "min": 4.63538855204,
-      "max": 4.67335351104,
+      "command": "JINX_JIT=1 /Users/siraben/Git/jinx/target/release/jinx --readonly-mode /Users/siraben/Git/nixpkgs/nixos/release.nix -A iso_minimal.x86_64-linux",
+      "mean": 4.51698600704,
+      "stddev": 0.038587285125783,
+      "median": 4.52310061804,
+      "user": 3.6147548666666665,
+      "system": 1.692964,
+      "min": 4.47570649304,
+      "max": 4.55215091004,
       "times": [
-        4.67335351104,
-        4.6404928860400005,
-        4.63538855204
+        4.47570649304,
+        4.52310061804,
+        4.55215091004
       ],
       "memory_usage_byte": [
-        3130966016,
-        3130966016,
-        3130966016
+        1986756608,
+        1986904064,
+        1986904064
       ],
       "exit_codes": [
         0,

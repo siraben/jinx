@@ -12,12 +12,20 @@ use crate::wire;
 /// `nix-archive-1`, the version magic at the start of every NAR.
 pub const NAR_VERSION_MAGIC_1: &[u8] = b"nix-archive-1";
 
+/// Filesystem object type supplied to a filtered NAR callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NarFileType {
+    Regular,
+    Directory,
+    Symlink,
+    Unknown,
+}
+
 /// Maximum directory nesting depth (matches `narMaxDepth`).
 const NAR_MAX_DEPTH: usize = 64;
 
-/// Reused per-file read buffer size (non-unix fallback). A single `read` covers
-/// any file up to this size; larger files loop.
-#[cfg(not(unix))]
+/// Reused per-file read buffer size. A single `read` covers any file up to this
+/// size; larger files loop. 256 KiB balances syscall count against cache reuse.
 const READ_BUF_SIZE: usize = 256 * 1024;
 
 fn other_err(msg: String) -> io::Error {
@@ -30,7 +38,6 @@ fn other_err(msg: String) -> io::Error {
 /// filter, case hack off). Regular files, directories (entries sorted by
 /// byte-wise name order) and symlinks are supported.
 pub fn dump_path(path: impl AsRef<Path>, sink: &mut impl Write) -> io::Result<()> {
-    crate::nar_stats::record_dump_call();
     wire::write_bytes(sink, NAR_VERSION_MAGIC_1)?;
     dump_root(path.as_ref(), sink, NoFilter)
 }
@@ -49,9 +56,8 @@ pub fn dump_path_filtered<F>(
     filter: &mut F,
 ) -> io::Result<()>
 where
-    F: FnMut(&Path) -> io::Result<bool>,
+    F: FnMut(&Path, NarFileType) -> io::Result<bool>,
 {
-    crate::nar_stats::record_dump_call();
     wire::write_bytes(sink, NAR_VERSION_MAGIC_1)?;
     // `&mut F` is itself `FnMut`, so it satisfies `PathFilter` directly.
     dump_root(path.as_ref(), sink, filter)
@@ -62,7 +68,7 @@ where
 trait PathFilter {
     /// Whether the child at `path` should be included. `NoFilter` never
     /// allocates a path (the unfiltered dump does no per-entry work here).
-    fn keep(&mut self, path: &Path) -> io::Result<bool>;
+    fn keep(&mut self, path: &Path, file_type: NarFileType) -> io::Result<bool>;
     /// Whether this is a real filter (controls whether the walk must
     /// materialize child paths to pass to `keep`).
     const ACTIVE: bool;
@@ -71,16 +77,16 @@ trait PathFilter {
 struct NoFilter;
 impl PathFilter for NoFilter {
     #[inline]
-    fn keep(&mut self, _path: &Path) -> io::Result<bool> {
+    fn keep(&mut self, _path: &Path, _file_type: NarFileType) -> io::Result<bool> {
         Ok(true)
     }
     const ACTIVE: bool = false;
 }
 
-impl<F: FnMut(&Path) -> io::Result<bool>> PathFilter for &mut F {
+impl<F: FnMut(&Path, NarFileType) -> io::Result<bool>> PathFilter for &mut F {
     #[inline]
-    fn keep(&mut self, path: &Path) -> io::Result<bool> {
-        (self)(path)
+    fn keep(&mut self, path: &Path, file_type: NarFileType) -> io::Result<bool> {
+        (self)(path, file_type)
     }
     const ACTIVE: bool = true;
 }
@@ -95,13 +101,34 @@ mod imp {
     use std::ffi::{CStr, CString};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::sync::{mpsc, Arc, Condvar, Mutex};
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum NodeType {
         Reg,
         Dir,
         Lnk,
+        Unknown,
+    }
+
+    impl NodeType {
+        fn public(self) -> NarFileType {
+            match self {
+                Self::Reg => NarFileType::Regular,
+                Self::Dir => NarFileType::Directory,
+                Self::Lnk => NarFileType::Symlink,
+                Self::Unknown => NarFileType::Unknown,
+            }
+        }
+    }
+
+    /// State threaded through the recursive walk. `path` holds the absolute path
+    /// of the current node as raw bytes (used for the filter callback and error
+    /// messages); `buf` is the reused file read buffer.
+    struct Walk<'a, W: Write, P: PathFilter> {
+        sink: &'a mut W,
+        filter: P,
+        path: Vec<u8>,
+        buf: Vec<u8>,
     }
 
     fn last_err() -> io::Error {
@@ -132,6 +159,18 @@ mod imp {
         }
         // SAFETY: `fd >= 0` is a freshly-opened descriptor owned by no one else.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn fstat(fd: libc::c_int) -> io::Result<libc::stat> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fd` is a live descriptor; `st` is a valid, writable buffer
+        // that `fstat` fully initializes on success.
+        let r = unsafe { libc::fstat(fd, st.as_mut_ptr()) };
+        if r < 0 {
+            return Err(last_err());
+        }
+        // SAFETY: `fstat` returned 0, so `st` is initialized.
+        Ok(unsafe { st.assume_init() })
     }
 
     fn fstatat_nofollow(dirfd: libc::c_int, name: &CStr) -> io::Result<libc::stat> {
@@ -208,6 +247,15 @@ mod imp {
         }
     }
 
+    fn mode_to_filter_type(mode: u32) -> NodeType {
+        match mode & (libc::S_IFMT as u32) {
+            m if m == libc::S_IFREG as u32 => NodeType::Reg,
+            m if m == libc::S_IFDIR as u32 => NodeType::Dir,
+            m if m == libc::S_IFLNK as u32 => NodeType::Lnk,
+            _ => NodeType::Unknown,
+        }
+    }
+
     /// Enumerate a directory's entries (excluding `.`/`..`) into a byte-wise
     /// name-sorted map of name -> `d_type`. `d_type` may be `DT_UNKNOWN` on some
     /// filesystems, resolved later via `fstatat`.
@@ -258,78 +306,15 @@ mod imp {
         result.map(|()| map)
     }
 
-    // -----------------------------------------------------------------------
-    // Two-phase dump: Phase 1 (this/eval thread) walks the tree, runs the path
-    // filter in traversal order, and records an ordered node tree plus a job
-    // list of regular-file contents to read. Phase 2 emits the NAR tokens in
-    // that exact order; a worker pool prefetches file contents on other cores
-    // under a byte budget, while the filter and token ordering stay single-
-    // threaded. Workers touch only libc + malloc'd buffers, never the VM/GC.
-    // -----------------------------------------------------------------------
-
-    /// Files larger than this stream inline on the eval thread in Phase 2
-    /// (never enqueued), so a single big file cannot exceed the prefetch budget.
-    const INLINE_THRESHOLD: u64 = 16 * 1024 * 1024;
-    /// Max bytes of prefetched-but-not-yet-consumed file contents in flight.
-    const PREFETCH_BUDGET: u64 = 128 * 1024 * 1024;
-    /// Only spin up the worker pool for dumps with enough parallelizable work;
-    /// small trees (hello/firefox, single-file `hash_path`) stay fully serial.
-    const PAR_MIN_JOBS: usize = 64;
-    const PAR_MIN_BYTES: u64 = 8 * 1024 * 1024;
-
-    /// A regular-file content-read job (absolute path + size, from Phase 1).
-    struct Job {
-        path: CString,
-        size: u64,
-        /// Streamed inline on the eval thread (size > INLINE_THRESHOLD) rather
-        /// than handed to the worker pool.
-        inline: bool,
-    }
-
-    /// The recorded, order-preserving node tree produced by Phase 1.
-    enum RNode {
-        File { exec: bool, size: u64, job: usize },
-        Symlink { target: Vec<u8> },
-        Dir { entries: Vec<(Vec<u8>, RNode)> },
-    }
-
-    /// Read a whole regular file (`size` bytes) into a fresh buffer. A short read
-    /// (EOF before `size`) means the file shrank while dumping — an error, as in
-    /// the serial path. O_NOFOLLOW guards against a swap-to-symlink race.
-    fn read_file_whole(path: &CStr, size: u64) -> io::Result<Vec<u8>> {
-        let fd = openat_rd(libc::AT_FDCWD, path, 0)?;
-        let mut buf = vec![0u8; size as usize];
-        let mut off = 0usize;
-        while off < buf.len() {
-            let n = read_some(fd.as_raw_fd(), &mut buf[off..])?;
-            if n == 0 {
-                return Err(other_err(format!(
-                    "file '{}' changed size while dumping NAR",
-                    Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())).display()
-                )));
-            }
-            off += n;
-        }
-        Ok(buf)
-    }
-
-    // ---- Phase 1: build the ordered tree + job list -----------------------
-
-    struct Builder<P: PathFilter> {
-        filter: P,
-        /// Absolute path bytes of the current node (filter arg + error messages).
-        path: Vec<u8>,
-        jobs: Vec<Job>,
-    }
-
-    impl<P: PathFilter> Builder<P> {
-        fn build(
+    impl<W: Write, P: PathFilter> Walk<'_, W, P> {
+        /// Dump one node whose type is already known.
+        fn dump_node(
             &mut self,
             dirfd: libc::c_int,
             name: &CStr,
             ntype: NodeType,
             depth: usize,
-        ) -> io::Result<RNode> {
+        ) -> io::Result<()> {
             if depth >= NAR_MAX_DEPTH {
                 return Err(other_err(format!(
                     "path '{}' exceeds maximum NAR directory depth of {}",
@@ -337,268 +322,113 @@ mod imp {
                     NAR_MAX_DEPTH
                 )));
             }
+
+            wire::write_bytes(self.sink, b"(")?;
             match ntype {
                 NodeType::Reg => {
-                    // One fstatat gives size + exec; contents are read later.
-                    let st = fstatat_nofollow(dirfd, name)?;
-                    let size = st.st_size as u64;
-                    let exec = st.st_mode as u32 & libc::S_IXUSR as u32 != 0;
-                    crate::nar_stats::record_file(size);
-                    let cpath = CString::new(self.path.clone())
-                        .map_err(|_| other_err("path contains NUL".into()))?;
-                    let job = self.jobs.len();
-                    self.jobs.push(Job {
-                        path: cpath,
-                        size,
-                        inline: size > INLINE_THRESHOLD,
-                    });
-                    Ok(RNode::File { exec, size, job })
-                }
-                NodeType::Lnk => {
-                    crate::nar_stats::record_symlink();
-                    let target = readlinkat_bytes(dirfd, name, 0)?;
-                    Ok(RNode::Symlink { target })
+                    let fd = openat_rd(dirfd, name, 0)?;
+                    let st = fstat(fd.as_raw_fd())?;
+                    wire::write_bytes(self.sink, b"type")?;
+                    wire::write_bytes(self.sink, b"regular")?;
+                    if st.st_mode as u32 & libc::S_IXUSR as u32 != 0 {
+                        wire::write_bytes(self.sink, b"executable")?;
+                        wire::write_bytes(self.sink, b"")?;
+                    }
+                    self.dump_contents(fd.as_raw_fd(), st.st_size as u64)?;
                 }
                 NodeType::Dir => {
-                    crate::nar_stats::record_dir();
+                    wire::write_bytes(self.sink, b"type")?;
+                    wire::write_bytes(self.sink, b"directory")?;
                     let dfd = openat_rd(dirfd, name, libc::O_DIRECTORY)?;
-                    let listing = read_dir_entries(dfd.as_raw_fd())?;
-                    let mut entries: Vec<(Vec<u8>, RNode)> = Vec::with_capacity(listing.len());
-                    let base = self.path.len();
-                    for (cname, d_type) in &listing {
-                        self.path.push(b'/');
-                        self.path.extend_from_slice(cname);
+                    self.dump_dir(dfd.as_raw_fd(), depth)?;
+                }
+                NodeType::Lnk => {
+                    wire::write_bytes(self.sink, b"type")?;
+                    wire::write_bytes(self.sink, b"symlink")?;
+                    wire::write_bytes(self.sink, b"target")?;
+                    let target = readlinkat_bytes(dirfd, name, 0)?;
+                    wire::write_bytes(self.sink, &target)?;
+                }
+                NodeType::Unknown => unreachable!("unknown node type resolved before recursion"),
+            }
+            wire::write_bytes(self.sink, b")")
+        }
 
-                        let keep = if P::ACTIVE {
-                            let p = Path::new(std::ffi::OsStr::from_bytes(&self.path));
-                            self.filter.keep(p)?
-                        } else {
-                            true
-                        };
-                        if keep {
-                            let ccname = CString::new(cname.as_slice()).map_err(|_| {
-                                other_err("directory entry name contains NUL".into())
-                            })?;
-                            let ct = match *d_type {
-                                libc::DT_DIR => NodeType::Dir,
-                                libc::DT_REG => NodeType::Reg,
-                                libc::DT_LNK => NodeType::Lnk,
-                                _ => {
-                                    let st = fstatat_nofollow(dfd.as_raw_fd(), &ccname)?;
-                                    mode_to_type(st.st_mode as u32, &self.path)?
-                                }
-                            };
-                            let child = self.build(dfd.as_raw_fd(), &ccname, ct, depth + 1)?;
-                            entries.push((cname.clone(), child));
+        /// Emit a regular file's `contents`: tag, u64 size, exactly `size` bytes
+        /// read from `fd`, then zero padding to 8 bytes. A short read (EOF before
+        /// `size`) means the file shrank while dumping — preserved as an error.
+        fn dump_contents(&mut self, fd: libc::c_int, size: u64) -> io::Result<()> {
+            wire::write_bytes(self.sink, b"contents")?;
+            wire::write_u64(self.sink, size)?;
+            let mut remaining = size;
+            while remaining > 0 {
+                let want = remaining.min(self.buf.len() as u64) as usize;
+                let n = read_some(fd, &mut self.buf[..want])?;
+                if n == 0 {
+                    return Err(other_err(format!(
+                        "file '{}' changed size while dumping NAR",
+                        Path::new(std::ffi::OsStr::from_bytes(&self.path)).display()
+                    )));
+                }
+                self.sink.write_all(&self.buf[..n])?;
+                remaining -= n as u64;
+            }
+            wire::write_padding(self.sink, size)
+        }
+
+        /// Walk the entries of the directory `dirfd`, in byte-wise name order,
+        /// applying the filter to each child (in order; first error wins).
+        fn dump_dir(&mut self, dirfd: libc::c_int, depth: usize) -> io::Result<()> {
+            let entries = read_dir_entries(dirfd)?;
+            let base = self.path.len();
+            for (name, d_type) in &entries {
+                // Extend the current path with "/name" for the filter/errors.
+                self.path.push(b'/');
+                self.path.extend_from_slice(name);
+
+                let cname = CString::new(name.as_slice())
+                    .map_err(|_| other_err("directory entry name contains NUL".into()))?;
+                let filter_stat = if P::ACTIVE {
+                    fstatat_nofollow(dirfd, &cname).ok()
+                } else {
+                    None
+                };
+                let filter_type = filter_stat
+                    .as_ref()
+                    .map(|st| mode_to_filter_type(st.st_mode as u32))
+                    .unwrap_or(NodeType::Unknown);
+                let keep = !P::ACTIVE || {
+                    let p = Path::new(std::ffi::OsStr::from_bytes(&self.path));
+                    self.filter.keep(p, filter_type.public())?
+                };
+
+                if keep {
+                    let ntype = if filter_type != NodeType::Unknown {
+                        filter_type
+                    } else {
+                        match *d_type {
+                            libc::DT_DIR => NodeType::Dir,
+                            libc::DT_REG => NodeType::Reg,
+                            libc::DT_LNK => NodeType::Lnk,
+                            // DT_UNKNOWN and any exotic type: resolve with fstatat.
+                            _ => {
+                                let st = fstatat_nofollow(dirfd, &cname)?;
+                                mode_to_type(st.st_mode as u32, &self.path)?
+                            }
                         }
-                        self.path.truncate(base);
-                    }
-                    Ok(RNode::Dir { entries })
+                    };
+                    wire::write_bytes(self.sink, b"entry")?;
+                    wire::write_bytes(self.sink, b"(")?;
+                    wire::write_bytes(self.sink, b"name")?;
+                    wire::write_bytes(self.sink, name)?;
+                    wire::write_bytes(self.sink, b"node")?;
+                    self.dump_node(dirfd, &cname, ntype, depth + 1)?;
+                    wire::write_bytes(self.sink, b")")?;
                 }
+
+                self.path.truncate(base);
             }
-        }
-    }
-
-    // ---- Phase 2: emit tokens, pulling file contents from a provider ------
-
-    /// Supplies a regular file's contents (by job index) during emission.
-    trait ContentProvider {
-        fn get(&mut self, job: usize, size: u64) -> io::Result<Vec<u8>>;
-    }
-
-    fn emit_node<W: Write, Pv: ContentProvider>(
-        node: &RNode,
-        sink: &mut W,
-        pv: &mut Pv,
-    ) -> io::Result<()> {
-        wire::write_bytes(sink, b"(")?;
-        match node {
-            RNode::File { exec, size, job } => {
-                wire::write_bytes(sink, b"type")?;
-                wire::write_bytes(sink, b"regular")?;
-                if *exec {
-                    wire::write_bytes(sink, b"executable")?;
-                    wire::write_bytes(sink, b"")?;
-                }
-                let contents = pv.get(*job, *size)?;
-                wire::write_bytes(sink, b"contents")?;
-                wire::write_u64(sink, *size)?;
-                sink.write_all(&contents)?;
-                wire::write_padding(sink, *size)?;
-            }
-            RNode::Symlink { target } => {
-                wire::write_bytes(sink, b"type")?;
-                wire::write_bytes(sink, b"symlink")?;
-                wire::write_bytes(sink, b"target")?;
-                wire::write_bytes(sink, target)?;
-            }
-            RNode::Dir { entries } => {
-                wire::write_bytes(sink, b"type")?;
-                wire::write_bytes(sink, b"directory")?;
-                for (name, child) in entries {
-                    wire::write_bytes(sink, b"entry")?;
-                    wire::write_bytes(sink, b"(")?;
-                    wire::write_bytes(sink, b"name")?;
-                    wire::write_bytes(sink, name)?;
-                    wire::write_bytes(sink, b"node")?;
-                    emit_node(child, sink, pv)?;
-                    wire::write_bytes(sink, b")")?;
-                }
-            }
-        }
-        wire::write_bytes(sink, b")")
-    }
-
-    /// Serial provider: read each file inline on the eval thread (no pool).
-    struct SerialProvider {
-        jobs: Vec<Job>,
-    }
-    impl ContentProvider for SerialProvider {
-        fn get(&mut self, job: usize, size: u64) -> io::Result<Vec<u8>> {
-            read_file_whole(&self.jobs[job].path, size)
-        }
-    }
-
-    /// Shared state between the eval thread and the read-ahead workers.
-    struct Shared {
-        jobs: Vec<Job>,
-        /// One slot per job; a worker fills its slot then notifies `cv`.
-        slots: Mutex<Vec<Option<io::Result<Vec<u8>>>>>,
-        cv: Condvar,
-    }
-    impl Shared {
-        fn take(&self, idx: usize) -> io::Result<Vec<u8>> {
-            let mut g = self.slots.lock().unwrap();
-            while g[idx].is_none() {
-                g = self.cv.wait(g).unwrap();
-            }
-            g[idx].take().unwrap()
-        }
-    }
-
-    fn worker_loop(shared: Arc<Shared>, rx: Arc<Mutex<mpsc::Receiver<usize>>>) {
-        loop {
-            let idx = {
-                let rx = rx.lock().unwrap();
-                rx.recv()
-            };
-            let idx = match idx {
-                Ok(i) => i,
-                Err(_) => break, // sender dropped: no more work
-            };
-            let job = &shared.jobs[idx];
-            // Guard the read against an unexpected panic: it runs with no lock
-            // held, so a panicking worker would die WITHOUT filling slot[idx]
-            // and (the mutex being unpoisoned) the eval thread would wait on
-            // the condvar forever. Convert a panic into an error in the slot so
-            // the consumer always unblocks; catch_unwind also lets the worker
-            // survive and keep serving the queue.
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                read_file_whole(&job.path, job.size)
-            }))
-            .unwrap_or_else(|_| {
-                Err(io::Error::other("NAR read-ahead worker panicked"))
-            });
-            let mut g = shared.slots.lock().unwrap();
-            g[idx] = Some(res);
-            shared.cv.notify_all();
-        }
-    }
-
-    /// Parallel provider: a bounded read-ahead window over the worker pool.
-    /// Jobs are submitted in index (= emission) order; `in_flight` tracks the
-    /// bytes of submitted-but-not-yet-consumed prefetch jobs, capped at the
-    /// budget. Inline jobs are never submitted (read directly in `get`).
-    struct ParallelProvider {
-        shared: Arc<Shared>,
-        tx: Option<mpsc::Sender<usize>>,
-        workers: Vec<std::thread::JoinHandle<()>>,
-        next_submit: usize,
-        in_flight: u64,
-    }
-
-    impl ParallelProvider {
-        fn submit_one(&mut self) {
-            let job = &self.shared.jobs[self.next_submit];
-            if !job.inline {
-                self.in_flight += job.size;
-                // Sender lives until Drop, so unwrap is safe here.
-                let _ = self.tx.as_ref().unwrap().send(self.next_submit);
-            }
-            self.next_submit += 1;
-        }
-        /// Ensure every job up to and including `target` has been submitted.
-        fn submit_through(&mut self, target: usize) {
-            while self.next_submit <= target {
-                self.submit_one();
-            }
-        }
-        /// Read ahead while there is budget headroom (always keep >=1 in flight).
-        fn submit_readahead(&mut self) {
-            let njobs = self.shared.jobs.len();
-            while self.next_submit < njobs {
-                let job = &self.shared.jobs[self.next_submit];
-                if !job.inline
-                    && self.in_flight != 0
-                    && self.in_flight + job.size > PREFETCH_BUDGET
-                {
-                    break;
-                }
-                self.submit_one();
-            }
-        }
-    }
-
-    impl ContentProvider for ParallelProvider {
-        fn get(&mut self, job: usize, size: u64) -> io::Result<Vec<u8>> {
-            if self.shared.jobs[job].inline {
-                // Big file: stream it on the eval thread, off the budget.
-                return read_file_whole(&self.shared.jobs[job].path, size);
-            }
-            self.submit_through(job);
-            self.submit_readahead();
-            let res = self.shared.take(job);
-            self.in_flight -= size;
-            self.submit_readahead();
-            res
-        }
-    }
-
-    impl Drop for ParallelProvider {
-        fn drop(&mut self) {
-            // Close the channel so idle workers exit, then join them. Workers
-            // never block on `cv` (only the eval thread waits), so this cannot
-            // deadlock.
-            self.tx = None;
-            for w in self.workers.drain(..) {
-                let _ = w.join();
-            }
-        }
-    }
-
-    /// Number of read-ahead workers, from `JINX_NAR_JOBS`. The parallel
-    /// prefetch pool is **opt-in**: measured on both aarch64-darwin and
-    /// x86_64-linux it trades 2-3x the system CPU for only ~8% ISO wall on a
-    /// warm page cache (page-cache lock contention on parallel reads), which is
-    /// a poor default for an interactively-run tool. It is a real win for
-    /// cold-cache / CI / batch dumps, where workers block on IO instead of
-    /// spinning on locks -- so it stays available behind the env var.
-    ///
-    /// Unset or `<= 1` => 0 (serial, no pool). `auto` => `available_parallelism`
-    /// capped at 8. A number `>= 2` => that many workers, capped at 16.
-    fn num_workers() -> usize {
-        match std::env::var("JINX_NAR_JOBS") {
-            Ok(v) if v == "auto" => std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .min(8),
-            Ok(v) => v
-                .parse::<usize>()
-                .ok()
-                .filter(|&n| n >= 2)
-                .map(|n| n.min(16))
-                .unwrap_or(0),
-            Err(_) => 0,
+            Ok(())
         }
     }
 
@@ -608,57 +438,18 @@ mod imp {
         filter: P,
     ) -> io::Result<()> {
         let path_bytes = path.as_os_str().as_bytes().to_vec();
-        let cpath =
-            CString::new(path_bytes.clone()).map_err(|_| other_err("path contains NUL".into()))?;
+        let cpath = CString::new(path_bytes.clone())
+            .map_err(|_| other_err("path contains NUL".into()))?;
         // The root type is unknown up front; one `fstatat` (no follow) resolves it.
         let st = fstatat_nofollow(libc::AT_FDCWD, &cpath)?;
         let ntype = mode_to_type(st.st_mode as u32, &path_bytes)?;
-
-        // Phase 1: walk + filter (this thread only), recording the node tree.
-        let mut builder = Builder {
+        let mut walk = Walk {
+            sink,
             filter,
             path: path_bytes,
-            jobs: Vec::new(),
+            buf: vec![0u8; READ_BUF_SIZE],
         };
-        let root = builder.build(libc::AT_FDCWD, &cpath, ntype, 0)?;
-        let jobs = builder.jobs;
-
-        // Phase 2: emit in order. Use the worker pool only when it is opted in
-        // (`JINX_NAR_JOBS`, see `num_workers`) AND there is enough
-        // parallelizable content to amortize thread spin-up. Default is serial.
-        let workers_n = num_workers();
-        let prefetch_bytes: u64 = jobs.iter().filter(|j| !j.inline).map(|j| j.size).sum();
-        let prefetch_count = jobs.iter().filter(|j| !j.inline).count();
-
-        if workers_n >= 2 && prefetch_count >= PAR_MIN_JOBS && prefetch_bytes >= PAR_MIN_BYTES {
-            let njobs = jobs.len();
-            let shared = Arc::new(Shared {
-                jobs,
-                slots: Mutex::new((0..njobs).map(|_| None).collect()),
-                cv: Condvar::new(),
-            });
-            let (tx, rx) = mpsc::channel::<usize>();
-            let rx = Arc::new(Mutex::new(rx));
-            let mut workers = Vec::new();
-            for _ in 0..workers_n {
-                let s = Arc::clone(&shared);
-                let r = Arc::clone(&rx);
-                workers.push(std::thread::spawn(move || worker_loop(s, r)));
-            }
-            let mut pv = ParallelProvider {
-                shared,
-                tx: Some(tx),
-                workers,
-                next_submit: 0,
-                in_flight: 0,
-            };
-            pv.submit_readahead();
-            emit_node(&root, sink, &mut pv)
-            // `pv` drops here: closes the channel and joins the workers.
-        } else {
-            let mut pv = SerialProvider { jobs };
-            emit_node(&root, sink, &mut pv)
-        }
+        walk.dump_node(libc::AT_FDCWD, &cpath, ntype, 0)
     }
 }
 
@@ -697,7 +488,6 @@ fn dump_std<W: Write, P: PathFilter>(
     if ft.is_file() {
         wire::write_bytes(sink, b"type")?;
         wire::write_bytes(sink, b"regular")?;
-        crate::nar_stats::record_file(st.len());
         wire::write_bytes(sink, b"contents")?;
         wire::write_u64(sink, st.len())?;
         let mut file = std::fs::File::open(path)?;
@@ -718,7 +508,6 @@ fn dump_std<W: Write, P: PathFilter>(
         }
         wire::write_padding(sink, st.len())?;
     } else if ft.is_dir() {
-        crate::nar_stats::record_dir();
         wire::write_bytes(sink, b"type")?;
         wire::write_bytes(sink, b"directory")?;
         let mut entries: BTreeMap<Vec<u8>, std::path::PathBuf> = BTreeMap::new();
@@ -728,7 +517,20 @@ fn dump_std<W: Write, P: PathFilter>(
             entries.insert(name, entry.path());
         }
         for (name, entry_path) in &entries {
-            if P::ACTIVE && !filter.keep(entry_path)? {
+            let metadata = std::fs::symlink_metadata(entry_path).ok();
+            let file_type = metadata.as_ref().map_or(NarFileType::Unknown, |m| {
+                let ft = m.file_type();
+                if ft.is_file() {
+                    NarFileType::Regular
+                } else if ft.is_dir() {
+                    NarFileType::Directory
+                } else if ft.is_symlink() {
+                    NarFileType::Symlink
+                } else {
+                    NarFileType::Unknown
+                }
+            });
+            if P::ACTIVE && !filter.keep(entry_path, file_type)? {
                 continue;
             }
             wire::write_bytes(sink, b"entry")?;
@@ -740,7 +542,6 @@ fn dump_std<W: Write, P: PathFilter>(
             wire::write_bytes(sink, b")")?;
         }
     } else if ft.is_symlink() {
-        crate::nar_stats::record_symlink();
         wire::write_bytes(sink, b"type")?;
         wire::write_bytes(sink, b"symlink")?;
         wire::write_bytes(sink, b"target")?;
@@ -779,7 +580,5 @@ pub fn dump_path_to_vec(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 pub fn hash_path(path: impl AsRef<Path>, algo: HashAlgorithm) -> io::Result<(Hash, u64)> {
     let mut sink = HashSink::new(algo);
     dump_path(path, &mut sink)?;
-    let (hash, sz) = sink.finish();
-    crate::nar_stats::record_nar_bytes(sz);
-    Ok((hash, sz))
+    Ok(sink.finish())
 }

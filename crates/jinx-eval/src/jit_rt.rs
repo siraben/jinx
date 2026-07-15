@@ -125,14 +125,14 @@ pub extern "C" fn jinx_alloc_cell(vm: *mut VM) -> u64 {
 /// matching the interpreter's `alloc_cell(Value::int(..))`. Returns the cell.
 pub extern "C" fn jinx_alloc_int(vm: *mut VM, i: i64) -> u64 {
     let vm = vm!(vm);
-    vm.alloc_cell(Value::int(i)).as_ptr() as u64
+    vm.alloc_result_cell(Value::int(i)).as_ptr() as u64
 }
 
 /// Allocate a fresh cell holding boolean `b` (result of inline `<`). Returns
 /// the cell.
 pub extern "C" fn jinx_alloc_bool(vm: *mut VM, b: u32) -> u64 {
     let vm = vm!(vm);
-    vm.alloc_cell(Value::bool(b != 0)).as_ptr() as u64
+    vm.alloc_result_cell(Value::bool(b != 0)).as_ptr() as u64
 }
 
 pub extern "C" fn jinx_store_local(vm: *mut VM, fi: u64, slot: u32) -> u64 {
@@ -171,18 +171,8 @@ pub extern "C" fn jinx_make_attrs(vm: *mut VM, fi: u64, d: u32) -> u64 {
     let desc = &vm.frames[fi as usize].code.prog().attrs_descs[d as usize];
     let n = desc.names.len();
     let start = vm.stack.len() - n;
-    let entries: Vec<crate::value::Attr> = desc
-        .names
-        .iter()
-        .zip(&vm.stack[start..])
-        .map(|(&(sym, pos), &cell)| crate::value::Attr {
-            sym: sym.0,
-            pos: pos.0,
-            val: cell,
-        })
-        .collect();
     vm.gc_check();
-    let v = vm.heap.new_bindings(&entries);
+    let v = vm.heap.new_static_bindings(desc, &vm.stack[start..]);
     let c = vm.heap.alloc_value(v);
     vm.stack.truncate(start);
     vm.stack.push(c);
@@ -219,6 +209,28 @@ pub extern "C" fn jinx_eq(vm: *mut VM, pos: u32, is_neq: u32) -> u64 {
         }
         Err(e) => err(e),
     }
+}
+
+pub extern "C" fn jinx_list_builtin(vm: *mut VM, kind: u32, pos: u32) -> u64 {
+    let vm = vm!(vm);
+    let kind = match kind {
+        0 => crate::chunk::ListBuiltin::Length,
+        1 => crate::chunk::ListBuiltin::Head,
+        2 => crate::chunk::ListBuiltin::Tail,
+        _ => unreachable!("invalid list builtin operand"),
+    };
+    status(vm.op_list_builtin(kind, PosIdx(pos)))
+}
+
+pub extern "C" fn jinx_fold_gen(vm: *mut VM, pos: u32, gen_pos: u32) -> u64 {
+    let vm = vm!(vm);
+    status(vm.op_fold_gen(PosIdx(pos), PosIdx(gen_pos)))
+}
+
+pub extern "C" fn jinx_list_empty(vm: *mut VM, negate: u32) -> u64 {
+    let vm = vm!(vm);
+    vm.op_list_empty(negate != 0);
+    0
 }
 
 pub extern "C" fn jinx_not(vm: *mut VM) -> u64 {
@@ -437,7 +449,7 @@ pub extern "C" fn jinx_call(vm: *mut VM, n: u32, pos: u32) -> u64 {
     match vm.call_function(fun, args, cpos) {
         Ok(v) => {
             vm.stack.truncate(args_start - 1);
-            let c = vm.alloc_cell(v);
+            let c = vm.alloc_result_cell(v);
             vm.stack.push(c);
             0
         }

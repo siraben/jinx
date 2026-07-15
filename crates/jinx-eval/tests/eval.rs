@@ -64,6 +64,20 @@ fn fails(expr: &str, msg_part: &str) {
 }
 
 #[test]
+fn deep_seq_terminates_on_shared_and_cyclic_containers() {
+    ok(
+        r#"
+        let
+          shared = { leaf = 1; };
+          attrs = rec { self = attrs; inherit shared; again = shared; };
+          list = let x = [ x shared shared ]; in x;
+        in builtins.deepSeq attrs (builtins.deepSeq list true)
+        "#,
+        "true",
+    );
+}
+
+#[test]
 fn arithmetic_and_output() {
     ok("1 + 2 * 3", "7");
     ok("7 / 2", "3");
@@ -222,9 +236,38 @@ fn functions_and_formals() {
 fn equality_semantics() {
     ok("let f = x: x; in f == f", "false"); // top-level function compare
     ok("let s = { f = x: x; }; in s == s", "true"); // shared cells deeper
+    // Repeated instances from one static constructor share their key shape;
+    // equality still compares every value.
+    ok(
+        "let mk = x: { a = x; b = x + 1; }; in mk 4 == mk 4",
+        "true",
+    );
+    ok(
+        "let mk = x: { a = x; b = x + 1; }; in mk 4 == mk 5",
+        "false",
+    );
+    // Separate source sites may have equal names but distinct positions and
+    // descriptors. Positions are not part of value equality.
+    ok("{ a = 1; b = 2; } == { a = 1; b = 2; }", "true");
+    ok("{ a = 1; b = 2; } == { a = 1; c = 2; }", "false");
+    // Static-shape specialization remains behind derivation equality, which
+    // compares only outPath and must not force unrelated fields.
+    ok(
+        r#"let mk = p: { type = "derivation"; outPath = p; ignored = throw "lazy"; }; in mk "/a" == mk "/a""#,
+        "true",
+    );
+    ok(
+        r#"let mk = p: { type = "derivation"; outPath = p; ignored = throw "lazy"; }; in mk "/a" == mk "/b""#,
+        "false",
+    );
     ok("1 == 1.0", "true");
     ok("[1 2] == [1 2.0]", "true");
     ok(r#"{ a = 1; } == { a = 1; b = 2; }"#, "false");
+    // Equality against [] is specialized but must keep lazy list elements and
+    // non-list cross-type behavior unchanged.
+    ok("[ (throw \"unused\") ] == []", "false");
+    ok("(x: x) == []", "false");
+    ok("[] != builtins.tail [ 1 ]", "false");
 }
 
 #[test]
@@ -257,9 +300,38 @@ fn list_and_attr_builtins() {
         "{ a = 1; }",
     );
     ok("builtins.foldl' (a: b: a + b) 0 [1 2 3 4]", "10");
+    ok("builtins.length [ (throw \"lazy\") ]", "1");
+    ok("__head [ 7 ]", "7");
+    // Spelling alone is insufficient for specialization: lexical shadowing
+    // and overapplication stay on generic call semantics.
+    ok("let builtins = { head = _: 42; }; in builtins.head []", "42");
+    ok("let __length = _: 9; in __length []", "9");
+    // More tails than the bounded inline-view limit exercise both the shared
+    // view and materializing fallback without changing list semantics.
+    ok(
+        "let drop = n: xs: if n == 0 then xs else drop (n - 1) (builtins.tail xs); in builtins.head (drop 40 (builtins.genList (x: x) 50))",
+        "40",
+    );
     ok(
         "builtins.genericClosure { startSet = [ {key = 0;} ]; operator = x: if x.key < 3 then [ {key = x.key + 1;} ] else []; }",
         "[ { key = 0; } { key = 1; } { key = 2; } { key = 3; } ]",
+    );
+    ok(
+        "builtins.genericClosure { startSet = [ {key=2;} {key=1;} {key=2;} ]; operator = x: []; }",
+        "[ { key = 2; } { key = 1; } ]",
+    );
+    ok(
+        r#"builtins.genericClosure { startSet = [ {key="a";} {key="b";} {key="a";} ]; operator = x: []; }"#,
+        r#"[ { key = "a"; } { key = "b"; } ]"#,
+    );
+    // Mixed numeric keys retain CompareValues equality through hash fallback.
+    ok(
+        "builtins.genericClosure { startSet = [ {key=1;} {key=1.0;} ]; operator = x: []; }",
+        "[ { key = 1; } ]",
+    );
+    fails(
+        r#"builtins.genericClosure { startSet = [ {key=1;} {key="x";} ]; operator = x: []; }"#,
+        "cannot compare a string with an integer",
     );
     ok(
         "builtins.partition (x: x > 2) [1 3 2 4]",
@@ -333,6 +405,58 @@ fn gc_survives_heavy_allocation() {
     ok(
         "builtins.length (builtins.attrNames (builtins.foldl' (acc: n: acc // { \"k${toString n}\" = n; }) {} (builtins.genList (i: i) 300)))",
         "300",
+    );
+}
+
+#[test]
+fn fold_gen_fusion_preserves_laziness_and_sharing_edges() {
+    // Direct and conservatively single-use let-bound producer forms.
+    ok(
+        "builtins.foldl' (a: x: a + x) 0 (builtins.genList (i: i + 1) 5)",
+        "15",
+    );
+    ok(
+        "let xs = builtins.genList (i: i + 1) 5; in builtins.foldl' (a: x: a + x) 0 xs",
+        "15",
+    );
+
+    // Generated elements stay lazy when the consumer ignores them.
+    ok(
+        "builtins.foldl' (a: _: a + 1) 0 (builtins.genList (_: abort \"unused\") 5)",
+        "5",
+    );
+    // If the accumulator retains an element, releasing the iteration roots
+    // must not collect it.
+    ok(
+        "builtins.foldl' (a: x: [x] ++ a) [] (builtins.genList (i: i) 4)",
+        "[ 3 2 1 0 ]",
+    );
+
+    // A shared let producer is deliberately rejected by the use-count proof.
+    ok(
+        "let xs = builtins.genList (i: i) 4; in [ (builtins.foldl' (a: x: a + x) 0 xs) (builtins.length xs) ]",
+        "[ 6 4 ]",
+    );
+    // Empty genList still validates/forces its function before foldl' forces z.
+    fails(
+        "builtins.foldl' (a: _: a) (abort \"late\") (builtins.genList 1 0)",
+        "expected a function",
+    );
+}
+
+#[test]
+fn fold_gen_fusion_rejects_shadowing_and_partial_calls() {
+    ok(
+        "let builtins = { foldl' = f: z: xs: 99; genList = f: n: []; }; in builtins.foldl' (a: b: a) 0 (builtins.genList (x: x) 3)",
+        "99",
+    );
+    ok(
+        "let __foldl' = f: z: xs: 88; in __foldl' (a: b: a) 0 (builtins.genList (x: x) 3)",
+        "88",
+    );
+    ok(
+        "let p = builtins.foldl' (a: x: a + x) 0; in p (builtins.genList (x: x) 4)",
+        "6",
     );
 }
 

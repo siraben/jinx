@@ -8,8 +8,8 @@
 set -euo pipefail
 
 JINX_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-JINX="$JINX_ROOT/target/release/jinx"
-ORACLE="$JINX_ROOT/.oracle/bin/nix-instantiate"
+JINX="${JINX:-$JINX_ROOT/target/release/jinx}"
+ORACLE="${ORACLE:-$JINX_ROOT/.oracle/bin/nix-instantiate}"
 NIXPKGS="${NIXPKGS:?set NIXPKGS to a nixpkgs checkout}"
 OUTDIR="${1:-$JINX_ROOT/bench/results}"
 mkdir -p "$OUTDIR"
@@ -18,7 +18,31 @@ export NIX_REMOTE=dummy:// NIX_STORE_DIR=/nix/store
 
 command -v hyperfine >/dev/null || { echo "hyperfine not on PATH (use: nix shell nixpkgs#hyperfine -c bash $0)"; exit 1; }
 [ -x "$JINX" ] || { echo "build first: cargo build --release -p jinx-cli"; exit 1; }
-[ -x "$ORACLE" ] || { echo "oracle missing at $ORACLE"; exit 1; }
+[ -x "$ORACLE" ] || {
+  echo "oracle missing at $ORACLE" >&2
+  echo "set ORACLE=/path/to/the/pinned/nix-instantiate (the repo .oracle symlink may have been garbage-collected)" >&2
+  exit 1
+}
+
+# Capture this before opening tracked result files below; otherwise the
+# metadata file reports the benchmark harness's own output as a dirty source
+# tree.
+JINX_DIRTY=$(test -n "$(git -C "$JINX_ROOT" status --porcelain)" && echo yes || echo no)
+
+# Capture enough provenance to explain or reproduce a result directory. This
+# is deliberately plain text so it remains useful without any plotting tools.
+{
+  echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "system=$(uname -a)"
+  echo "jinx=$JINX"
+  echo "jinx_commit=$(git -C "$JINX_ROOT" rev-parse HEAD)"
+  echo "jinx_dirty=$JINX_DIRTY"
+  echo "oracle=$ORACLE"
+  echo "oracle_version=$($ORACLE --version 2>&1 | head -n 1)"
+  echo "nixpkgs=$NIXPKGS"
+  echo "nixpkgs_commit=$(git -C "$NIXPKGS" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "hyperfine=$(hyperfine --version | head -n 1)"
+} > "$OUTDIR/metadata.txt"
 
 hf() { # name runs warmups cmds...
   local name=$1 runs=$2 warm=$3; shift 3

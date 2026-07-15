@@ -116,7 +116,7 @@ fn is_derivation(vm: &mut VM, v: &Value) -> bool {
     if let Some(a) = crate::vm::attrs_get(v, vm.syms.type_) {
         if vm.force(a.val, PosIdx(a.pos)).is_ok() {
             let tv = val(a.val);
-            return tv.tag() == Tag::String && str_bytes(&tv) == b"derivation";
+            return tv.is_string() && str_bytes(&tv) == b"derivation";
         }
     }
     false
@@ -144,7 +144,7 @@ fn print_xml(
         ),
         Tag::True => w.empty("bool", vec![attr("value", b"true")]),
         Tag::False => w.empty("bool", vec![attr("value", b"false")]),
-        Tag::String => {
+        Tag::String | Tag::SmallString => {
             let ids = vm.read_str_ctx(&v);
             merge_ctx(ctx, &ids);
             w.empty("string", vec![attr("value", str_bytes(&v))]);
@@ -168,11 +168,11 @@ fn print_xml(
                 w.close("attrs");
             }
         }
-        Tag::Closure => {
+        Tag::Closure | Tag::Closure0 | Tag::Closure1 => {
             print_function(vm, &v, location, w)?;
         }
         Tag::PrimOp | Tag::PrimOpApp => w.empty("unevaluated", vec![]),
-        Tag::Thunk | Tag::Thunk0 | Tag::Failed | Tag::Blackhole | Tag::Blackhole0 => {
+        Tag::Thunk | Tag::Thunk0 | Tag::Thunk1 | Tag::Failed | Tag::Blackhole | Tag::Blackhole0 | Tag::Blackhole1 => {
             w.empty("unevaluated", vec![])
         }
     }
@@ -248,7 +248,7 @@ fn print_derivation(
             let _ = vm.force(a.val, PosIdx(a.pos));
         }
         let av = val(a.val);
-        if av.tag() == Tag::String {
+        if av.is_string() {
             drv_path = str_bytes(&av).to_vec();
             xa.push(attr("drvPath", &drv_path));
         }
@@ -258,7 +258,7 @@ fn print_derivation(
             let _ = vm.force(a.val, PosIdx(a.pos));
         }
         let av = val(a.val);
-        if av.tag() == Tag::String {
+        if av.is_string() {
             xa.push(attr("outPath", str_bytes(&av)));
         }
     }

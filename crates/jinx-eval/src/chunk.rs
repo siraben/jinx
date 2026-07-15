@@ -41,6 +41,28 @@ pub const CTX_STRINGS: &[&str] = &[
     "while evaluating one of the elements to concatenate",        // 12
 ];
 
+/// Statically resolved one-argument list primops. The compiler emits these
+/// only when the callee is the immutable global (`builtins.head` / `__head`,
+/// etc.); aliases, partial applications, overapplications, and shadowed names
+/// retain generic `Select` + `Call` semantics.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListBuiltin {
+    Length = 0,
+    Head = 1,
+    Tail = 2,
+}
+
+impl ListBuiltin {
+    pub const fn display(self) -> &'static str {
+        match self {
+            Self::Length => "length",
+            Self::Head => "head",
+            Self::Tail => "tail",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Op {
     /// Push constant cell `consts[i]`.
@@ -114,6 +136,17 @@ pub enum Op {
     /// Pop `n` argument cells (TOS = last arg) and a function cell below
     /// them; apply; push result.
     Call(u32),
+    /// Replace TOS with the result of a statically resolved one-argument list
+    /// builtin. Preserves generic call-depth and error-trace behavior.
+    ListBuiltin(ListBuiltin),
+    /// Stack: [fold-fn, initial, generator-fn, length] -> [result].
+    /// Emitted only for exact immutable `foldl'`/`genList` producer-consumer
+    /// pairs. Generated elements remain application thunks; only the list
+    /// spine and its all-elements-live retention are eliminated.
+    FoldGen { gen_pos: PosIdx },
+    /// Replace TOS with whether it is an empty list (optionally negated).
+    /// Emitted for equality/inequality against a syntactic `[]`.
+    ListEmpty { negate: bool },
     /// Return TOS as the chunk's result.
     Ret,
     /// Push the `__curPos` attrset for this op's position.
@@ -135,6 +168,11 @@ pub enum Op {
 /// order (the order values are pushed).
 pub struct AttrsDesc {
     pub names: Vec<(Symbol, PosIdx)>,
+    /// Slot of the conventional `type` attribute, or `u32::MAX` when absent.
+    /// Derivation tests are on every attrset-equality path; recording this in
+    /// the shape makes the overwhelmingly common negative case O(1). A
+    /// sentinel keeps the descriptor compact without `Option<u32>` padding.
+    pub type_slot: u32,
     pub pos: PosIdx,
 }
 
@@ -242,6 +280,10 @@ pub enum ChunkKind {
     Forward { upval: u32, pos: PosIdx },
     /// Body is exactly `Const(idx); Ret`.
     ConstReturn { idx: u32 },
+    /// Lambda body is exactly `MakeClosure(child); Ret`. Applying the outer
+    /// lambda can return the child closure by value, without allocating the
+    /// short-lived result cell used by the ordinary operand-stack path.
+    ClosureReturn { child: u32 },
     /// Straightline body over the frame-less-interpretable op subset
     /// (`Const`/`GetUpval`/`ResolveWith`/`Force`/`MakeThunk`/`MakeClosure`/
     /// `Select`/`SelectForce`/`Call`/`Ret`, single trailing `Ret`,
@@ -262,6 +304,10 @@ pub struct Chunk {
     pub with_captures: u32,
     /// Non-with captures, appended after the with prefix.
     pub captures: Vec<Cap>,
+    /// All non-with captures are the contiguous parent-upvalue suffix starting
+    /// at `with_captures`. Precomputed to keep MakeThunk sharing eligibility
+    /// out of the hot runtime path.
+    pub captures_parent_prefix: bool,
     /// Present iff this chunk is a lambda body.
     pub lambda: Option<LambdaSpec>,
     /// Lambda name (display), or Symbol(0).
@@ -303,21 +349,20 @@ pub struct Program {
     pub select_caches: Vec<std::cell::Cell<SelectCache>>,
 }
 
-/// Per-`Select`-site inline cache: the last attrset object selected here and
-/// the slot its attribute was found at. Bindings objects are immutable, so a
-/// pointer match lets us skip the binary search; the slot's symbol is
-/// re-checked on hit to stay correct even if the GC reuses an address.
+/// Per-`Select`-site inline cache: the last slot where this site's fixed symbol
+/// was found. The slot is self-validating: immutable flat/static attrsets
+/// re-check the symbol at that offset before using it. Unlike an object-keyed
+/// monomorphic cache, this also hits across distinct instances and compatible
+/// shapes without comparing object or shape identity.
 #[derive(Clone, Copy)]
 pub struct SelectCache {
-    pub attrs: *const u64,
     pub slot: u32,
 }
 
 impl Default for SelectCache {
     fn default() -> Self {
         SelectCache {
-            attrs: std::ptr::null(),
-            slot: 0,
+            slot: u32::MAX,
         }
     }
 }

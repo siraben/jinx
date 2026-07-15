@@ -1,4 +1,5 @@
 /target
+/bench/jinx.profdata
 /.oracle
 /result*
 .DS_Store

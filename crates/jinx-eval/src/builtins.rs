@@ -4,12 +4,13 @@
 //! *called*, so name resolution and `builtins ? x` behave correctly.
 
 use std::path::{Path, PathBuf};
+use std::hash::{Hash as _, Hasher as _};
 
 use jinx_store::hash::{hash_string, Hash, HashAlgorithm, HashFormat};
 use jinx_syntax::pos::{Origin, PosIdx, NO_POS};
 use jinx_syntax::symbol::Symbol;
 
-use crate::chunk::{Chunk, Op, Program};
+use crate::chunk::{Chunk, ListBuiltin, Op, Program};
 use crate::error::{ErrId, ErrKind};
 use crate::immortal;
 use crate::print;
@@ -382,12 +383,12 @@ fn temp_cell(vm: &mut VM, v: Value) -> VRef {
 }
 
 fn force_fun(vm: &mut VM, cell: VRef, pos: PosIdx, ctx: &str) -> Result<(), ErrId> {
-    vm.force(cell, pos).map_err(|e| {
+    vm.force_if_needed(cell, pos).map_err(|e| {
         vm.add_trace(e, pos, ctx);
         e
     })?;
     let v = val(cell);
-    let is_fun = matches!(v.tag(), Tag::Closure | Tag::PrimOp | Tag::PrimOpApp)
+    let is_fun = matches!(v.tag(), Tag::Closure | Tag::Closure0 | Tag::Closure1 | Tag::PrimOp | Tag::PrimOpApp)
         || (v.tag() == Tag::Attrs && attrs_get(&v, vm.syms.functor).is_some());
     if !is_fun {
         let printed = print::print_value_err(vm, &v);
@@ -418,6 +419,7 @@ fn compare_values(vm: &mut VM, a: VRef, b: VRef, pos: PosIdx, ctx: &str) -> Resu
     // one. jinx stores them as distinct tags, so normalize booleans here.
     let norm = |t: Tag| match t {
         Tag::True | Tag::False => Tag::True,
+        Tag::SmallString => Tag::String,
         other => other,
     };
     if norm(va.tag()) != norm(vb.tag()) {
@@ -441,7 +443,7 @@ fn compare_values(vm: &mut VM, a: VRef, b: VRef, pos: PosIdx, ctx: &str) -> Resu
     match va.tag() {
         Tag::Int => Ok(va.as_int() < vb.as_int()),
         Tag::Float => Ok(va.as_float() < vb.as_float()),
-        Tag::String => Ok(str_bytes(&va) < str_bytes(&vb)),
+        Tag::String | Tag::SmallString => Ok(str_bytes(&va) < str_bytes(&vb)),
         Tag::Path => Ok(path_bytes(&va) < path_bytes(&vb)),
         Tag::List => {
             let (ea, eb) = (list_elems(&va), list_elems(&vb));
@@ -573,7 +575,7 @@ fn prim_deep_seq(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx
 fn prim_trace(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
     vm.force(args[0], pos)?;
     let v = val(args[0]);
-    let text = if v.tag() == Tag::String {
+    let text = if v.is_string() {
         str_bytes(&v).to_vec()
     } else {
         print::print_value_trace(vm, &v)
@@ -634,7 +636,7 @@ fn prim_add_error_context(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], po
 // ---------------------------------------------------------------------
 
 fn type_test(vm: &mut VM, args: &[VRef], pos: PosIdx, f: impl Fn(&Value) -> bool) -> R {
-    vm.force(args[0], pos)?;
+    vm.force_if_needed(args[0], pos)?;
     Ok(Value::bool(f(&val(args[0]))))
 }
 
@@ -656,7 +658,7 @@ fn prim_is_float(vm: &mut VM, _d: &'static PrimOpDef, a: &[VRef], p: PosIdx) -> 
 
 fn prim_is_function(vm: &mut VM, _d: &'static PrimOpDef, a: &[VRef], p: PosIdx) -> R {
     type_test(vm, a, p, |v| {
-        matches!(v.tag(), Tag::Closure | Tag::PrimOp | Tag::PrimOpApp)
+        matches!(v.tag(), Tag::Closure | Tag::Closure0 | Tag::Closure1 | Tag::PrimOp | Tag::PrimOpApp)
     })
 }
 
@@ -673,20 +675,20 @@ fn prim_is_path(vm: &mut VM, _d: &'static PrimOpDef, a: &[VRef], p: PosIdx) -> R
 }
 
 fn prim_is_string(vm: &mut VM, _d: &'static PrimOpDef, a: &[VRef], p: PosIdx) -> R {
-    type_test(vm, a, p, |v| v.tag() == Tag::String)
+    type_test(vm, a, p, Value::is_string)
 }
 
 fn prim_type_of(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
-    vm.force(args[0], pos)?;
+    vm.force_if_needed(args[0], pos)?;
     let t = match val(args[0]).tag() {
         Tag::Int => "int",
         Tag::True | Tag::False => "bool",
-        Tag::String => "string",
+        Tag::String | Tag::SmallString => "string",
         Tag::Path => "path",
         Tag::Null => "null",
         Tag::Attrs => "set",
         Tag::List => "list",
-        Tag::Closure | Tag::PrimOp | Tag::PrimOpApp => "lambda",
+        Tag::Closure | Tag::Closure0 | Tag::Closure1 | Tag::PrimOp | Tag::PrimOpApp => "lambda",
         Tag::Float => "float",
         _ => unreachable!(),
     };
@@ -705,9 +707,43 @@ fn arith(
     fi: fn(i64, i64) -> Option<i64>,
     ff: fn(f64, f64) -> f64,
 ) -> R {
-    vm.force(args[0], pos)?;
-    vm.force(args[1], pos)?;
-    let (a, b) = (val(args[0]), val(args[1]));
+    let (mut a, mut b) = (val(args[0]), val(args[1]));
+    let numeric = |v: &Value| matches!(v.tag(), Tag::Int | Tag::Float);
+    if !(numeric(&a) && numeric(&b)) {
+        vm.force(args[0], pos)?;
+        vm.force(args[1], pos)?;
+        (a, b) = (val(args[0]), val(args[1]));
+    }
+
+    // Arithmetic overwhelmingly sees already-forced numeric operands. Keep
+    // that case allocation-free: the old path formatted two error-context
+    // Strings and then re-ran the force/type checks for every successful
+    // operation. Preserve that path below for type errors, where its exact
+    // diagnostics are observable.
+    match (a.tag(), b.tag()) {
+        (Tag::Int, Tag::Int) => {
+            let (x, y) = (a.as_int(), b.as_int());
+            return match fi(x, y) {
+                Some(r) => Ok(Value::int(r)),
+                None => {
+                    let msg =
+                        format!("integer overflow in {} {} {} {}", what.1, x, what.2, y);
+                    Err(vm.new_err(ErrKind::Eval, msg, pos))
+                }
+            };
+        }
+        (Tag::Float, Tag::Float) => {
+            return Ok(Value::float(ff(a.as_float(), b.as_float())));
+        }
+        (Tag::Float, Tag::Int) => {
+            return Ok(Value::float(ff(a.as_float(), b.as_int() as f64)));
+        }
+        (Tag::Int, Tag::Float) => {
+            return Ok(Value::float(ff(a.as_int() as f64, b.as_float())));
+        }
+        _ => {}
+    }
+
     if a.tag() == Tag::Float || b.tag() == Tag::Float {
         let x = vm.force_float(
             args[0],
@@ -754,40 +790,84 @@ fn prim_mul(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> 
 }
 
 fn prim_div(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
-    vm.force(args[0], pos)?;
-    vm.force(args[1], pos)?;
-    let f2 = vm.force_float(
-        args[1],
-        pos,
-        "while evaluating the second operand of the division",
-    )?;
-    if f2 == 0.0 {
-        return Err(vm.new_err(ErrKind::Eval, "division by zero", pos));
+    let (mut a, mut b) = (val(args[0]), val(args[1]));
+    let numeric = |v: &Value| matches!(v.tag(), Tag::Int | Tag::Float);
+    if !(numeric(&a) && numeric(&b)) {
+        vm.force(args[0], pos)?;
+        vm.force(args[1], pos)?;
+        (a, b) = (val(args[0]), val(args[1]));
     }
-    let (a, b) = (val(args[0]), val(args[1]));
-    if a.tag() == Tag::Float || b.tag() == Tag::Float {
-        let f1 = vm.force_float(
-            args[0],
-            pos,
-            "while evaluating the first operand of the division",
-        )?;
-        Ok(Value::float(f1 / f2))
-    } else {
-        let i1 = vm.force_int(
-            args[0],
-            pos,
-            "while evaluating the first operand of the division",
-        )?;
-        let i2 = vm.force_int(
-            args[1],
-            pos,
-            "while evaluating the second operand of the division",
-        )?;
-        match i1.checked_div(i2) {
-            Some(r) => Ok(Value::int(r)),
-            None => {
-                let msg = format!("integer overflow in dividing {} / {}", i1, i2);
-                Err(vm.new_err(ErrKind::Eval, msg, pos))
+    match (a.tag(), b.tag()) {
+        (Tag::Int, Tag::Int) => {
+            let (i1, i2) = (a.as_int(), b.as_int());
+            if i2 == 0 {
+                return Err(vm.new_err(ErrKind::Eval, "division by zero", pos));
+            }
+            match i1.checked_div(i2) {
+                Some(r) => Ok(Value::int(r)),
+                None => {
+                    let msg = format!("integer overflow in dividing {} / {}", i1, i2);
+                    Err(vm.new_err(ErrKind::Eval, msg, pos))
+                }
+            }
+        }
+        (Tag::Float, Tag::Float) => {
+            let f2 = b.as_float();
+            if f2 == 0.0 {
+                return Err(vm.new_err(ErrKind::Eval, "division by zero", pos));
+            }
+            Ok(Value::float(a.as_float() / f2))
+        }
+        (Tag::Float, Tag::Int) => {
+            let i2 = b.as_int();
+            if i2 == 0 {
+                return Err(vm.new_err(ErrKind::Eval, "division by zero", pos));
+            }
+            Ok(Value::float(a.as_float() / i2 as f64))
+        }
+        (Tag::Int, Tag::Float) => {
+            let f2 = b.as_float();
+            if f2 == 0.0 {
+                return Err(vm.new_err(ErrKind::Eval, "division by zero", pos));
+            }
+            Ok(Value::float(a.as_int() as f64 / f2))
+        }
+        _ => {
+            // Preserve the original operand-validation order and diagnostics
+            // for non-numeric values: the divisor is checked first.
+            let f2 = vm.force_float(
+                args[1],
+                pos,
+                "while evaluating the second operand of the division",
+            )?;
+            if f2 == 0.0 {
+                return Err(vm.new_err(ErrKind::Eval, "division by zero", pos));
+            }
+            if a.tag() == Tag::Float || b.tag() == Tag::Float {
+                let f1 = vm.force_float(
+                    args[0],
+                    pos,
+                    "while evaluating the first operand of the division",
+                )?;
+                Ok(Value::float(f1 / f2))
+            } else {
+                let i1 = vm.force_int(
+                    args[0],
+                    pos,
+                    "while evaluating the first operand of the division",
+                )?;
+                let i2 = vm.force_int(
+                    args[1],
+                    pos,
+                    "while evaluating the second operand of the division",
+                )?;
+                match i1.checked_div(i2) {
+                    Some(r) => Ok(Value::int(r)),
+                    None => {
+                        let msg = format!("integer overflow in dividing {} / {}", i1, i2);
+                        Err(vm.new_err(ErrKind::Eval, msg, pos))
+                    }
+                }
             }
         }
     }
@@ -812,8 +892,22 @@ fn prim_bit_xor(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx)
 }
 
 fn prim_less_than(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
-    vm.force(args[0], pos)?;
-    vm.force(args[1], pos)?;
+    let (mut a, mut b) = (val(args[0]), val(args[1]));
+    let numeric = |v: &Value| matches!(v.tag(), Tag::Int | Tag::Float);
+    if !(numeric(&a) && numeric(&b)) {
+        vm.force(args[0], pos)?;
+        vm.force(args[1], pos)?;
+        (a, b) = (val(args[0]), val(args[1]));
+    }
+    match (a.tag(), b.tag()) {
+        (Tag::Int, Tag::Int) => return Ok(Value::bool(a.as_int() < b.as_int())),
+        (Tag::Float, Tag::Float) => return Ok(Value::bool(a.as_float() < b.as_float())),
+        (Tag::Float, Tag::Int) => return Ok(Value::bool(a.as_float() < b.as_int() as f64)),
+        (Tag::Int, Tag::Float) => {
+            return Ok(Value::bool((a.as_int() as f64) < b.as_float()));
+        }
+        _ => {}
+    }
     Ok(Value::bool(compare_values(vm, args[0], args[1], NO_POS, "")?))
 }
 
@@ -896,7 +990,7 @@ fn prim_substring(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
     // Special case: skip coercion if the length is 0.
     if len == 0 {
         vm.force(args[2], pos)?;
-        if val(args[2]).tag() == Tag::String {
+        if val(args[2]).is_string() {
             let v = val(args[2]);
             let ctxp = str_ctx(&v);
             return Ok(vm.new_string_value(b"", ctxp));
@@ -2585,7 +2679,9 @@ fn prim_flake_ref_to_string(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], 
                 FlakeVal::Int(iv)
             }
             Tag::True | Tag::False => FlakeVal::Bool(v.as_bool()),
-            Tag::String => FlakeVal::Str(String::from_utf8_lossy(str_bytes(&v)).into_owned()),
+            Tag::String | Tag::SmallString => {
+                FlakeVal::Str(String::from_utf8_lossy(str_bytes(&v)).into_owned())
+            }
             _ => {
                 return Err(vm.new_err(
                     ErrKind::Eval,
@@ -3192,22 +3288,35 @@ fn prim_parse_drv_name(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
 // lists
 // ---------------------------------------------------------------------
 
-fn prim_length(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+pub(crate) fn eval_list_builtin(
+    vm: &mut VM,
+    kind: ListBuiltin,
+    arg: VRef,
+    pos: PosIdx,
+) -> R {
+    match kind {
+        ListBuiltin::Length => eval_length(vm, arg, pos),
+        ListBuiltin::Head => eval_head(vm, arg, pos),
+        ListBuiltin::Tail => eval_tail(vm, arg, pos),
+    }
+}
+
+fn eval_length(vm: &mut VM, arg: VRef, pos: PosIdx) -> R {
     vm.force_list(
-        args[0],
+        arg,
         pos,
         "while evaluating the first argument passed to builtins.length",
     )?;
-    Ok(Value::int(list_elems(&val(args[0])).len() as i64))
+    Ok(Value::int(list_elems(&val(arg)).len() as i64))
 }
 
-fn prim_head(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+fn eval_head(vm: &mut VM, arg: VRef, pos: PosIdx) -> R {
     vm.force_list(
-        args[0],
+        arg,
         pos,
         "while evaluating the first argument passed to 'builtins.head'",
     )?;
-    let elems = list_elems(&val(args[0]));
+    let elems = list_elems(&val(arg));
     if elems.is_empty() {
         return Err(vm.new_err(ErrKind::Eval, "'builtins.head' called on an empty list", pos));
     }
@@ -3215,17 +3324,41 @@ fn prim_head(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) ->
     Ok(val(elems[0]))
 }
 
-fn prim_tail(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+fn eval_tail(vm: &mut VM, arg: VRef, pos: PosIdx) -> R {
     vm.force_list(
-        args[0],
+        arg,
         pos,
         "while evaluating the first argument passed to 'builtins.tail'",
     )?;
-    let elems = list_elems(&val(args[0]));
+    let elems = list_elems(&val(arg));
     if elems.is_empty() {
         return Err(vm.new_err(ErrKind::Eval, "'builtins.tail' called on an empty list", pos));
     }
-    Ok(vm.new_list_value(&elems[1..]))
+    let source = val(arg);
+    // A view retains the original payload, including the skipped cell. Only
+    // share when that cell is immutable pointer-free WHNF; otherwise copying
+    // preserves the old behavior of releasing a potentially large graph.
+    let view = val(elems[0])
+        .is_pointer_free_whnf()
+        .then(|| source.list_tail_view())
+        .flatten();
+    if let Some(view) = view {
+        Ok(view)
+    } else {
+        Ok(vm.new_list_value(&elems[1..]))
+    }
+}
+
+fn prim_length(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    eval_length(vm, args[0], pos)
+}
+
+fn prim_head(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    eval_head(vm, args[0], pos)
+}
+
+fn prim_tail(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
+    eval_tail(vm, args[0], pos)
 }
 
 fn prim_elem_at(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
@@ -3478,6 +3611,102 @@ fn prim_foldl_strict(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: Po
     let out = val(cur);
     vm.temp_end(scope);
     r?;
+    Ok(out)
+}
+
+/// Evaluate the compiler-proven `foldl' f z (genList g n)` pipeline without
+/// materializing the list. `g i` deliberately remains an application thunk:
+/// `f` may ignore its second argument, and Nix's error/force order depends on
+/// that laziness. The single mutable temp root lets prior iterations die at
+/// precise safepoints unless the accumulator graph actually retains them.
+pub(crate) fn eval_fold_gen(
+    vm: &mut VM,
+    fold_fun: VRef,
+    initial: VRef,
+    gen_fun: VRef,
+    len_cell: VRef,
+    pos: PosIdx,
+    gen_call_pos: PosIdx,
+) -> R {
+    force_fun(
+        vm,
+        fold_fun,
+        pos,
+        "while evaluating the first argument passed to builtins.foldlStrict",
+    )?;
+
+    // Reproduce the nested generic genList call's depth boundary and trace.
+    // A failure of depth_check itself occurs before primop dispatch and thus
+    // receives no inner "while calling genList" frame.
+    vm.depth_check(gen_call_pos)?;
+    vm.call_depth += 1;
+    let prepared = (|| {
+        let len = vm.force_int(
+            len_cell,
+            pos,
+            "while evaluating the second argument passed to builtins.genList",
+        )?;
+        if len < 0 {
+            return Err(vm.new_err(
+                ErrKind::Eval,
+                format!("cannot create list of size {}", len),
+                pos,
+            ));
+        }
+        force_fun(
+            vm,
+            gen_fun,
+            pos,
+            "while evaluating the first argument passed to builtins.genList",
+        )?;
+        // Preserve Vec's capacity-overflow rejection without reserving the
+        // list's pointer array. A real allocator OOM is process/environment
+        // dependent; the fused path's purpose is to avoid that allocation.
+        if std::alloc::Layout::array::<VRef>(len as usize).is_err() {
+            return Err(vm.new_err(ErrKind::Eval, "out of memory".to_string(), pos));
+        }
+        Ok(len)
+    })();
+    vm.call_depth -= 1;
+    let len = prepared.map_err(|e| {
+        vm.add_trace(e, gen_call_pos, "while calling the 'genList' builtin");
+        e
+    })?;
+
+    if len == 0 {
+        vm.force(initial, pos)?;
+        return Ok(val(initial));
+    }
+
+    let scope = vm.temp_scope();
+    let cur_root = vm.temp_roots.len();
+    vm.temp_roots.push(initial);
+    let mut cur = initial;
+    for n in 0..len {
+        let idx = vm.alloc_cell(Value::int(n));
+        vm.temp_roots.push(idx);
+        let generated = vm.new_apply_thunk(gen_fun, &[idx]);
+        let element = vm.alloc_cell(generated);
+        // The application thunk now owns the index edge, so this single
+        // scratch slot can root the element passed into the consumer.
+        vm.temp_roots[cur_root + 1] = element;
+        let next = match vm.call_function(fold_fun, &[cur, element], pos) {
+            Ok(v) => vm.alloc_cell(v),
+            Err(e) => {
+                vm.temp_end(scope);
+                return Err(e);
+            }
+        };
+        // Publish the new accumulator before releasing this iteration's
+        // temporary roots. If it retains `element`, that edge keeps it live.
+        vm.temp_roots[cur_root] = next;
+        cur = next;
+        vm.temp_roots.truncate(cur_root + 1);
+    }
+    let forced = vm.force(cur, pos);
+    let out = val(cur);
+    vm.temp_end(scope);
+    forced?;
     Ok(out)
 }
 
@@ -3805,7 +4034,6 @@ fn prim_remove_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: Po
     let entries: Vec<Attr> = attrs_entries(&val(args[0]))
         .iter()
         .filter(|a| !to_remove.contains(&a.sym))
-        .copied()
         .collect();
     if entries.len() == attrs_entries(&val(args[0])).len() {
         return Ok(val(args[0]));
@@ -3874,16 +4102,10 @@ fn prim_map_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosId
         pos,
         "while evaluating the second argument passed to builtins.mapAttrs",
     )?;
-    // Borrow the input payload directly instead of copying it. This is sound
-    // because the bindings object is rooted by `args[1]` for the whole call,
-    // the heap is non-moving, and bindings objects are never mutated in place
-    // — every producer (`new_bindings`, `new_bindings_merge`, `new_bindings_raw`,
-    // `immortal::bindings`) writes into a freshly-allocated object, and the loop
-    // below only creates thunks (no user code, no in-place attr writes). So the
-    // slice stays valid and unaliased across the allocating calls inside the
-    // loop, making the old defensive `.to_vec()` unnecessary. `attrs_entries`
-    // returns a slice with a free lifetime, so it does not borrow `vm`.
-    let entries_in: &[Attr] = attrs_entries(&val(args[1]));
+    // Borrow the immutable flat/layered input directly. The object remains
+    // rooted by `args[1]`; allocation is non-moving and ordered iteration does
+    // not retain mutable VM state.
+    let entries_in = attrs_entries(&val(args[1]));
     let scope = vm.temp_scope();
     let mut entries = std::mem::take(&mut vm.scratch_attrs);
     entries.clear();
@@ -3931,28 +4153,28 @@ fn prim_intersect_attrs(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
         if e1.len() <= e2.len() {
             // small = e1: keep the matching e2 entry.
             for a in e1 {
-                if let Ok(k) = e2.binary_search_by(|x| x.sym.cmp(&a.sym)) {
-                    entries.push(e2[k]);
+                if let Some(found) = e2.get(a.sym) {
+                    entries.push(found);
                 }
             }
         } else {
             // small = e2: keep e2's own entry on a hit in e1.
             for a in e2 {
-                if e1.binary_search_by(|x| x.sym.cmp(&a.sym)).is_ok() {
-                    entries.push(*a);
+                if e1.get(a.sym).is_some() {
+                    entries.push(a);
                 }
             }
         }
     } else {
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < e1.len() && j < e2.len() {
-            match e1[i].sym.cmp(&e2[j].sym) {
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
+        let (mut i1, mut i2) = (e1.iter().peekable(), e2.iter().peekable());
+        while let (Some(a1), Some(a2)) = (i1.peek(), i2.peek()) {
+            match a1.sym.cmp(&a2.sym) {
+                std::cmp::Ordering::Less => { i1.next(); }
+                std::cmp::Ordering::Greater => { i2.next(); }
                 std::cmp::Ordering::Equal => {
-                    entries.push(e2[j]);
-                    i += 1;
-                    j += 1;
+                    entries.push(*a2);
+                    i1.next();
+                    i2.next();
                 }
             }
         }
@@ -3995,10 +4217,10 @@ fn prim_function_args(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: P
     // The previous `__functor`-following both diverged from that and recursed
     // through the Rust stack with no depth accounting, so a self-returning
     // functor (`{ __functor = self: self; }`) aborted with a stack overflow.
-    if !matches!(v.tag(), Tag::Closure | Tag::PrimOp | Tag::PrimOpApp) {
+    if !matches!(v.tag(), Tag::Closure | Tag::Closure0 | Tag::Closure1 | Tag::PrimOp | Tag::PrimOpApp) {
         return Err(vm.new_err(ErrKind::Type, "'functionArgs' requires a function", pos));
     }
-    if v.tag() != Tag::Closure {
+    if !matches!(v.tag(), Tag::Closure | Tag::Closure0 | Tag::Closure1) {
         return Ok(vm.new_bindings_value(&[]));
     }
     let (code, _) = crate::vm::thunk_code(&v);
@@ -4040,6 +4262,101 @@ fn prim_unsafe_get_attr_pos(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], 
         Some(a) => Ok(vm.mk_pos(PosIdx(a.pos))),
         None => Ok(Value::null()),
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClosureKeyDomain {
+    Int,
+    Float,
+    String,
+    Path,
+}
+
+fn closure_key_domain(v: &Value) -> Option<ClosureKeyDomain> {
+    match v.tag() {
+        Tag::Int => Some(ClosureKeyDomain::Int),
+        Tag::Float if v.as_float().is_finite() => Some(ClosureKeyDomain::Float),
+        Tag::String | Tag::SmallString => Some(ClosureKeyDomain::String),
+        Tag::Path => Some(ClosureKeyDomain::Path),
+        _ => None,
+    }
+}
+
+fn closure_key_hash(v: &Value, domain: ClosureKeyDomain) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    match domain {
+        ClosureKeyDomain::Int => v.as_int().hash(&mut hasher),
+        ClosureKeyDomain::Float => {
+            let value = v.as_float();
+            let bits = if value == 0.0 { 0 } else { value.to_bits() };
+            bits.hash(&mut hasher);
+        }
+        ClosureKeyDomain::String => str_bytes(v).hash(&mut hasher),
+        ClosureKeyDomain::Path => path_bytes(v).hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+fn closure_keys_equal(a: &Value, b: &Value, domain: ClosureKeyDomain) -> bool {
+    match domain {
+        ClosureKeyDomain::Int => a.as_int() == b.as_int(),
+        ClosureKeyDomain::Float => a.as_float() == b.as_float(),
+        ClosureKeyDomain::String => str_bytes(a) == str_bytes(b),
+        ClosureKeyDomain::Path => path_bytes(a) == path_bytes(b),
+    }
+}
+
+fn sort_closure_seen(keys: &mut Vec<VRef>, elems: &mut Vec<VRef>, domain: ClosureKeyDomain) {
+    let mut pairs: Vec<(VRef, VRef)> = keys.drain(..).zip(elems.drain(..)).collect();
+    pairs.sort_by(|(a, _), (b, _)| {
+        let (a, b) = (val(*a), val(*b));
+        match domain {
+            ClosureKeyDomain::Int => a.as_int().cmp(&b.as_int()),
+            ClosureKeyDomain::Float => a.as_float().partial_cmp(&b.as_float()).unwrap(),
+            ClosureKeyDomain::String => str_bytes(&a).cmp(str_bytes(&b)),
+            ClosureKeyDomain::Path => path_bytes(&a).cmp(path_bytes(&b)),
+        }
+    });
+    for (key, elem) in pairs {
+        keys.push(key);
+        elems.push(elem);
+    }
+}
+
+fn insert_ordered_closure_key(
+    vm: &mut VM,
+    done_keys: &mut Vec<VRef>,
+    done_elems: &mut Vec<VRef>,
+    key: VRef,
+    elem: VRef,
+) -> Result<bool, ErrId> {
+    // The new key is compared first so an incomparability error reports its
+    // type before the existing key, matching std::map and C++ Nix.
+    let mut lo = 0usize;
+    let mut hi = done_keys.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let other_elem = done_elems[mid];
+        let cmp = |vm: &mut VM, a: VRef, b: VRef| -> Result<bool, ErrId> {
+            compare_values(vm, a, b, NO_POS, "").map_err(|er| {
+                let other_p = crate::print::print_value_err(vm, &val(other_elem));
+                let elem_p = crate::print::print_value_err(vm, &val(elem));
+                vm.add_trace(er, NO_POS, format!("with element {other_p}"));
+                vm.add_trace(er, NO_POS, format!("while comparing element {elem_p}"));
+                er
+            })
+        };
+        if cmp(vm, key, done_keys[mid])? {
+            hi = mid;
+        } else if cmp(vm, done_keys[mid], key)? {
+            lo = mid + 1;
+        } else {
+            return Ok(false);
+        }
+    }
+    done_keys.insert(lo, key);
+    done_elems.insert(lo, elem);
+    Ok(true)
 }
 
 fn prim_generic_closure(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: PosIdx) -> R {
@@ -4090,6 +4407,10 @@ fn prim_generic_closure(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
         list_elems(&val(start.val)).iter().copied().collect();
     let mut done_keys: Vec<VRef> = Vec::new();
     let mut done_elems: Vec<VRef> = Vec::new();
+    let mut hash_domain: Option<ClosureKeyDomain> = None;
+    let mut hash_active = true;
+    let mut hash_buckets: rustc_hash::FxHashMap<u64, Vec<VRef>> =
+        rustc_hash::FxHashMap::default();
     let mut res: Vec<VRef> = Vec::new();
     while let Some(e) = work.pop_front() {
         // C++ adds "in genericClosure element %s" if forcing the element or
@@ -4110,40 +4431,58 @@ fn prim_generic_closure(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos:
             return Err(er);
         };
         vm.force(key.val, NO_POS)?;
-        // Insert into done set (ordered by CompareValues). The new key is
-        // compared *first* so an incomparability error reports the new
-        // element's type before the existing one (matching std::map order).
-        let mut lo = 0usize;
-        let mut hi = done_keys.len();
-        let mut is_dup = false;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let other_elem = done_elems[mid];
-            let cmp = |vm: &mut VM, a: VRef, b: VRef| -> Result<bool, ErrId> {
-                compare_values(vm, a, b, NO_POS, "").map_err(|er| {
-                    // Pre-swapped for reverse printing: "with element",
-                    // then "while comparing element".
-                    let other_p = crate::print::print_value_err(vm, &val(other_elem));
-                    let e_p = crate::print::print_value_err(vm, &val(e));
-                    vm.add_trace(er, NO_POS, format!("with element {other_p}"));
-                    vm.add_trace(er, NO_POS, format!("while comparing element {e_p}"));
-                    er
-                })
-            };
-            if cmp(vm, key.val, done_keys[mid])? {
-                hi = mid;
-            } else if cmp(vm, done_keys[mid], key.val)? {
-                lo = mid + 1;
-            } else {
-                is_dup = true;
-                break;
+        let key_v = val(key.val);
+        let key_domain = closure_key_domain(&key_v);
+        let inserted = if hash_active {
+            match (hash_domain, key_domain) {
+                (None, Some(domain)) => {
+                    hash_domain = Some(domain);
+                    let hash = closure_key_hash(&key_v, domain);
+                    hash_buckets.entry(hash).or_default().push(key.val);
+                    done_keys.push(key.val);
+                    done_elems.push(e);
+                    true
+                }
+                (Some(domain), Some(current)) if domain == current => {
+                    let hash = closure_key_hash(&key_v, domain);
+                    let bucket = hash_buckets.entry(hash).or_default();
+                    if bucket
+                        .iter()
+                        .any(|&seen| closure_keys_equal(&key_v, &val(seen), domain))
+                    {
+                        false
+                    } else {
+                        bucket.push(key.val);
+                        done_keys.push(key.val);
+                        done_elems.push(e);
+                        true
+                    }
+                }
+                _ => {
+                    // A mixed or incomparable key needs the exact ordered
+                    // CompareValues fallback. Materialize the hash prefix in
+                    // map order before comparing the new key, preserving error
+                    // selection and trace text.
+                    if let Some(domain) = hash_domain {
+                        sort_closure_seen(&mut done_keys, &mut done_elems, domain);
+                    }
+                    hash_active = false;
+                    hash_buckets.clear();
+                    insert_ordered_closure_key(
+                        vm,
+                        &mut done_keys,
+                        &mut done_elems,
+                        key.val,
+                        e,
+                    )?
+                }
             }
-        }
-        if is_dup {
+        } else {
+            insert_ordered_closure_key(vm, &mut done_keys, &mut done_elems, key.val, e)?
+        };
+        if !inserted {
             continue;
         }
-        done_keys.insert(lo, key.val);
-        done_elems.insert(lo, e);
         vm.temp_roots.push(key.val);
         res.push(e);
         vm.temp_roots.push(e);
@@ -4198,7 +4537,10 @@ fn prim_zip_attrs_with(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
     // place, so the slice stays valid across the `force_attrs` calls below.
     // `list_elems` returns a free-lifetime slice, so it does not borrow `vm`.
     let lists: &[VRef] = list_elems(&val(args[1]));
-    let mut buckets: Vec<(u32, Vec<VRef>)> = Vec::new();
+    // Collect flat, then stable-sort by symbol. Stability preserves the input
+    // attrset order within each group while avoiding a linear bucket search
+    // for every attribute.
+    let mut named: Vec<(u32, VRef)> = Vec::new();
     for el in lists {
         vm.force_attrs(
             *el,
@@ -4206,13 +4548,17 @@ fn prim_zip_attrs_with(vm: &mut VM, _d: &'static PrimOpDef, args: &[VRef], pos: 
             "while evaluating a value of the list passed as second argument to builtins.zipAttrsWith",
         )?;
         for a in attrs_entries(&val(*el)) {
-            match buckets.iter_mut().find(|(s, _)| *s == a.sym) {
-                Some((_, v)) => v.push(a.val),
-                None => buckets.push((a.sym, vec![a.val])),
-            }
+            named.push((a.sym, a.val));
         }
     }
-    buckets.sort_by_key(|(s, _)| *s);
+    named.sort_by_key(|(sym, _)| *sym);
+    let mut buckets: Vec<(u32, Vec<VRef>)> = Vec::new();
+    for (sym, value) in named {
+        match buckets.last_mut() {
+            Some((last_sym, values)) if *last_sym == sym => values.push(value),
+            _ => buckets.push((sym, vec![value])),
+        }
+    }
     let scope = vm.temp_scope();
     let mut entries = std::mem::take(&mut vm.scratch_attrs);
     entries.clear();
@@ -4461,12 +4807,19 @@ fn base_name_of(path: &[u8]) -> Vec<u8> {
 
 /// Port of `EvalState::callPathFilter`: call `filter path type` and force the
 /// result to a Boolean. `type` is `"regular"`/`"directory"`/`"symlink"`/
-/// `"unknown"` per the entry's lstat.
-fn call_path_filter(vm: &mut VM, filter: VRef, path: &std::path::Path) -> Result<bool, ErrId> {
-    let t = path
-        .symlink_metadata()
-        .map(|m| file_type_str(&m))
-        .unwrap_or("unknown");
+/// `"unknown"` using metadata already obtained by the NAR walker.
+fn call_path_filter(
+    vm: &mut VM,
+    filter: VRef,
+    path: &std::path::Path,
+    file_type: jinx_store::nar::NarFileType,
+) -> Result<bool, ErrId> {
+    let t = match file_type {
+        jinx_store::nar::NarFileType::Regular => "regular",
+        jinx_store::nar::NarFileType::Directory => "directory",
+        jinx_store::nar::NarFileType::Symlink => "symlink",
+        jinx_store::nar::NarFileType::Unknown => "unknown",
+    };
     use std::os::unix::ffi::OsStrExt;
     let pv = mk_string(vm, path.as_os_str().as_bytes());
     let pc = temp_cell(vm, pv);
@@ -4518,14 +4871,14 @@ fn value_ident_eq(a: VRef, b: VRef, depth: u32) -> bool {
     let va = val(a);
     let vb = val(b);
     let ta = va.tag();
-    if ta != vb.tag() {
+    if ta != vb.tag() && !(va.is_string() && vb.is_string()) {
         return false;
     }
     match ta {
         Tag::Null | Tag::True | Tag::False => true,
         Tag::Int => va.as_int() == vb.as_int(),
         Tag::Float => va.as_float().to_bits() == vb.as_float().to_bits(),
-        Tag::String => {
+        Tag::String | Tag::SmallString => {
             // Require equal bytes and the same (or both-null) context object;
             // distinct-but-equal contexts conservatively compare unequal.
             str_bytes(&va) == str_bytes(&vb) && std::ptr::eq(str_ctx(&va), str_ctx(&vb))
@@ -4536,7 +4889,7 @@ fn value_ident_eq(a: VRef, b: VRef, depth: u32) -> bool {
             let (acc_b, bytes_b) = unsafe { crate::value::path_parts(vb.ptr() as *const u64) };
             acc_a == acc_b && bytes_a == bytes_b
         }
-        Tag::Closure => {
+        Tag::Closure | Tag::Closure0 | Tag::Closure1 => {
             let (code_a, ups_a) = crate::vm::thunk_code(&va);
             let (code_b, ups_b) = crate::vm::thunk_code(&vb);
             std::ptr::eq(code_a, code_b)
@@ -4595,8 +4948,10 @@ fn dump_nar_filtered<W: std::io::Write>(
         Some(f) => {
             let mut pending: Option<ErrId> = None;
             let res = {
-                let mut cb = |p: &std::path::Path| -> std::io::Result<bool> {
-                    match call_path_filter(vm, f, p) {
+                let mut cb = |p: &std::path::Path,
+                              file_type: jinx_store::nar::NarFileType|
+                 -> std::io::Result<bool> {
+                    match call_path_filter(vm, f, p, file_type) {
                         Ok(b) => Ok(b),
                         Err(e) => {
                             pending = Some(e);
@@ -4650,12 +5005,10 @@ fn add_filtered_path(
         if let Some(entries) = vm.filtered_path_cache.get(key) {
             for (f, _hash, sp) in entries {
                 if filter_ident_eq(*f, filter) {
-                    jinx_store::nar_stats::record_cache_hit();
                     return Ok(sp.clone());
                 }
             }
         }
-        jinx_store::nar_stats::record_cache_miss();
     }
 
     // Compute the content-address hash. The daemon needs the actual bytes for
@@ -4669,7 +5022,6 @@ fn add_filtered_path(
             if need_bytes {
                 let bytes = std::fs::read(real_path)
                     .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?;
-                jinx_store::nar_stats::record_nar_bytes(bytes.len() as u64);
                 let h = hash_string(HashAlgorithm::Sha256, &bytes);
                 (h, Some(bytes))
             } else {
@@ -4678,8 +5030,7 @@ fn add_filtered_path(
                     .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?;
                 std::io::copy(&mut f, &mut sink)
                     .map_err(|e| vm.new_err(ErrKind::Eval, e.to_string(), NO_POS))?;
-                let (h, n) = sink.finish();
-                jinx_store::nar_stats::record_nar_bytes(n);
+                let (h, _) = sink.finish();
                 (h, None)
             }
         }
@@ -4687,14 +5038,12 @@ fn add_filtered_path(
             if need_bytes {
                 let mut nar = Vec::new();
                 dump_nar_filtered(vm, real_path, filter, &mut nar)?;
-                jinx_store::nar_stats::record_nar_bytes(nar.len() as u64);
                 let h = hash_string(HashAlgorithm::Sha256, &nar);
                 (h, Some(nar))
             } else {
                 let mut sink = jinx_store::hash::HashSink::new(HashAlgorithm::Sha256);
                 dump_nar_filtered(vm, real_path, filter, &mut sink)?;
-                let (h, n) = sink.finish();
-                jinx_store::nar_stats::record_nar_bytes(n);
+                let (h, _) = sink.finish();
                 (h, None)
             }
         }
@@ -5396,7 +5745,7 @@ fn realise_path_context(vm: &mut VM, cell: VRef, pos: PosIdx) -> Result<(), ErrI
     // `Built` context, matching C++ `coerceToPath` feeding `realiseContext`.
     let ids: Vec<u32> = match v.tag() {
         Tag::Path => return Ok(()),
-        Tag::String => vm.read_str_ctx(&v),
+        Tag::String | Tag::SmallString => vm.read_str_ctx(&v),
         _ => match vm.coerce_to_string(
             cell,
             pos,

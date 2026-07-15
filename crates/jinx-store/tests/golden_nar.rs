@@ -100,6 +100,42 @@ fn golden_single_file_and_symlink_nars() {
     fs::remove_dir_all(root.parent().unwrap()).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn filtered_walk_supplies_entry_types() {
+    use jinx_store::nar::NarFileType;
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = make_tree("filtered-types");
+    let fifo = CString::new(root.join("pipe").as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo` is a valid NUL-terminated path; the fixture path is fresh.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let mut seen = BTreeMap::new();
+    let mut out = Vec::new();
+    nar::dump_path_filtered(&root, &mut out, &mut |path, file_type| {
+        seen.insert(
+            path.file_name().unwrap().to_string_lossy().into_owned(),
+            file_type,
+        );
+        // Unsupported file types are reported as "unknown" to the callback
+        // and may be filtered out before the NAR walker rejects them.
+        Ok(file_type != NarFileType::Unknown)
+    })
+    .unwrap();
+
+    assert_eq!(out, GOLDEN_TREE_NAR);
+    assert_eq!(seen["emptydir"], NarFileType::Directory);
+    assert_eq!(seen["nested"], NarFileType::Directory);
+    assert_eq!(seen["regular.txt"], NarFileType::Regular);
+    assert_eq!(seen["script.sh"], NarFileType::Regular);
+    assert_eq!(seen["link"], NarFileType::Symlink);
+    assert_eq!(seen["pipe"], NarFileType::Unknown);
+
+    fs::remove_dir_all(root.parent().unwrap()).unwrap();
+}
+
 #[test]
 fn golden_dump_string() {
     // dump_string("x") must equal the NAR of a non-executable file

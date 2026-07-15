@@ -30,7 +30,7 @@ pub fn parse(
     let mut p = Parser {
         lexer: Lexer::new(source, origin),
         src: source,
-        peeked: Vec::new(),
+        peeked: [None, None],
         exprs,
         symbols,
         positions,
@@ -64,7 +64,7 @@ type PExpr = (ExprId, u32); // expression + begin offset of its production
 struct Parser<'a> {
     lexer: Lexer<'a>,
     src: &'a [u8],
-    peeked: Vec<Token>,
+    peeked: [Option<Token>; 2],
     exprs: &'a mut Exprs,
     symbols: &'a mut SymbolTable,
     positions: &'a mut PosTable,
@@ -74,37 +74,67 @@ struct Parser<'a> {
     warnings: &'a mut Vec<Vec<u8>>,
 }
 
+/// The portion of a token needed for grammar decisions and parse errors.
+///
+/// Lookahead never needs the token payload: productions which consume an
+/// identifier/string/path take ownership of the full [`Token`] via `next`.
+/// Keeping this header separate avoids cloning a token's `Vec<u8>` merely to
+/// inspect its kind or source offsets.
+#[derive(Clone)]
+struct TokenHead {
+    kind: TokKind,
+    begin: u32,
+}
+
+impl From<&Token> for TokenHead {
+    #[inline]
+    fn from(t: &Token) -> Self {
+        Self {
+            kind: t.kind.clone(),
+            begin: t.begin,
+        }
+    }
+}
+
 impl<'a> Parser<'a> {
     // ---------- token plumbing ----------
 
-    fn fill(&mut self, n: usize) -> Result<(), ParseError> {
-        while self.peeked.len() < n {
-            let t = self.lexer.next_token(self.positions)?;
-            self.peeked.push(t);
+    fn fill(&mut self, index: usize) -> Result<(), ParseError> {
+        debug_assert!(index < 2);
+        if self.peeked[0].is_none() {
+            self.peeked[0] = Some(self.lexer.next_token(self.positions)?);
+        }
+        if index == 1 && self.peeked[1].is_none() {
+            self.peeked[1] = Some(self.lexer.next_token(self.positions)?);
         }
         Ok(())
     }
 
-    fn peek(&mut self) -> Result<&Token, ParseError> {
+    #[inline]
+    fn peek(&mut self) -> Result<TokenHead, ParseError> {
+        self.fill(0)?;
+        Ok(TokenHead::from(self.peeked[0].as_ref().unwrap()))
+    }
+
+    #[inline]
+    fn peek2(&mut self) -> Result<TokenHead, ParseError> {
         self.fill(1)?;
-        Ok(&self.peeked[0])
+        Ok(TokenHead::from(self.peeked[1].as_ref().unwrap()))
     }
 
-    fn peek2(&mut self) -> Result<&Token, ParseError> {
-        self.fill(2)?;
-        Ok(&self.peeked[1])
-    }
-
+    #[inline]
     fn next(&mut self) -> Result<Token, ParseError> {
-        self.fill(1)?;
-        Ok(self.peeked.remove(0))
+        self.fill(0)?;
+        let token = self.peeked[0].take().unwrap();
+        self.peeked[0] = self.peeked[1].take();
+        Ok(token)
     }
 
     fn at(&self, offset: u32) -> PosIdx {
         self.positions.add(self.origin, offset)
     }
 
-    fn err_unexpected(&self, t: &Token, expecting: &[&str]) -> ParseError {
+    fn err_unexpected(&self, t: &TokenHead, expecting: &[&str]) -> ParseError {
         let mut msg = format!("syntax error, unexpected {}", token_name(&t.kind));
         if !expecting.is_empty() {
             msg.push_str(", expecting ");
@@ -113,7 +143,7 @@ impl<'a> Parser<'a> {
         ParseError::new(msg, self.at(t.begin))
     }
 
-    fn is_char(t: &Token, c: u8) -> bool {
+    fn is_char(t: &TokenHead, c: u8) -> bool {
         matches!(t.kind, TokKind::Char(x) if x == c)
     }
 
@@ -578,7 +608,7 @@ impl<'a> Parser<'a> {
                 }
                 self.next()?;
                 let attrs = self.parse_binds(BindsCtx::RecBrace)?;
-                debug_assert!(Self::is_char(self.peek()?, b'}'));
+                debug_assert!(Self::is_char(&self.peek()?, b'}'));
                 self.next()?;
                 {
                     let a = self.exprs.attrs_mut(attrs);
@@ -603,7 +633,7 @@ impl<'a> Parser<'a> {
                 }
                 self.next()?;
                 let attrs = self.parse_binds(BindsCtx::RecBrace)?;
-                debug_assert!(Self::is_char(self.peek()?, b'}'));
+                debug_assert!(Self::is_char(&self.peek()?, b'}'));
                 self.next()?;
                 let pos = self.at(kw.begin);
                 {
@@ -627,7 +657,7 @@ impl<'a> Parser<'a> {
                     return Ok((e, open.begin));
                 }
                 let attrs = self.parse_binds(BindsCtx::Brace)?;
-                debug_assert!(Self::is_char(self.peek()?, b'}'));
+                debug_assert!(Self::is_char(&self.peek()?, b'}'));
                 self.next()?;
                 let pos = self.at(open.begin);
                 self.exprs.attrs_mut(attrs).pos = pos;
@@ -1002,7 +1032,7 @@ impl<'a> Parser<'a> {
 
     // ---------- binds ----------
 
-    fn binds_err(&self, t: &Token, ctx: BindsCtx) -> ParseError {
+    fn binds_err(&self, t: &TokenHead, ctx: BindsCtx) -> ParseError {
         match ctx {
             BindsCtx::Brace => self.err_unexpected(t, &["'inherit'"]),
             BindsCtx::RecBrace => self.err_unexpected(t, &["'inherit'", "'}'"]),
@@ -1346,7 +1376,7 @@ impl<'a> Parser<'a> {
 
     fn parse_brace_binds_tail(&mut self, open_begin: u32) -> Result<PExpr, ParseError> {
         let attrs = self.parse_binds(BindsCtx::Brace)?;
-        debug_assert!(Self::is_char(self.peek()?, b'}'));
+        debug_assert!(Self::is_char(&self.peek()?, b'}'));
         self.next()?;
         let pos = self.at(open_begin);
         self.exprs.attrs_mut(attrs).pos = pos;

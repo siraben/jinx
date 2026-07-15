@@ -585,7 +585,7 @@ fn instantiate_check(vm: &mut VM, v: VRef) -> Result<(), ErrId> {
         Some(a) => {
             vm.force(a.val, NO_POS)?;
             let tv = val(a.val);
-            tv.tag() == Tag::String && str_bytes(&tv) == b"derivation"
+            tv.is_string() && str_bytes(&tv) == b"derivation"
         }
         None => false,
     };
@@ -970,7 +970,7 @@ fn get_derivations(
             let is_drv = matches!(attrs_get(&vv, vm.syms.type_), Some(a) if {
                 vm.force(a.val, NO_POS)?;
                 let tv = val(a.val);
-                tv.tag() == Tag::String && str_bytes(&tv) == b"derivation"
+                tv.is_string() && str_bytes(&tv) == b"derivation"
             });
             if is_drv {
                 if let Some(a) = attrs_get(&vv, vm.syms.drv_path) {
@@ -987,7 +987,7 @@ fn get_derivations(
                     if let Some(o) = attrs_get(&vv, vm.symbols.create(b"outputName")) {
                         vm.force(o.val, NO_POS)?;
                         let ov = val(o.val);
-                        if ov.tag() == Tag::String {
+                        if ov.is_string() {
                             let name = str_bytes(&ov);
                             if !name.is_empty() && name != b"out" {
                                 s.push(b'!');
@@ -1046,7 +1046,7 @@ fn auto_call(vm: &mut VM, args: &[(Symbol, VRef)], fun: VRef) -> Result<VRef, Er
             return auto_call(vm, args, rc);
         }
     }
-    if v.tag() != Tag::Closure {
+    if !matches!(v.tag(), Tag::Closure | Tag::Closure0 | Tag::Closure1) {
         return Ok(fun);
     }
     let (code, _) = thunk_code(&v);
