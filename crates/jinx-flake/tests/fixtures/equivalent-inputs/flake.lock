@@ -1,0 +1,37 @@
+{
+  "nodes": {
+    "commonA": {
+      "locked": {
+        "path": "common",
+        "type": "path"
+      },
+      "original": {
+        "path": "common",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "commonB": {
+      "locked": {
+        "path": "common",
+        "type": "path"
+      },
+      "original": {
+        "path": "common",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "root": {
+      "inputs": {
+        "a": "commonA",
+        "b": "commonB",
+        "followed": [
+          "a"
+        ]
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

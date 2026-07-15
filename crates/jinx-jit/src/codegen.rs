@@ -125,7 +125,11 @@ impl JitHook for Compiler {
 enum Arith {
     Add,
     Sub,
+    Mul,
     Lt,
+    BitAnd,
+    BitOr,
+    BitXor,
 }
 
 /// Results of the pre-pass: which ops to specialize / elide. Every
@@ -155,7 +159,11 @@ fn const_arith(prog: &Program, ci: u32, arity: u32) -> Option<Arith> {
     match def.name {
         "__add" => Some(Arith::Add),
         "__sub" => Some(Arith::Sub),
+        "__mul" => Some(Arith::Mul),
         "__lessThan" => Some(Arith::Lt),
+        "__bitAnd" => Some(Arith::BitAnd),
+        "__bitOr" => Some(Arith::BitOr),
+        "__bitXor" => Some(Arith::BitXor),
         _ => None,
     }
 }
@@ -179,6 +187,8 @@ fn stack_effect(op: Op, prog: &Program) -> (usize, usize, Option<u32>) {
         | Op::RecOverrides(_)
         | Op::Select { .. }
         | Op::SelectForce(_)
+        | Op::ListBuiltin(_)
+        | Op::ListEmpty { .. }
         | Op::PopWith => (0, 0, None),
         Op::Pop | Op::StoreLocal(_) | Op::PushWith | Op::SelectDyn(_) => (1, 0, None),
         Op::Not => (1, 1, None),
@@ -196,6 +206,7 @@ fn stack_effect(op: Op, prog: &Program) -> (usize, usize, Option<u32>) {
             (1 + ndyn, 1, None)
         }
         Op::Call(k) => (k as usize + 1, 1, None),
+        Op::FoldGen { .. } => (4, 1, None),
         Op::Slide(n) => (n as usize + 1, 1, None),
         // Block terminators: never reached before block end in the simulation.
         Op::Jump(_)
@@ -571,8 +582,8 @@ fn translate_op(
                 // Operand is a constant (already WHNF): forcing is a no-op.
                 return false;
             }
-            // Inline WHNF fast path (mirrors the interpreter's tag check):
-            // only Thunk (9) / Blackhole (13) / Failed (14) need the helper.
+            // Inline WHNF fast path, explicitly enumerated to keep packed
+            // closures and SmallString in the high tag range as WHNF values.
             let len = tr.load_len();
             let ea = tr.slot_off(len, -1);
             let cell = tr.b.ins().load(I64, tr.flags, ea, 0);
@@ -581,12 +592,12 @@ fn translate_op(
                 .b
                 .ins()
                 .icmp_imm(IntCC::Equal, tag, Tag::Thunk as i64);
-            let is_bh_failed = tr.b.ins().icmp_imm(
-                IntCC::UnsignedGreaterThanOrEqual,
-                tag,
-                Tag::Blackhole as i64,
-            );
-            let need = tr.b.ins().bor(is_thunk, is_bh_failed);
+            let mut need = is_thunk;
+            for ft in [Tag::Blackhole, Tag::Failed, Tag::Thunk0, Tag::Blackhole0,
+                Tag::Thunk1, Tag::Blackhole1] {
+                let is = tr.b.ins().icmp_imm(IntCC::Equal, tag, ft as i64);
+                need = tr.b.ins().bor(need, is);
+            }
             let slow = tr.b.create_block();
             let nb = next();
             tr.b.ins().brif(need, slow, &[], nb, &[]);
@@ -705,6 +716,20 @@ fn translate_op(
             let z = tr.iconst32(0);
             erroring!("jinx_eq", &[tr.vm, p, z])
         }
+        Op::ListBuiltin(kind) => {
+            let k = tr.iconst32(kind as u32);
+            let p = tr.iconst32(pos);
+            erroring!("jinx_list_builtin", &[tr.vm, k, p])
+        }
+        Op::FoldGen { gen_pos } => {
+            let p = tr.iconst32(pos);
+            let gp = tr.iconst32(gen_pos.0);
+            erroring!("jinx_fold_gen", &[tr.vm, p, gp])
+        }
+        Op::ListEmpty { negate } => {
+            let n = tr.iconst32(u32::from(negate));
+            plain!("jinx_list_empty", &[tr.vm, n])
+        }
         Op::NEq => {
             let p = tr.iconst32(pos);
             let o = tr.iconst32(1);
@@ -724,15 +749,13 @@ fn translate_op(
 
         // ---- helper: selection ----
         Op::Select { sym, cache } => {
-            // Inline monomorphic-cache hit: subject already a WHNF attrset,
-            // same bindings object as last time at this site, and the cached
-            // slot still names `sym` (all re-checked, exactly like
-            // `VM::op_select`'s hit path). Anything else -> helper.
+            // Inline slot-cache hit for flat bindings: subject already a WHNF
+            // attrset and the cached slot still names this site's fixed
+            // symbol. The symbol check makes the slot valid across distinct
+            // immutable attrset objects. Static/layered layouts use the helper.
             let cache_addr = &prog.select_caches[cache as usize]
                 as *const std::cell::Cell<jinx_eval::chunk::SelectCache>
                 as i64;
-            let cache_attrs_off =
-                std::mem::offset_of!(jinx_eval::chunk::SelectCache, attrs) as i32;
             let cache_slot_off =
                 std::mem::offset_of!(jinx_eval::chunk::SelectCache, slot) as i32;
             let attr_sym_off = std::mem::offset_of!(jinx_eval::value::Attr, sym) as i32;
@@ -751,14 +774,19 @@ fn translate_op(
             let c1 = tr.b.create_block();
             tr.b.ins().brif(is_attrs, c1, &[], slow, &[]);
 
-            // c1: same bindings object as cached?
+            // c1: only the flat Bindings layout is inlined here.
             tr.b.switch_to_block(c1);
             let obj = tr.w1(cell);
             let caddr = tr.b.ins().iconst(I64, cache_addr);
-            let cattrs = tr.b.ins().load(I64, tr.flags, caddr, cache_attrs_off);
-            let same = tr.b.ins().icmp(IntCC::Equal, obj, cattrs);
+            let hdr = tr.b.ins().load(I64, tr.flags, obj, 0);
+            let kind = tr.b.ins().band_imm(hdr, 0xff);
+            let flat = tr.b.ins().icmp_imm(
+                IntCC::Equal,
+                kind,
+                jinx_eval::value::ObjKind::Bindings as i64,
+            );
             let c2 = tr.b.create_block();
-            tr.b.ins().brif(same, c2, &[], slow, &[]);
+            tr.b.ins().brif(flat, c2, &[], slow, &[]);
 
             // c2: slot in range and still naming `sym`?
             tr.b.switch_to_block(c2);
@@ -766,7 +794,6 @@ fn translate_op(
                 .b
                 .ins()
                 .uload32(tr.flags, caddr, cache_slot_off);
-            let hdr = tr.b.ins().load(I64, tr.flags, obj, 0);
             let blen = tr.b.ins().ushr_imm(hdr, 8);
             let in_range = tr.b.ins().icmp(IntCC::UnsignedLessThan, slot, blen);
             let c3 = tr.b.create_block();
@@ -808,12 +835,12 @@ fn translate_op(
             let cell = tr.b.ins().load(I64, tr.flags, ea, 0);
             let tag = tr.tag_of(cell);
             let is_thunk = tr.b.ins().icmp_imm(IntCC::Equal, tag, Tag::Thunk as i64);
-            let is_bh_failed = tr.b.ins().icmp_imm(
-                IntCC::UnsignedGreaterThanOrEqual,
-                tag,
-                Tag::Blackhole as i64,
-            );
-            let need = tr.b.ins().bor(is_thunk, is_bh_failed);
+            let mut need = is_thunk;
+            for ft in [Tag::Blackhole, Tag::Failed, Tag::Thunk0, Tag::Blackhole0,
+                Tag::Thunk1, Tag::Blackhole1] {
+                let is = tr.b.ins().icmp_imm(IntCC::Equal, tag, ft as i64);
+                need = tr.b.ins().bor(need, is);
+            }
             let slow = tr.b.create_block();
             let nb = next();
             tr.b.ins().brif(need, slow, &[], nb, &[]);
@@ -907,7 +934,9 @@ fn overflow(tr: &mut Tr, kind: Arith, x: Value, y: Value, r: Value) -> Value {
     let (p, q) = match kind {
         Arith::Add => (tr.b.ins().bxor(x, r), tr.b.ins().bxor(y, r)),
         Arith::Sub => (tr.b.ins().bxor(x, y), tr.b.ins().bxor(x, r)),
-        Arith::Lt => unreachable!(),
+        Arith::Mul | Arith::Lt | Arith::BitAnd | Arith::BitOr | Arith::BitXor => {
+            unreachable!()
+        }
     };
     let a = tr.b.ins().band(p, q);
     tr.b.ins().icmp_imm(IntCC::SignedLessThan, a, 0)
@@ -976,10 +1005,28 @@ fn emit_arith_call(
             let result = tr.call("jinx_alloc_int", &[tr.vm, r]);
             finish_arith(tr, len, result, 3, next);
         }
+        Arith::Mul => {
+            let (r, ov) = tr.b.ins().smul_overflow(x, y);
+            let done = tr.b.create_block();
+            tr.b.ins().brif(ov, slow, &[], done, &[]);
+            tr.b.switch_to_block(done);
+            let result = tr.call("jinx_alloc_int", &[tr.vm, r]);
+            finish_arith(tr, len, result, 3, next);
+        }
         Arith::Lt => {
             let rb = tr.b.ins().icmp(IntCC::SignedLessThan, x, y);
             let rbi = tr.b.ins().uextend(I32, rb);
             let result = tr.call("jinx_alloc_bool", &[tr.vm, rbi]);
+            finish_arith(tr, len, result, 3, next);
+        }
+        Arith::BitAnd | Arith::BitOr | Arith::BitXor => {
+            let r = match kind {
+                Arith::BitAnd => tr.b.ins().band(x, y),
+                Arith::BitOr => tr.b.ins().bor(x, y),
+                Arith::BitXor => tr.b.ins().bxor(x, y),
+                _ => unreachable!(),
+            };
+            let result = tr.call("jinx_alloc_int", &[tr.vm, r]);
             finish_arith(tr, len, result, 3, next);
         }
     }

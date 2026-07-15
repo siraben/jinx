@@ -462,7 +462,17 @@ impl StoreDir {
 
     /// Port of `printStorePath`: `<storeDir>/<baseName>`.
     pub fn print_store_path(&self, path: &StorePath) -> String {
-        format!("{}/{}", self.store_dir, path.to_string())
+        use std::fmt::Write;
+
+        // Render directly into the result. `format!` plus `path.to_string()`
+        // built an intermediate allocation for every store-path print, which
+        // is particularly frequent while serializing derivations.
+        let mut out =
+            String::with_capacity(self.store_dir.len() + 1 + 32 + 1 + path.name().len());
+        out.push_str(&self.store_dir);
+        out.push('/');
+        write!(&mut out, "{path}").expect("writing to a String cannot fail");
+        out
     }
 
     /// Port of `parseStorePath`. Note: unlike C++, no general path

@@ -125,6 +125,10 @@ pub struct Compiler<'a> {
     /// from the attr/let binding it is directly bound to, recursing into the
     /// curried body chain. Keyed by `ExprId.0`.
     lambda_names: FxHashMap<u32, Symbol>,
+    /// Conservative producer definitions for live lexical let slots.
+    /// `uses == 1` is a raw-symbol occurrence count over the complete let;
+    /// shadowing can only make it reject safe cases, never accept sharing.
+    fusion_bindings: Vec<(usize, u32, ExprId, u32)>,
 }
 
 pub fn compile_program(
@@ -154,6 +158,7 @@ pub fn compile_program(
         from_owner: None,
         empty_list_cell,
         lambda_names: FxHashMap::default(),
+        fusion_bindings: Vec::new(),
     };
     // Chunk 0 = entry.
     c.push_state(0, NO_POS, Symbol(0));
@@ -172,6 +177,9 @@ pub fn compile_program(
 /// finished chunk list).
 pub(crate) fn classify_chunk(chunk: &Chunk, chunks: &[Chunk]) -> ChunkKind {
     if chunk.lambda.is_some() {
+        if let [Op::MakeClosure(child), Op::Ret] = chunk.ops.as_slice() {
+            return ChunkKind::ClosureReturn { child: *child };
+        }
         return ChunkKind::General;
     }
     match chunk.ops.as_slice() {
@@ -212,7 +220,9 @@ fn straight_ok(chunk: &Chunk, chunks: &[Chunk]) -> bool {
             | Op::Force
             | Op::Select { .. }
             | Op::SelectForce(_)
-            | Op::Call(_) => {}
+            | Op::Call(_)
+            | Op::ListBuiltin(_)
+            | Op::ListEmpty { .. } => {}
             Op::MakeThunk(cid) | Op::MakeClosure(cid) => {
                 let child = &chunks[*cid as usize];
                 // The frame-less MakeThunk copies the with-prefix straight
@@ -258,6 +268,9 @@ impl<'a> Compiler<'a> {
     fn pop_state(&mut self) -> u32 {
         let mut st = self.states.pop().unwrap();
         st.chunk.captures = st.upvals.iter().map(|(_, c)| *c).collect();
+        st.chunk.captures_parent_prefix = st.chunk.captures.iter().enumerate().all(|(j, cap)| {
+            matches!(cap, Cap::Upval(i) if *i as usize == st.chunk.with_captures as usize + j)
+        });
         st.chunk.max_height = st.max_height;
         st.chunk.kind = classify_chunk(&st.chunk, &self.prog.chunks);
         self.prog.chunks[st.chunk_idx as usize] = st.chunk;
@@ -487,6 +500,24 @@ impl<'a> Compiler<'a> {
                 pos, fun, args, ..
             } => {
                 let (fun, args, pos) = (*fun, args.clone(), *pos);
+                if args.len() == 3 && self.static_named_builtin(fun, b"foldl'") {
+                    if let Some((g, n, gen_pos)) = self.fold_gen_producer(args[2]) {
+                        self.compile_maybe_thunk(args[0], None);
+                        self.compile_maybe_thunk(args[1], None);
+                        self.compile_maybe_thunk(g, None);
+                        self.compile_maybe_thunk(n, None);
+                        self.emit(Op::FoldGen { gen_pos }, pos);
+                        self.bump(-3);
+                        return;
+                    }
+                }
+                if args.len() == 1 {
+                    if let Some(kind) = self.static_list_builtin(fun) {
+                        self.compile_maybe_thunk(args[0], None);
+                        self.emit(Op::ListBuiltin(kind), pos);
+                        return;
+                    }
+                }
                 self.compile_expr(fun);
                 for a in &args {
                     self.compile_maybe_thunk(*a, None);
@@ -496,8 +527,20 @@ impl<'a> Compiler<'a> {
             }
             Expr::Let { attrs, body } => {
                 let (attrs, body) = (*attrs, *body);
+                let fusion_base = self.fusion_bindings.len();
                 let n = self.compile_bindings_scope(attrs, true);
+                let slot_start = self.height() - n;
+                let state = self.states.len() - 1;
+                let a = self.exprs.attrs(attrs);
+                for (i, (sym, def)) in a.attrs.iter().enumerate() {
+                    if def.kind == AttrDefKind::Plain && self.looks_like_gen_list(def.e) {
+                        let uses = self.count_let_symbol_uses(attrs, body, *sym, 2);
+                        self.fusion_bindings
+                            .push((state, slot_start + i as u32, def.e, uses));
+                    }
+                }
                 self.compile_expr(body);
+                self.fusion_bindings.truncate(fusion_base);
                 if n > 0 {
                     self.emit(Op::Slide(n), NO_POS);
                     self.bump(-(n as i64));
@@ -577,17 +620,33 @@ impl<'a> Compiler<'a> {
             }
             Expr::OpEq(a, b) => {
                 let (a, b) = (*a, *b);
-                self.compile_expr(a);
-                self.compile_expr(b);
-                self.emit(Op::Eq, NO_POS);
-                self.bump(-1);
+                if self.is_empty_list(a) {
+                    self.compile_expr(b);
+                    self.emit(Op::ListEmpty { negate: false }, NO_POS);
+                } else if self.is_empty_list(b) {
+                    self.compile_expr(a);
+                    self.emit(Op::ListEmpty { negate: false }, NO_POS);
+                } else {
+                    self.compile_expr(a);
+                    self.compile_expr(b);
+                    self.emit(Op::Eq, NO_POS);
+                    self.bump(-1);
+                }
             }
             Expr::OpNEq(a, b) => {
                 let (a, b) = (*a, *b);
-                self.compile_expr(a);
-                self.compile_expr(b);
-                self.emit(Op::NEq, NO_POS);
-                self.bump(-1);
+                if self.is_empty_list(a) {
+                    self.compile_expr(b);
+                    self.emit(Op::ListEmpty { negate: true }, NO_POS);
+                } else if self.is_empty_list(b) {
+                    self.compile_expr(a);
+                    self.emit(Op::ListEmpty { negate: true }, NO_POS);
+                } else {
+                    self.compile_expr(a);
+                    self.compile_expr(b);
+                    self.emit(Op::NEq, NO_POS);
+                    self.bump(-1);
+                }
             }
             Expr::OpAnd(pos, a, b) => self.compile_bool_op(*pos, *a, *b, 3, 4, false, false),
             Expr::OpOr(pos, a, b) => self.compile_bool_op(*pos, *a, *b, 5, 6, true, true),
@@ -646,6 +705,211 @@ impl<'a> Compiler<'a> {
             Expr::Lambda(l) => l.pos,
             _ => NO_POS,
         }
+    }
+
+    fn is_empty_list(&self, id: ExprId) -> bool {
+        matches!(self.exprs.get(id), Expr::List(xs) if xs.is_empty())
+    }
+
+    /// Return the name of an immutable global builtin. Calling `resolve` is
+    /// important: lexical `builtins` and `__name` bindings must not qualify.
+    fn static_builtin_symbol(&mut self, fun: ExprId) -> Option<Symbol> {
+        let (base, name) = match self.exprs.get(fun) {
+            Expr::Select {
+                e,
+                attrpath,
+                def: None,
+                ..
+            } if attrpath.len() == 1 && attrpath[0].expr.is_none() => {
+                let base = match self.exprs.get(*e) {
+                    Expr::Var { name, .. } => *name,
+                    _ => return None,
+                };
+                if self.symbols.resolve(base) != b"builtins" {
+                    return None;
+                }
+                (base, attrpath[0].symbol)
+            }
+            Expr::Var { name, .. } => (*name, *name),
+            _ => return None,
+        };
+        matches!(self.resolve(Key::Sym(base), None), Resolved::Global(_)).then_some(name)
+    }
+
+    fn static_list_builtin(&mut self, fun: ExprId) -> Option<ListBuiltin> {
+        let name = self.static_builtin_symbol(fun)?;
+        match self.symbols.resolve(name) {
+            b"head" | b"__head" => ListBuiltin::Head,
+            b"tail" | b"__tail" => ListBuiltin::Tail,
+            b"length" | b"__length" => ListBuiltin::Length,
+            _ => return None,
+        }
+        .into()
+    }
+
+    /// Recognize one exact immutable global builtin by display spelling.
+    fn static_named_builtin(&mut self, fun: ExprId, wanted: &[u8]) -> bool {
+        let Some(name) = self.static_builtin_symbol(fun) else {
+            return false;
+        };
+        let name = self.symbols.resolve(name);
+        name == wanted || name.strip_prefix(b"__") == Some(wanted)
+    }
+
+    /// Cheap spelling-only prefilter used before the bounded let use scan.
+    /// Final eligibility still goes through `static_named_builtin`, which
+    /// proves that the name resolves to an immutable global.
+    fn looks_like_gen_list(&self, id: ExprId) -> bool {
+        let fun = match self.exprs.get(id) {
+            Expr::Call { fun, args, .. } if args.len() == 2 => *fun,
+            _ => return false,
+        };
+        match self.exprs.get(fun) {
+            Expr::Select {
+                e,
+                attrpath,
+                def: None,
+                ..
+            } if attrpath.len() == 1 && attrpath[0].expr.is_none() => {
+                matches!(self.exprs.get(*e), Expr::Var { name, .. }
+                    if self.symbols.resolve(*name) == b"builtins")
+                    && self.symbols.resolve(attrpath[0].symbol) == b"genList"
+            }
+            Expr::Var { name, .. } => self.symbols.resolve(*name) == b"__genList",
+            _ => false,
+        }
+    }
+
+    /// Return the arguments of an exact `genList g n`, either directly or
+    /// through a same-frame, conservatively single-use plain let binding.
+    fn fold_gen_producer(&mut self, arg: ExprId) -> Option<(ExprId, ExprId, PosIdx)> {
+        let producer = match self.exprs.get(arg) {
+            Expr::Call { .. } => arg,
+            Expr::Var { name, .. } => {
+                let slot = match self.resolve(Key::Sym(*name), None) {
+                    Resolved::Local(slot) => slot,
+                    _ => return None,
+                };
+                let state = self.states.len() - 1;
+                self.fusion_bindings
+                    .iter()
+                    .rev()
+                    .find(|&&(s, k, _, uses)| s == state && k == slot && uses == 1)
+                    .map(|&(_, _, e, _)| e)?
+            }
+            _ => return None,
+        };
+        let (pos, fun, args) = match self.exprs.get(producer) {
+            Expr::Call { pos, fun, args, .. } if args.len() == 2 => (*pos, *fun, args.clone()),
+            _ => return None,
+        };
+        self.static_named_builtin(fun, b"genList")
+            .then_some((args[0], args[1], pos))
+    }
+
+    /// Count raw occurrences, capped at `cap`. Counting shadowed uses is a
+    /// deliberate conservative false negative for the single-use proof.
+    fn count_let_symbol_uses(
+        &self,
+        attrs: ExprId,
+        body: ExprId,
+        sym: Symbol,
+        cap: u32,
+    ) -> u32 {
+        let mut count = self.count_symbol_uses(body, sym, cap);
+        let a = self.exprs.attrs(attrs);
+        for (_, d) in &a.attrs {
+            if count >= cap {
+                break;
+            }
+            count += self.count_symbol_uses(d.e, sym, cap - count);
+        }
+        for e in &a.inherit_from_exprs {
+            if count >= cap {
+                break;
+            }
+            count += self.count_symbol_uses(*e, sym, cap - count);
+        }
+        for d in &a.dynamic_attrs {
+            if count >= cap {
+                break;
+            }
+            count += self.count_symbol_uses(d.name_expr, sym, cap - count);
+            if count < cap {
+                count += self.count_symbol_uses(d.value_expr, sym, cap - count);
+            }
+        }
+        count.min(cap)
+    }
+
+    fn count_symbol_uses(&self, id: ExprId, sym: Symbol, cap: u32) -> u32 {
+        if cap == 0 {
+            return 0;
+        }
+        let mut children = Vec::new();
+        match self.exprs.get(id) {
+            Expr::Var { name, .. } => return u32::from(*name == sym),
+            Expr::Select { e, attrpath, def, .. } => {
+                children.push(*e);
+                children.extend(attrpath.iter().filter_map(|a| a.expr));
+                children.extend(*def);
+            }
+            Expr::OpHasAttr { e, attrpath } => {
+                children.push(*e);
+                children.extend(attrpath.iter().filter_map(|a| a.expr));
+            }
+            Expr::Attrs(a) => {
+                children.extend(a.attrs.values().map(|d| d.e));
+                children.extend(a.inherit_from_exprs.iter().copied());
+                children.extend(
+                    a.dynamic_attrs
+                        .iter()
+                        .flat_map(|d| [d.name_expr, d.value_expr]),
+                );
+            }
+            Expr::List(xs) => children.extend(xs.iter().copied()),
+            Expr::Lambda(l) => {
+                children.push(l.body);
+                if let Some(f) = &l.formals {
+                    children.extend(f.formals.iter().filter_map(|x| x.def));
+                }
+            }
+            Expr::Call { fun, args, .. } => {
+                children.push(*fun);
+                children.extend(args.iter().copied());
+            }
+            Expr::Let { attrs, body } => children.extend([*attrs, *body]),
+            Expr::With { attrs, body, .. } => children.extend([*attrs, *body]),
+            Expr::If {
+                cond, then, else_, ..
+            } => children.extend([*cond, *then, *else_]),
+            Expr::Assert { cond, body, .. } => children.extend([*cond, *body]),
+            Expr::OpNot(e) => children.push(*e),
+            Expr::OpEq(a, b)
+            | Expr::OpNEq(a, b)
+            | Expr::OpAnd(_, a, b)
+            | Expr::OpOr(_, a, b)
+            | Expr::OpImpl(_, a, b)
+            | Expr::OpUpdate(_, a, b)
+            | Expr::OpConcatLists(_, a, b) => children.extend([*a, *b]),
+            Expr::ConcatStrings { es, .. } => {
+                children.extend(es.iter().map(|(_, e)| *e))
+            }
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::String(_)
+            | Expr::Path(_)
+            | Expr::InheritFrom { .. }
+            | Expr::CurPos(_) => {}
+        }
+        let mut count = 0;
+        for child in children {
+            count += self.count_symbol_uses(child, sym, cap - count);
+            if count >= cap {
+                return cap;
+            }
+        }
+        count
     }
 
     /// Port of the per-node `Expr::getPos()` overrides (nixexpr.hh), used
@@ -1242,6 +1506,10 @@ impl<'a> Compiler<'a> {
 
         let desc = AttrsDesc {
             names: names.iter().map(|(s, d)| (*s, d.pos)).collect(),
+            type_slot: names
+                .iter()
+                .position(|(s, _)| self.symbols.resolve(*s) == b"type")
+                .map_or(u32::MAX, |i| i as u32),
             pos,
         };
         self.prog.attrs_descs.push(desc);

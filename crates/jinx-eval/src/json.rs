@@ -248,7 +248,7 @@ fn to_json_ctx_inner(
         Tag::True => out.extend_from_slice(b"true"),
         Tag::False => out.extend_from_slice(b"false"),
         Tag::Null => out.extend_from_slice(b"null"),
-        Tag::String => {
+        Tag::String | Tag::SmallString => {
             if let Err(e) = json_string(out, str_bytes(&v)) {
                 return Err(json_utf8_errid(vm, e));
             }

@@ -6,9 +6,10 @@
 //! `Heap` allocation never collects. Collections run only from
 //! `VM::gc_check()`, which is called at op dispatch and at the head of the
 //! `alloc_*`/`new_*` wrappers. Precise roots: the operand stack, frames
-//! (thunk payloads + with-chains), `temp_roots`, and the import cache;
-//! immortal globals/constants need no rooting. Native `VRef`/`Value`
-//! locals in builtins are covered by the conservative stack scan, but
+//! (thunk payloads + with-chains), frame-less scratch safepoint maps,
+//! by-copy call values, `temp_roots`, and the import cache; immortal
+//! globals/constants need no rooting. Native `VRef`/`Value` locals in
+//! builtins retain a conservative stack-scan fallback, but
 //! `Vec<VRef>` *contents* live on the Rust heap and are NOT scanned:
 //! builtins accumulating cells in vectors must root them via
 //! `TempRoots` (see `VM::temp_scope`).
@@ -19,7 +20,7 @@ use std::ptr::NonNull;
 use jinx_syntax::pos::{PosIdx, PosTable, NO_POS};
 use jinx_syntax::symbol::{Symbol, SymbolTable};
 
-use crate::chunk::{Chunk, CodeRef, Op, CTX_STRINGS};
+use crate::chunk::{Chunk, CodeRef, ListBuiltin, Op, CTX_STRINGS};
 use crate::compile::SpecialSyms;
 use crate::error::{best_matches, ErrId, ErrKind, EvalError, Trace};
 use crate::heap::Heap;
@@ -51,16 +52,27 @@ pub fn set(c: VRef, v: Value) {
 
 /// Typed views (thin unsafe wrappers; heap objects are non-moving).
 #[inline]
-pub fn str_bytes<'a>(v: &Value) -> &'a [u8] {
-    debug_assert_eq!(v.tag(), Tag::String);
-    // SAFETY: tag invariant.
-    unsafe { value::str_parts(v.ptr() as *const u64).0 }
+pub fn str_bytes<'a>(v: &'a Value) -> &'a [u8] {
+    debug_assert!(v.is_string());
+    match v.tag() {
+        Tag::SmallString => v.small_string_bytes(),
+        Tag::String => {
+            // SAFETY: tag invariant.
+            unsafe { value::str_parts(v.ptr() as *const u64).0 }
+        }
+        _ => unreachable!(),
+    }
 }
 
 #[inline]
 pub fn str_ctx(v: &Value) -> *mut u64 {
-    // SAFETY: tag invariant.
-    unsafe { value::str_parts(v.ptr() as *const u64).1 }
+    debug_assert!(v.is_string());
+    if v.tag() == Tag::SmallString {
+        std::ptr::null_mut()
+    } else {
+        // SAFETY: tag invariant.
+        unsafe { value::str_parts(v.ptr() as *const u64).1 }
+    }
 }
 
 /// The string-context ids attached to a string `Value` (empty if none).
@@ -91,22 +103,218 @@ pub fn path_bytes<'a>(v: &Value) -> &'a [u8] {
 #[inline]
 pub fn list_elems<'a>(v: &Value) -> &'a [VRef] {
     debug_assert_eq!(v.tag(), Tag::List);
-    // SAFETY: tag invariant.
-    unsafe { value::elems(v.ptr() as *const u64) }
+    // A bounded tail view keeps the original flat payload and records only a
+    // start offset in the spare bits of the Value cell. The GC already traces
+    // the payload through `Tag::List`, including the bounded skipped prefix.
+    // SAFETY: tag invariant; list-tail views always point at the same flat
+    // ObjKind::List payload as their source.
+    let all = unsafe { value::elems(v.ptr() as *const u64) };
+    &all[v.list_offset()..]
+}
+
+/// A logical, sorted view over a flat or bounded-layer attrset.
+#[derive(Clone, Copy)]
+pub struct AttrsView<'a> {
+    ptr: *const u64,
+    _marker: std::marker::PhantomData<&'a Attr>,
+}
+
+#[derive(Clone, Copy)]
+enum AttrLayer<'a> {
+    Flat(&'a [Attr]),
+    Static(&'static crate::chunk::AttrsDesc, &'a [VRef]),
+}
+
+impl AttrLayer<'_> {
+    #[inline]
+    fn len(self) -> usize {
+        match self { Self::Flat(x) => x.len(), Self::Static(_, x) => x.len() }
+    }
+
+    #[inline]
+    fn attr(self, i: usize) -> Attr {
+        match self {
+            Self::Flat(x) => x[i],
+            Self::Static(desc, values) => {
+                let (sym, pos) = desc.names[i];
+                Attr { sym: sym.0, pos: pos.0, val: values[i] }
+            }
+        }
+    }
+}
+
+pub struct AttrsIter<'a> {
+    layers: [AttrLayer<'a>; 8],
+    pos: [usize; 8],
+    count: usize,
+}
+
+impl<'a> AttrsView<'a> {
+    #[inline]
+    pub fn len(self) -> usize {
+        unsafe {
+            match value::header_kind(*self.ptr) {
+                value::ObjKind::Bindings => value::header_len(*self.ptr),
+                value::ObjKind::BindingsStatic => value::header_len(*self.ptr),
+                value::ObjKind::BindingsLayer => value::bindings_layer(self.ptr).1,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn depth(self) -> u8 {
+        unsafe {
+            match value::header_kind(*self.ptr) {
+                value::ObjKind::Bindings => 1,
+                value::ObjKind::BindingsStatic => 1,
+                value::ObjKind::BindingsLayer => value::bindings_layer(self.ptr).2,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    pub fn get(self, sym: u32) -> Option<Attr> {
+        let mut p = self.ptr;
+        loop {
+            unsafe {
+                match value::header_kind(*p) {
+                    value::ObjKind::Bindings => {
+                        let es = value::bindings(p);
+                        return es.binary_search_by_key(&sym, |a| a.sym).ok().map(|i| es[i]);
+                    }
+                    value::ObjKind::BindingsStatic => {
+                        let (desc, values) = value::bindings_static(p);
+                        return desc.names.binary_search_by_key(&sym, |(s, _)| s.0)
+                            .ok().map(|i| {
+                                let (s, pos) = desc.names[i];
+                                Attr { sym: s.0, pos: pos.0, val: values[i] }
+                            });
+                    }
+                    value::ObjKind::BindingsLayer => {
+                        let (base, _, _, es) = value::bindings_layer(p);
+                        if let Ok(i) = es.binary_search_by_key(&sym, |a| a.sym) {
+                            return Some(es[i]);
+                        }
+                        p = base;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    pub fn iter(self) -> AttrsIter<'a> {
+        let mut layers = [AttrLayer::Flat(&[]); 8];
+        let mut count = 0;
+        let mut p = self.ptr;
+        loop {
+            unsafe {
+                match value::header_kind(*p) {
+                    value::ObjKind::Bindings => {
+                        layers[count] = AttrLayer::Flat(value::bindings(p));
+                        count += 1;
+                        break;
+                    }
+                    value::ObjKind::BindingsStatic => {
+                        let (desc, values) = value::bindings_static(p);
+                        layers[count] = AttrLayer::Static(desc, values);
+                        count += 1;
+                        break;
+                    }
+                    value::ObjKind::BindingsLayer => {
+                        let (base, _, _, local) = value::bindings_layer(p);
+                        layers[count] = AttrLayer::Flat(local);
+                        count += 1;
+                        p = base;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        debug_assert!(count <= 8);
+        AttrsIter { layers, pos: [0; 8], count }
+    }
+
+    pub fn to_vec(self) -> Vec<Attr> {
+        self.iter().collect()
+    }
+
+    #[inline]
+    pub fn as_flat(self) -> Option<&'a [Attr]> {
+        unsafe {
+            (value::header_kind(*self.ptr) == value::ObjKind::Bindings)
+                .then(|| value::bindings(self.ptr))
+        }
+    }
+
+    #[inline]
+    pub fn as_static(self) -> Option<(&'static crate::chunk::AttrsDesc, &'a [VRef])> {
+        unsafe {
+            (value::header_kind(*self.ptr) == value::ObjKind::BindingsStatic)
+                .then(|| value::bindings_static(self.ptr))
+        }
+    }
+
+    #[inline]
+    pub fn at(self, index: usize) -> Attr {
+        self.iter().nth(index).expect("attr index out of bounds")
+    }
+}
+
+impl<'a> Iterator for AttrsIter<'a> {
+    type Item = Attr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut min = u32::MAX;
+        let mut chosen = None;
+        for i in 0..self.count {
+            if self.pos[i] < self.layers[i].len() {
+                let sym = self.layers[i].attr(self.pos[i]).sym;
+                if sym < min {
+                    min = sym;
+                    chosen = Some(i);
+                }
+            }
+        }
+        let chosen = chosen?;
+        let result = self.layers[chosen].attr(self.pos[chosen]);
+        // Advance every layer defining this name. Since layers are ordered
+        // newest first, `result` is the right-biased winner.
+        for i in 0..self.count {
+            if self.pos[i] < self.layers[i].len()
+                && self.layers[i].attr(self.pos[i]).sym == min
+            {
+                self.pos[i] += 1;
+            }
+        }
+        Some(result)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.layers[..self.count].iter().map(|x| x.len()).sum()))
+    }
+}
+
+impl<'a> IntoIterator for AttrsView<'a> {
+    type Item = Attr;
+    type IntoIter = AttrsIter<'a>;
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
 }
 
 #[inline]
-pub fn attrs_entries<'a>(v: &Value) -> &'a [Attr] {
+pub fn attrs_entries<'a>(v: &Value) -> AttrsView<'a> {
     debug_assert_eq!(v.tag(), Tag::Attrs);
-    // SAFETY: tag invariant.
-    unsafe { value::bindings(v.ptr() as *const u64) }
+    AttrsView { ptr: v.ptr() as *const u64, _marker: std::marker::PhantomData }
 }
 
 pub fn attrs_get(v: &Value, sym: Symbol) -> Option<Attr> {
-    let es = attrs_entries(v);
-    es.binary_search_by(|a| a.sym.cmp(&sym.0))
-        .ok()
-        .map(|i| es[i])
+    attrs_entries(v).get(sym.0)
 }
 
 pub struct PrimOpDef {
@@ -138,15 +346,32 @@ pub fn primapp_parts<'a>(v: &Value) -> (&'static PrimOpDef, &'a [VRef]) {
     }
 }
 
-pub fn thunk_code(v: &Value) -> (&'static CodeRef, &'static [VRef]) {
-    debug_assert!(matches!(v.tag(), Tag::Thunk | Tag::Closure | Tag::Blackhole));
-    // SAFETY: thunk/closure data objects carry a &'static CodeRef.
+pub fn thunk_code<'a>(v: &'a Value) -> (&'static CodeRef, &'a [VRef]) {
+    debug_assert!(matches!(v.tag(), Tag::Thunk | Tag::Closure | Tag::Blackhole
+        | Tag::Thunk0 | Tag::Blackhole0 | Tag::Closure0
+        | Tag::Thunk1 | Tag::Blackhole1 | Tag::Closure1));
     unsafe {
-        let (code, elems) = value::code_and_elems(v.ptr() as *const u64);
-        (
-            &*(code as *const CodeRef),
-            std::slice::from_raw_parts(elems.as_ptr(), elems.len()),
-        )
+        match v.tag() {
+            Tag::Thunk | Tag::Closure | Tag::Blackhole => {
+                let code = &*(v.unpacked_code() as *const CodeRef);
+                let owner = value::elems(v.ptr());
+                if v.is_shared_env() {
+                    let chunk = code.chunk();
+                    let n = chunk.with_captures as usize + chunk.captures.len();
+                    debug_assert!(n <= owner.len());
+                    (code, &owner[..n])
+                } else {
+                    (code, owner)
+                }
+            }
+            Tag::Thunk0 | Tag::Blackhole0 | Tag::Closure0 =>
+                (&*(v.w1 as *const CodeRef), &[]),
+            Tag::Thunk1 | Tag::Blackhole1 | Tag::Closure1 => (
+                &*(v.unpacked_code() as *const CodeRef),
+                std::slice::from_raw_parts(&v.w1 as *const u64 as *const VRef, 1),
+            ),
+            _ => std::hint::unreachable_unchecked(),
+        }
     }
 }
 
@@ -159,8 +384,8 @@ pub struct Frame {
 }
 
 impl Frame {
-    pub(crate) fn upvals(&self) -> &'static [VRef] {
-        if matches!(self.data.tag(), Tag::Thunk | Tag::Closure) {
+    pub(crate) fn upvals(&self) -> &[VRef] {
+        if matches!(self.data.tag(), Tag::Thunk | Tag::Closure | Tag::Thunk1 | Tag::Closure1) {
             thunk_code(&self.data).1
         } else {
             &[]
@@ -185,6 +410,17 @@ pub struct VM {
     pub stack: crate::stack::Stack,
     pub frames: Vec<Frame>,
     pub temp_roots: Vec<VRef>,
+    /// Roots explicitly published by execution engines at collection
+    /// safepoints. In particular, the frame-less interpreter mirrors its
+    /// native scratch stack here before every opcode that can re-enter or
+    /// allocate, so optimized register allocation cannot hide live cells.
+    safepoint_roots: Vec<VRef>,
+    /// By-copy Values in native evaluator control flow (notably curried call
+    /// results) whose payload object must be traced at a safepoint.
+    safepoint_values: Vec<Value>,
+    /// Currently evaluating cells; roots them and preserves direct-cycle
+    /// identity even when a packed thunk has no unique payload object.
+    forcing_cells: Vec<VRef>,
     /// Permanent extra roots (mutable global cells like `derivation`,
     /// scopedImport scope cells referenced from leaked program constants).
     pub perm_roots: Vec<VRef>,
@@ -334,6 +570,9 @@ impl VM {
             stack: crate::stack::Stack::with_capacity(1024),
             frames: Vec::with_capacity(64),
             temp_roots: Vec::new(),
+            safepoint_roots: Vec::new(),
+            safepoint_values: Vec::new(),
+            forcing_cells: Vec::new(),
             perm_roots: Vec::new(),
             symbols,
             sym_string_cache: Vec::new(),
@@ -453,6 +692,9 @@ impl VM {
             stack,
             frames,
             temp_roots,
+            safepoint_roots,
+            safepoint_values,
+            forcing_cells,
             perm_roots,
             file_cache,
             ..
@@ -469,6 +711,15 @@ impl VM {
                     }
                 }
                 for &c in temp_roots.iter() {
+                    m.mark_cell(c);
+                }
+                for &c in safepoint_roots.iter() {
+                    m.mark_cell(c);
+                }
+                for v in safepoint_values.iter() {
+                    m.mark_value(v);
+                }
+                for &c in forcing_cells.iter() {
                     m.mark_cell(c);
                 }
                 for &c in perm_roots.iter() {
@@ -514,8 +765,34 @@ impl VM {
     // ---------------- allocation wrappers ----------------
 
     pub fn alloc_cell(&mut self, v: Value) -> VRef {
-        self.gc_check();
+        if self.heap.should_gc() {
+            let base = self.safepoint_values.len();
+            self.safepoint_values.push(v);
+            self.gc();
+            self.safepoint_values.truncate(base);
+        }
         self.heap.alloc_value(v)
+    }
+
+    /// Allocate a cell for a completed expression result. Unlike thunks and
+    /// local placeholders, Boolean and small-integer results are immutable, so
+    /// they may use canonical immortal cells. This matters for call-heavy code:
+    /// otherwise every primitive call and inline arithmetic op retains another
+    /// 16-byte cell until collection.
+    #[inline]
+    pub fn alloc_result_cell(&mut self, v: Value) -> VRef {
+        match v.tag() {
+            Tag::False => self.false_cell,
+            Tag::True => self.true_cell,
+            Tag::Int => {
+                if let Some(c) = immortal::small_int_cell(v.as_int()) {
+                    c
+                } else {
+                    self.alloc_cell(v)
+                }
+            }
+            _ => self.alloc_cell(v),
+        }
     }
 
     pub fn new_string_value(&mut self, bytes: &[u8], ctx: *mut u64) -> Value {
@@ -563,7 +840,7 @@ impl VM {
         match v.tag() {
             // Runtime attribute sets don't retain their definition position in
             // jinx's heap layout, so only the lambda case is handled here.
-            Tag::Closure => {
+            Tag::Closure | Tag::Closure0 | Tag::Closure1 => {
                 let (code, _) = thunk_code(v);
                 code.chunk().pos
             }
@@ -576,6 +853,7 @@ impl VM {
             }
             // SAFETY: Blackhole0's w1 is always an immortal CodeRef.
             Tag::Blackhole0 => unsafe { (*(v.w1 as *const CodeRef)).chunk().pos },
+            Tag::Blackhole1 => unsafe { (*(v.unpacked_code() as *const CodeRef)).chunk().pos },
             _ => fallback,
         }
     }
@@ -589,6 +867,87 @@ impl VM {
             pos,
             format!("while calling the '{}' builtin", def.display()),
         );
+    }
+
+    /// Execute a compiler-proven global list builtin without resolving the
+    /// immutable `builtins` attrset or entering generic primop dispatch. Keep
+    /// the observable call-depth accounting and call-site trace identical to
+    /// [`call_function`]; the primitive itself still receives `NO_POS`.
+    pub(crate) fn call_list_builtin(
+        &mut self,
+        kind: ListBuiltin,
+        arg: VRef,
+        pos: PosIdx,
+    ) -> Result<Value, ErrId> {
+        self.depth_check(pos)?;
+        self.call_depth += 1;
+        let r = crate::builtins::eval_list_builtin(self, kind, arg, NO_POS);
+        self.call_depth -= 1;
+        r.map_err(|e| {
+            self.add_trace(
+                e,
+                pos,
+                format!("while calling the '{}' builtin", kind.display()),
+            );
+            e
+        })
+    }
+
+    #[inline]
+    pub(crate) fn op_list_builtin(&mut self, kind: ListBuiltin, pos: PosIdx) -> Result<(), ErrId> {
+        let arg = *self.stack.last().unwrap();
+        let v = self.call_list_builtin(kind, arg, pos)?;
+        let c = self.alloc_cell(v);
+        *self.stack.last_mut().unwrap() = c;
+        Ok(())
+    }
+
+    /// Execute a compiler-proven fold/genList pipeline while retaining the
+    /// generic outer call's depth accounting and builtin trace.
+    pub(crate) fn call_fold_gen(
+        &mut self,
+        fold_fun: VRef,
+        initial: VRef,
+        gen_fun: VRef,
+        len: VRef,
+        pos: PosIdx,
+        gen_pos: PosIdx,
+    ) -> Result<Value, ErrId> {
+        self.depth_check(pos)?;
+        self.call_depth += 1;
+        let r = crate::builtins::eval_fold_gen(
+            self, fold_fun, initial, gen_fun, len, NO_POS, gen_pos,
+        );
+        self.call_depth -= 1;
+        r.map_err(|e| {
+            self.add_trace(e, pos, "while calling the 'foldl\'' builtin");
+            e
+        })
+    }
+
+    #[inline]
+    pub(crate) fn op_fold_gen(&mut self, pos: PosIdx, gen_pos: PosIdx) -> Result<(), ErrId> {
+        let base = self.stack.len() - 4;
+        let v = self.call_fold_gen(
+            self.stack[base],
+            self.stack[base + 1],
+            self.stack[base + 2],
+            self.stack[base + 3],
+            pos,
+            gen_pos,
+        )?;
+        self.stack.truncate(base);
+        let c = self.alloc_result_cell(v);
+        self.stack.push(c);
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn op_list_empty(&mut self, negate: bool) {
+        let c = *self.stack.last().unwrap();
+        let v = val(c);
+        let empty = v.tag() == Tag::List && list_elems(&v).is_empty();
+        *self.stack.last_mut().unwrap() = self.bool_cell(empty ^ negate);
     }
 
     /// C++ skips the "while evaluating the attribute" frame when the attr's
@@ -630,7 +989,7 @@ impl VM {
             Tag::False | Tag::True => "a Boolean".into(),
             Tag::Int => "an integer".into(),
             Tag::Float => "a float".into(),
-            Tag::String => {
+            Tag::String | Tag::SmallString => {
                 if str_ctx(v).is_null() {
                     "a string".into()
                 } else {
@@ -640,13 +999,14 @@ impl VM {
             Tag::Path => "a path".into(),
             Tag::Attrs => "a set".into(),
             Tag::List => "a list".into(),
-            Tag::Closure => "a function".into(),
+            Tag::Closure | Tag::Closure0 | Tag::Closure1 => "a function".into(),
             Tag::PrimOp => format!("the built-in function '{}'", primop_of(v).display()),
             Tag::PrimOpApp => format!(
                 "the partially applied built-in function '{}'",
                 primapp_parts(v).0.display()
             ),
-            Tag::Thunk | Tag::Thunk0 | Tag::Blackhole | Tag::Blackhole0 => "a thunk".into(),
+            Tag::Thunk | Tag::Thunk0 | Tag::Thunk1 | Tag::Blackhole | Tag::Blackhole0
+                | Tag::Blackhole1 => "a thunk".into(),
             Tag::Failed => "an error".into(),
         }
     }
@@ -674,11 +1034,22 @@ impl VM {
 
     // ---------------- force ----------------
 
+    /// Enter the out-of-line force machinery only for thunk-like states.
+    /// `needs_force` includes failed and blackholed cells, so memoized errors
+    /// and infinite-recursion behavior remain owned by `force`.
+    #[inline(always)]
+    pub(crate) fn force_if_needed(&mut self, cell: VRef, pos: PosIdx) -> Result<(), ErrId> {
+        if !val(cell).needs_force() {
+            return Ok(());
+        }
+        self.force(cell, pos)
+    }
+
     pub fn force(&mut self, cell: VRef, pos: PosIdx) -> Result<(), ErrId> {
         loop {
             let v = val(cell);
             match v.tag() {
-                Tag::Thunk | Tag::Thunk0 => {
+                Tag::Thunk | Tag::Thunk0 | Tag::Thunk1 => {
                     // Retain the thunk's data pointer in the blackhole so that
                     // `determine_pos` can recover the position of the
                     // expression being computed (C++ `Value::determinePos`
@@ -686,16 +1057,22 @@ impl VM {
                     // like Thunk (see `has_heap_payload`); a Thunk0 packs its
                     // immortal (untraced) CodeRef into w1, blackholed as
                     // Blackhole0.
-                    let (code, elems): (&'static CodeRef, &'static [VRef]) =
+                    let (code, elems): (&'static CodeRef, &[VRef]) =
                         if v.tag() == Tag::Thunk {
-                            self.set_b(cell, Value::make(Tag::Blackhole, v.w1));
+                            let w0 = (v.w0 & !0xff) | Tag::Blackhole as u64;
+                            self.set_b(cell, Value { w0, w1: v.w1 });
                             thunk_code(&v)
-                        } else {
+                        } else if v.tag() == Tag::Thunk0 {
                             self.set_b(cell, Value::make(Tag::Blackhole0, v.w1));
                             // SAFETY: Thunk0's w1 is always an immortal CodeRef.
-                            (unsafe { &*(v.w1 as *const CodeRef) }, &[])
+                            (unsafe { &*(v.w1 as *const CodeRef) }, &[] as &[VRef])
+                        } else {
+                            let bh = Value { w0: (v.w0 & !0xff) | Tag::Blackhole1 as u64, w1: v.w1 };
+                            self.set_b(cell, bh);
+                            thunk_code(&v)
                         };
                     use crate::chunk::ChunkKind;
+                    self.forcing_cells.push(cell);
                     let run = match code.chunk().kind {
                         // ---- frame-less trivial kinds (round-4) ----
                         ChunkKind::ConstReturn { idx } => {
@@ -704,7 +1081,7 @@ impl VM {
                         ChunkKind::Forward { upval, pos: gpos } => {
                             let target = elems[upval as usize];
                             let tv = val(target);
-                            if tv.tag() == Tag::Blackhole {
+                            if matches!(tv.tag(), Tag::Blackhole | Tag::Blackhole0 | Tag::Blackhole1) {
                                 // Exact port of the framed behavior: the
                                 // forwarding frame *is* the running frame, so
                                 // a blackholed target matching our own thunk
@@ -712,7 +1089,7 @@ impl VM {
                                 // at the reference site `gpos`); anything
                                 // else reports at the enclosing force
                                 // position.
-                                let bpos = if tv.w1 != 0 && tv.w1 == v.w1 {
+                                let bpos = if target == cell {
                                     gpos
                                 } else if pos.is_set() {
                                     pos
@@ -731,7 +1108,8 @@ impl VM {
                         ChunkKind::Straight => {
                             let saved_force_pos = self.force_pos;
                             self.force_pos = pos;
-                            let r = self.force_straight(code, elems);
+                            let owner = (v.tag() == Tag::Thunk).then(|| v.ptr());
+                            let r = self.force_straight(code, elems, owner);
                             self.force_pos = saved_force_pos;
                             r
                         }
@@ -743,14 +1121,19 @@ impl VM {
                             self.force_pos = saved_force_pos;
                             run
                         }
+                        ChunkKind::ClosureReturn { .. } => {
+                            unreachable!("lambda-only chunk forced as a thunk")
+                        }
                     };
+                    let popped = self.forcing_cells.pop();
+                    debug_assert_eq!(popped, Some(cell));
                     match run {
                         Ok(res) => {
                             self.set_b(cell, res);
                             // The chunk may itself return an (unforced)
                             // thunk value (e.g. a call result); keep going
                             // until WHNF, like C++ forceValue on tApp.
-                            if matches!(res.tag(), Tag::Thunk | Tag::Thunk0) {
+                            if matches!(res.tag(), Tag::Thunk | Tag::Thunk0 | Tag::Thunk1) {
                                 continue;
                             }
                             return Ok(());
@@ -761,21 +1144,19 @@ impl VM {
                         }
                     }
                 }
-                Tag::Blackhole | Tag::Blackhole0 => {
+                Tag::Blackhole | Tag::Blackhole0 | Tag::Blackhole1 => {
                     // Re-forcing a blackhole is infinite recursion. The
                     // position C++ reports is the reference site that closes
                     // the cycle:
                     //   * Direct self-reference (a thunk forces *itself*, e.g.
                     //     `a = {} // a`): the offending reference is the current
-                    //     `pos`. We detect this by comparing the blackhole's
-                    //     retained thunk pointer (w1) against the thunk of the
-                    //     currently running frame — they're equal iff the
-                    //     running thunk is re-forcing its own cell.
+                    //     `pos`. Cell identity is representation-independent;
+                    //     packed thunks intentionally have no unique payload.
                     //   * Indirect cycle (x -> y -> x): the reference site lives
                     //     in the *enclosing* thunk, whose force position jinx
                     //     tracks as `force_pos`.
-                    let running = self.frames.last().map(|f| f.data.w1).unwrap_or(0);
-                    let bpos = if v.w1 != 0 && v.w1 == running {
+                    let direct = self.forcing_cells.last().copied() == Some(cell);
+                    let bpos = if direct {
                         pos
                     } else if self.force_pos != NO_POS {
                         self.force_pos
@@ -804,7 +1185,7 @@ impl VM {
     }
 
     pub fn force_bool(&mut self, cell: VRef, pos: PosIdx, ctx: &str) -> Result<bool, ErrId> {
-        self.force(cell, pos).map_err(|e| {
+        self.force_if_needed(cell, pos).map_err(|e| {
             self.add_trace(e, pos, ctx);
             e
         })?;
@@ -821,7 +1202,7 @@ impl VM {
         // `ctx` frame is attached via `.withTrace(pos, ctx)` ONLY on the type
         // mismatch. When forcing the value itself throws, that error propagates
         // unwrapped (unlike forceInt/forceString, which do add ctx on any error).
-        self.force(cell, pos)?;
+        self.force_if_needed(cell, pos)?;
         let v = val(cell);
         if v.tag() != Tag::Attrs {
             // C++ forceAttrs uses `.withTrace(pos, ctx)` only — no position on
@@ -838,7 +1219,7 @@ impl VM {
     /// attached on ANY error (a throw / infinite recursion), not only a type
     /// mismatch. Used for the `//` operator's operands (`evalForUpdate`).
     pub fn eval_attrs(&mut self, cell: VRef, pos: PosIdx, ctx: &str) -> Result<(), ErrId> {
-        self.force(cell, pos).map_err(|e| {
+        self.force_if_needed(cell, pos).map_err(|e| {
             self.add_trace(e, pos, ctx);
             e
         })?;
@@ -854,7 +1235,7 @@ impl VM {
     pub fn force_list(&mut self, cell: VRef, pos: PosIdx, ctx: &str) -> Result<(), ErrId> {
         // See force_attrs: `ctx` is added only on the type mismatch, not when
         // forcing the argument throws (C++ inline forceList).
-        self.force(cell, pos)?;
+        self.force_if_needed(cell, pos)?;
         let v = val(cell);
         if v.tag() != Tag::List {
             // C++ forceList uses `.withTrace(pos, ctx)` only — no position on
@@ -867,7 +1248,7 @@ impl VM {
     }
 
     pub fn force_int(&mut self, cell: VRef, pos: PosIdx, ctx: &str) -> Result<i64, ErrId> {
-        self.force(cell, pos).map_err(|e| {
+        self.force_if_needed(cell, pos).map_err(|e| {
             self.add_trace(e, pos, ctx);
             e
         })?;
@@ -881,7 +1262,7 @@ impl VM {
     }
 
     pub fn force_float(&mut self, cell: VRef, pos: PosIdx, ctx: &str) -> Result<f64, ErrId> {
-        self.force(cell, pos).map_err(|e| {
+        self.force_if_needed(cell, pos).map_err(|e| {
             self.add_trace(e, pos, ctx);
             e
         })?;
@@ -905,12 +1286,12 @@ impl VM {
         pos: PosIdx,
         ctx: &str,
     ) -> Result<Vec<u8>, ErrId> {
-        self.force(cell, pos).map_err(|e| {
+        self.force_if_needed(cell, pos).map_err(|e| {
             self.add_trace(e, pos, ctx);
             e
         })?;
         let v = val(cell);
-        if v.tag() != Tag::String {
+        if !v.is_string() {
             let e = self.type_err(&v, "a string", pos, None);
             self.add_trace(e, pos, ctx);
             return Err(e);
@@ -940,9 +1321,18 @@ impl VM {
 
     // ---------------- running code ----------------
 
+    #[inline]
+    fn reserve_frame_stack(&mut self, base: usize, chunk: &Chunk) {
+        let frame_bound = base
+            .checked_add(chunk.max_height as usize)
+            .expect("operand stack height overflow");
+        self.stack.reserve_to(frame_bound);
+    }
+
     /// Push a frame for `code` (with upvalue payload `data`), run it, pop.
     pub fn run_code(&mut self, code: &'static CodeRef, data: Value) -> Result<Value, ErrId> {
         let base = self.stack.len();
+        self.reserve_frame_stack(base, code.chunk());
         self.frames.push(Frame {
             code,
             data,
@@ -1015,19 +1405,19 @@ impl VM {
     }
 
     /// Invoke a compiled chunk entry for frame `fi` and decode its status word.
-    /// Performs the frame setup the compiled prologue used to do via helper
-    /// calls: reserve operand-stack capacity for all inline pushes, and pass
-    /// the stack address / locals base / upvalue pointer as arguments.
+    /// Pass the already-reserved operand stack, locals base, and upvalue
+    /// pointer to a compiled chunk entry.
     #[inline]
-    fn run_jit(
-        &mut self,
-        entry: crate::jit::JitEntry,
-        fi: usize,
-        chunk: &'static Chunk,
-    ) -> Result<VRef, ErrId> {
+    fn run_jit(&mut self, entry: crate::jit::JitEntry, fi: usize) -> Result<VRef, ErrId> {
         let base = self.frames[fi].locals_base;
-        let upv = self.frames[fi].upvals().as_ptr() as u64;
-        self.stack.reserve_to(base + chunk.max_height as usize);
+        // Frames may move during nested calls, so a packed capture is copied
+        // to this stable native-stack slot for the compiled invocation.
+        let inline = [self.frames[fi].data.packed_capture().unwrap_or_else(NonNull::dangling)];
+        let upv = if self.frames[fi].data.packed_capture().is_some() {
+            inline.as_ptr() as u64
+        } else {
+            self.frames[fi].upvals().as_ptr() as u64
+        };
         let sa = (&mut self.stack) as *mut crate::stack::Stack;
         let r = entry(self as *mut VM, fi as u64, sa, base as u64, upv);
         if r & crate::jit::ERR_FLAG != 0 {
@@ -1044,7 +1434,7 @@ impl VM {
         if self.jit.is_some() {
             let code = self.frames[fi].code;
             if let Some(entry) = self.jit_dispatch(code) {
-                return self.run_jit(entry, fi, chunk);
+                return self.run_jit(entry, fi);
             }
         }
         // Frame constants, hoisted out of the dispatch loop: the program is
@@ -1053,7 +1443,15 @@ impl VM {
         // lifetime. Nested calls push/pop frames *above* `fi` only.
         let prog: &'static crate::chunk::Program = self.frames[fi].code.prog();
         let base = self.frames[fi].locals_base;
-        let upvals: &'static [VRef] = self.frames[fi].upvals();
+        let frame_data = self.frames[fi].data;
+        let inline = [frame_data.packed_capture().unwrap_or_else(NonNull::dangling)];
+        let upvals: &[VRef] = if frame_data.packed_capture().is_some() {
+            &inline
+        } else if matches!(frame_data.tag(), Tag::Thunk | Tag::Closure | Tag::Thunk0 | Tag::Closure0) {
+            thunk_code(&frame_data).1
+        } else {
+            &[]
+        };
         let mut ip = 0usize;
         macro_rules! pos {
             () => {
@@ -1086,9 +1484,8 @@ impl VM {
                 }
                 Op::Force => {
                     let c = *self.stack.last().unwrap();
-                    // Fast path: only thunk-like cells need the (out-of-line)
-                    // force machinery; an already-WHNF value returns immediately.
-                    // C++ `forceValue` inlines the `!isThunk` early-out too.
+                    // Keep position lookup on the slow path: `pos!()` binary
+                    // searches the sparse source-position table.
                     if val(c).needs_force() {
                         self.force(c, pos!())?;
                     }
@@ -1143,26 +1540,13 @@ impl VM {
                     self.stack.push(c);
                 }
                 Op::MakeAttrs(d) => {
-                    // gc_check BEFORE building: the entry cells are still
-                    // rooted on the operand stack while we fill the object.
+                    // The shape is immortal program data; only copy the value
+                    // pointers into the per-instance heap object.
                     self.gc_check();
                     let desc = &prog.attrs_descs[d as usize];
                     let n = desc.names.len();
                     let start = self.stack.len() - n;
-                    let (v, out) = self.heap.new_bindings_raw(n);
-                    // SAFETY: `out` has n slots; desc.names and the popped
-                    // stack range both have exactly n items.
-                    unsafe {
-                        for (k, (&(sym, pos), &cell)) in
-                            desc.names.iter().zip(&self.stack[start..]).enumerate()
-                        {
-                            out.add(k).write(Attr {
-                                sym: sym.0,
-                                pos: pos.0,
-                                val: cell,
-                            });
-                        }
-                    }
+                    let v = self.heap.new_static_bindings(desc, &self.stack[start..]);
                     let c = self.heap.alloc_value(v);
                     self.stack.truncate(start);
                     self.stack.push(c);
@@ -1388,9 +1772,14 @@ impl VM {
                     }
                     let v = self.call_function(fun, args, cpos)?;
                     self.stack.truncate(args_start - 1);
-                    let c = self.alloc_cell(v);
+                    let c = self.alloc_result_cell(v);
                     self.stack.push(c);
                 }
+                Op::ListBuiltin(kind) => {
+                    self.op_list_builtin(kind, pos!())?;
+                }
+                Op::FoldGen { gen_pos } => self.op_fold_gen(pos!(), gen_pos)?,
+                Op::ListEmpty { negate } => self.op_list_empty(negate),
                 Op::Ret => {
                     return Ok(self.stack.pop().unwrap());
                 }
@@ -1450,9 +1839,9 @@ impl VM {
     }
 
     /// `Op::Select`: force TOS as attrs and replace it with attribute `sym`,
-    /// using the per-site inline cache to skip the binary search when the same
-    /// attrset object recurs. Shared by the interpreter and the JIT's
-    /// `jinx_select` helper.
+    /// using the per-site inline cache to skip the binary search when the
+    /// site's symbol remains at the same slot. Shared by the interpreter and
+    /// the JIT's `jinx_select` helper.
     pub(crate) fn op_select(
         &mut self,
         sym: Symbol,
@@ -1478,28 +1867,43 @@ impl VM {
     ) -> Result<VRef, ErrId> {
         self.force_attrs(cell, pos, "while selecting an attribute")?;
         let v = val(cell);
-        let attrs_ptr = v.ptr() as *const u64;
         let es = attrs_entries(&v);
         let cache = &prog.select_caches[cache_idx as usize];
         let c = cache.get();
-        // Cache hit: same attrset object and the cached slot still names `sym`
-        // (re-checked so an address reused by the GC can't cause a mislookup).
-        let found = if c.attrs == attrs_ptr
-            && (c.slot as usize) < es.len()
-            && es[c.slot as usize].sym == sym.0
-        {
-            Some(es[c.slot as usize])
-        } else {
-            match es.binary_search_by(|a| a.sym.cmp(&sym.0)) {
-                Ok(i) => {
-                    cache.set(crate::chunk::SelectCache {
-                        attrs: attrs_ptr,
-                        slot: i as u32,
-                    });
-                    Some(es[i])
+        // The cached slot is valid across objects and static shapes. The
+        // symbol check is the complete correctness guard; no identity test is
+        // needed because bindings are immutable and the site symbol is fixed.
+        let found = if let Some(flat) = es.as_flat() {
+            if (c.slot as usize) < flat.len()
+                && flat[c.slot as usize].sym == sym.0
+            {
+                Some(flat[c.slot as usize])
+            } else {
+                match flat.binary_search_by_key(&sym.0, |a| a.sym) {
+                    Ok(i) => {
+                        cache.set(crate::chunk::SelectCache { slot: i as u32 });
+                        Some(flat[i])
+                    }
+                    Err(_) => None,
                 }
-                Err(_) => None,
             }
+        } else if let Some((desc, values)) = es.as_static() {
+            if (c.slot as usize) < values.len()
+                && desc.names[c.slot as usize].0 == sym
+            {
+                let i = c.slot as usize;
+                Some(Attr { sym: sym.0, pos: desc.names[i].1.0, val: values[i] })
+            } else {
+                match desc.names.binary_search_by_key(&sym.0, |(s, _)| s.0) {
+                    Ok(i) => {
+                        cache.set(crate::chunk::SelectCache { slot: i as u32 });
+                        Some(Attr { sym: sym.0, pos: desc.names[i].1.0, val: values[i] })
+                    }
+                    Err(_) => None,
+                }
+            }
+        } else {
+            es.get(sym.0)
         };
         match found {
             Some(a) => {
@@ -1575,7 +1979,7 @@ impl VM {
         let desc = &prog.attrs_descs[rdesc.attrs_desc as usize];
         let attrs_cell = *self.stack.last().unwrap();
         let av = val(attrs_cell);
-        let ov_attr = attrs_entries(&av)[rdesc.overrides_idx as usize];
+        let ov_attr = attrs_entries(&av).at(rdesc.overrides_idx as usize);
         // C++ forces at `vOverrides->determinePos(noPos)` computed on the
         // (unforced) value — noPos for a non-attrs/non-lambda thunk.
         let opos = self.determine_pos(&val(ov_attr.val), NO_POS);
@@ -1600,7 +2004,7 @@ impl VM {
                 };
             } else {
                 let idx = entries.partition_point(|a| a.sym < o.sym);
-                entries.insert(idx, *o);
+                entries.insert(idx, o);
             }
         }
         let v = self.new_bindings_value(&entries);
@@ -1617,12 +2021,27 @@ impl VM {
         let right = self.stack.pop().unwrap();
         let (lv, rv) = (val(left), val(right));
         let (le, re) = (attrs_entries(&lv), attrs_entries(&rv));
+        let layered = !le.is_empty() && !re.is_empty() && re.len() <= 16 && le.depth() < 8;
         let v = if le.is_empty() {
             rv
         } else if re.is_empty() {
             lv
+        } else if layered {
+            let right_entries = re.to_vec();
+            let duplicates = right_entries
+                .iter()
+                .filter(|a| le.get(a.sym).is_some())
+                .count();
+            self.heap.new_bindings_layer(
+                lv.ptr(),
+                &right_entries,
+                le.len() + right_entries.len() - duplicates,
+                le.depth() + 1,
+            )
         } else {
-            self.heap.new_bindings_merge(le, re)
+            let left_entries = le.to_vec();
+            let right_entries = re.to_vec();
+            self.heap.new_bindings_merge(&left_entries, &right_entries)
         };
         let c = self.alloc_cell(v);
         self.stack.push(c);
@@ -1743,7 +2162,7 @@ impl VM {
                         i_pos,
                         "while evaluating a path segment",
                         false,
-                        first_tag == Tag::String,
+                        matches!(first_tag, Tag::String | Tag::SmallString),
                         !first,
                     )?;
                     parts.push(part);
@@ -1780,7 +2199,7 @@ impl VM {
             }
             Mode::Unset => unreachable!(),
         };
-        let c = self.alloc_cell(v);
+        let c = self.alloc_result_cell(v);
         self.stack.truncate(start);
         self.stack.push(c);
         Ok(())
@@ -1866,6 +2285,15 @@ impl VM {
     // ---------------- thunks / with ----------------
 
     pub(crate) fn make_thunk(&mut self, fi: usize, cid: u32, tag: Tag) -> VRef {
+        let v = self.make_thunk_value(fi, cid, tag);
+        self.heap.alloc_value(v)
+    }
+
+    /// Construct a thunk/closure value without allocating its containing
+    /// value cell. The normal opcode path wraps this with [`make_thunk`];
+    /// closure-return fusion passes the by-copy value directly to the next
+    /// application and avoids a cell that cannot escape.
+    fn make_thunk_value(&mut self, fi: usize, cid: u32, tag: Tag) -> Value {
         // gc_check FIRST: the upval sources (stack cells, frame upvals,
         // with_local) are all rooted, and no collection can run while we fill
         // the fresh object below.
@@ -1878,7 +2306,40 @@ impl VM {
         if n == 0 && tag == Tag::Thunk {
             // Capture-free thunk: pack the code ref straight into the cell
             // (16 bytes total instead of a 16-byte data object + cell).
-            return self.heap.alloc_value(Value::make(Tag::Thunk0, code as u64));
+            return Value::make(Tag::Thunk0, code as u64);
+        }
+        if n == 0 && tag == Tag::Closure {
+            return Value::make(Tag::Closure0, code as u64);
+        }
+        if n == 1 {
+            let capture = if child.with_captures > 0 {
+                let inherited = cur_chunk.with_captures as usize;
+                if inherited > 0 { self.frames[fi].upvals()[0] }
+                else { self.frames[fi].with_local[0] }
+            } else {
+                match child.captures[0] {
+                    crate::chunk::Cap::Local(s) => self.stack[self.frames[fi].locals_base + s as usize],
+                    crate::chunk::Cap::Upval(i) => self.frames[fi].upvals()[i as usize],
+                }
+            };
+            let pt = if tag == Tag::Thunk { Tag::Thunk1 } else { Tag::Closure1 };
+            return Value::packed_code(pt, code, capture);
+        }
+        let parent = self.frames[fi].data;
+        if matches!(parent.tag(), Tag::Thunk | Tag::Closure)
+            && self.frames[fi].with_local.is_empty()
+        {
+            let pn = self.frames[fi].upvals().len();
+            // A shared parent can itself point at a slightly longer owner.
+            // Bound retention against the physical object, not its logical
+            // prefix, so repeated sharing cannot accumulate hidden captures.
+            let owner_n = unsafe { value::header_len(*parent.ptr()) };
+            let share = n >= 3 && n <= pn && owner_n - n <= 2
+                && child.with_captures == cur_chunk.with_captures
+                && child.captures_parent_prefix;
+            if share {
+                return Value::shared_env(tag, code, parent.ptr());
+            }
         }
         let (v, out) = self.heap.new_thunk_raw(tag, code, n);
         let mut k = 0usize;
@@ -1905,7 +2366,7 @@ impl VM {
             }
             debug_assert_eq!(k, n);
         }
-        self.heap.alloc_value(v)
+        v
     }
 
     pub(crate) fn resolve_with(&mut self, fi: usize, sym: Symbol, pos: PosIdx) -> Result<VRef, ErrId> {
@@ -1939,13 +2400,27 @@ impl VM {
 
     /// Frame-less interpreter for [`crate::chunk::ChunkKind::Straight`]
     /// chunks: runs the body against a small native-stack scratch array
-    /// instead of pushing a `Frame` (the conservative stack scan roots the
-    /// scratch cells; the forced cell's blackhole roots `upvals`). The
+    /// instead of pushing a `Frame`. Scratch cells are precisely published in
+    /// `safepoint_roots`; the forced cell's blackhole roots `upvals`. The
     /// caller has already blackholed the cell and set `force_pos`.
     fn force_straight(
         &mut self,
         code: &'static CodeRef,
-        upvals: &'static [VRef],
+        upvals: &[VRef],
+        owner: Option<*mut u64>,
+    ) -> Result<Value, ErrId> {
+        let root_base = self.safepoint_roots.len();
+        let result = self.force_straight_inner(code, upvals, owner, root_base);
+        self.safepoint_roots.truncate(root_base);
+        result
+    }
+
+    fn force_straight_inner(
+        &mut self,
+        code: &'static CodeRef,
+        upvals: &[VRef],
+        owner: Option<*mut u64>,
+        root_base: usize,
     ) -> Result<Value, ErrId> {
         let chunk = code.chunk();
         let prog = code.prog();
@@ -1953,7 +2428,26 @@ impl VM {
         let mut sp = 0usize;
         let mut ip = 0usize;
         loop {
-            match chunk.ops[ip] {
+            let op = chunk.ops[ip];
+            // Publish only before operations that can allocate or re-enter the
+            // evaluator. Const/GetUpval/Ret cannot reach a collection, and
+            // mirroring the scratch stack on those very common opcodes showed
+            // up as avoidable overhead in the post-GC benchmark refresh.
+            if matches!(
+                op,
+                Op::ResolveWith(_)
+                    | Op::Force
+                    | Op::MakeThunk(_)
+                    | Op::MakeClosure(_)
+                    | Op::Select { .. }
+                    | Op::SelectForce(_)
+                    | Op::Call(_)
+                    | Op::ListBuiltin(_)
+            ) {
+                self.safepoint_roots.truncate(root_base);
+                self.safepoint_roots.extend_from_slice(&st[..sp]);
+            }
+            match op {
                 Op::Const(i) => {
                     st[sp] = prog.consts[i as usize];
                     sp += 1;
@@ -1974,11 +2468,11 @@ impl VM {
                     }
                 }
                 Op::MakeThunk(cid) => {
-                    st[sp] = self.make_thunk_from_upvals(prog, cid, Tag::Thunk, upvals);
+                    st[sp] = self.make_thunk_from_upvals(prog, cid, Tag::Thunk, upvals, owner);
                     sp += 1;
                 }
                 Op::MakeClosure(cid) => {
-                    st[sp] = self.make_thunk_from_upvals(prog, cid, Tag::Closure, upvals);
+                    st[sp] = self.make_thunk_from_upvals(prog, cid, Tag::Closure, upvals, owner);
                     sp += 1;
                 }
                 Op::Select { sym, cache } => {
@@ -2015,9 +2509,28 @@ impl VM {
                     }
                     let v = self.call_function(fun, &st[sp - n..sp], cpos)?;
                     sp -= n + 1;
-                    let c = self.alloc_cell(v);
+                    // Straight chunks overwhelmingly end in `Call; Ret`.
+                    // Return the by-copy result directly instead of allocating
+                    // a cell that the forcing path would immediately copy into
+                    // the owner thunk and discard.
+                    if matches!(chunk.ops.get(ip + 1), Some(Op::Ret)) {
+                        return Ok(v);
+                    }
+                    let c = self.alloc_result_cell(v);
                     st[sp] = c;
                     sp += 1;
+                }
+                Op::ListBuiltin(kind) => {
+                    let v = self.call_list_builtin(kind, st[sp - 1], chunk.pos_at(ip))?;
+                    if matches!(chunk.ops.get(ip + 1), Some(Op::Ret)) {
+                        return Ok(v);
+                    }
+                    st[sp - 1] = self.alloc_cell(v);
+                }
+                Op::ListEmpty { negate } => {
+                    let v = val(st[sp - 1]);
+                    let empty = v.tag() == Tag::List && list_elems(&v).is_empty();
+                    st[sp - 1] = self.bool_cell(empty ^ negate);
                 }
                 Op::Ret => return Ok(val(st[sp - 1])),
                 _ => unreachable!("non-straight op in Straight chunk"),
@@ -2035,6 +2548,7 @@ impl VM {
         cid: u32,
         tag: Tag,
         parent_upvals: &[VRef],
+        owner: Option<*mut u64>,
     ) -> VRef {
         self.gc_check();
         let child: &Chunk = &prog.chunks[cid as usize];
@@ -2044,6 +2558,28 @@ impl VM {
             // Capture-free thunk: pack the code ref straight into the cell
             // (16 bytes total instead of a 16-byte data object + cell).
             return self.heap.alloc_value(Value::make(Tag::Thunk0, code as u64));
+        }
+        if n == 0 && tag == Tag::Closure {
+            return self.heap.alloc_value(Value::make(Tag::Closure0, code as u64));
+        }
+        if n == 1 {
+            let capture = if child.with_captures > 0 { parent_upvals[0] } else {
+                match child.captures[0] {
+                    crate::chunk::Cap::Upval(i) => parent_upvals[i as usize],
+                    crate::chunk::Cap::Local(_) => unreachable!("straight chunk child with local capture"),
+                }
+            };
+            let pt = if tag == Tag::Thunk { Tag::Thunk1 } else { Tag::Closure1 };
+            return self.heap.alloc_value(Value::packed_code(pt, code, capture));
+        }
+        if let Some(owner) = owner {
+            let pn = parent_upvals.len();
+            let owner_n = unsafe { value::header_len(*owner) };
+            let share = n >= 3 && n <= pn && owner_n - n <= 2
+                && child.captures_parent_prefix;
+            if share {
+                return self.heap.alloc_value(Value::shared_env(tag, code, owner));
+            }
         }
         let (v, out) = self.heap.new_thunk_raw(tag, code, n);
         // SAFETY: `out` has n slots; we write exactly n below.
@@ -2107,7 +2643,9 @@ impl VM {
     ) -> Result<Value, ErrId> {
         self.depth_check(pos)?;
         self.call_depth += 1;
+        let value_root_base = self.safepoint_values.len();
         let r = self.call_function_inner(fun, args, pos);
+        self.safepoint_values.truncate(value_root_base);
         self.call_depth -= 1;
         r
     }
@@ -2136,8 +2674,12 @@ impl VM {
         let mut i = 0usize;
 
         while i < args.len() {
+            // `vcur` is a by-copy Value. After the first application it may no
+            // longer be reachable through `fun`, so publish its payload before
+            // a nested closure/builtin call can reach a collection safepoint.
+            self.safepoint_values.push(vcur);
             match vcur.tag() {
-                Tag::Closure => {
+                Tag::Closure | Tag::Closure0 | Tag::Closure1 => {
                     vcur = self.call_closure(vcur, args[i], pos)?;
                     i += 1;
                 }
@@ -2158,7 +2700,13 @@ impl VM {
                     // which is `noPos` for a bare primop. The call-site `pos`
                     // is only used for the "while calling the '…' builtin"
                     // frame.
-                    vcur = f(self, def, &args[i..i + needed], NO_POS).map_err(|e| {
+                    // The arguments may be an inline native slice (frame-less
+                    // call path), so publish them for the whole builtin call.
+                    let scope = self.temp_scope();
+                    self.temp_roots.extend_from_slice(&args[i..i + needed]);
+                    let call = f(self, def, &args[i..i + needed], NO_POS);
+                    self.temp_end(scope);
+                    vcur = call.map_err(|e| {
                         self.add_primop_trace(e, def, pos);
                         e
                     })?;
@@ -2216,10 +2764,11 @@ impl VM {
                 }
                 _ => return Err(self.not_a_function_err(&vcur, pos)),
             }
+            self.safepoint_values.pop();
             // `vcur` may need forcing between applications (e.g. a lambda
             // body returning a thunk value cannot happen — run_code returns
             // WHNF-or-thunk copies; force via a temp cell when required).
-            if i < args.len() && matches!(vcur.tag(), Tag::Thunk | Tag::Thunk0) {
+            if i < args.len() && matches!(vcur.tag(), Tag::Thunk | Tag::Thunk0 | Tag::Thunk1) {
                 let c = self.alloc_cell(vcur);
                 let scope = self.temp_scope();
                 self.temp_roots.push(c);
@@ -2269,6 +2818,10 @@ impl VM {
         let chunk = code.chunk();
         let spec = chunk.lambda.as_ref().expect("closure without lambda spec");
         let base = self.stack.len();
+        // Lambda formals are runtime locals pushed before `run_top_frame`.
+        // The compiler seeds `max_height` with their count, so reserve the
+        // absolute frame bound before materializing any of them.
+        self.reserve_frame_stack(base, chunk);
 
         // Display names (the bare "%1%" form and the quoted trace form) are
         // computed lazily at the cold error sites — allocating them on every
@@ -2387,10 +2940,14 @@ impl VM {
             self.set_b(dst, val(t));
         }
         let chunk_pos = chunk.pos;
-        let r = self.run_top_frame();
+        let r = if let crate::chunk::ChunkKind::ClosureReturn { child } = chunk.kind {
+            Ok(self.make_thunk_value(fi, child, Tag::Closure))
+        } else {
+            self.run_top_frame().map(val)
+        };
         self.frames.pop();
         let out = match r {
-            Ok(v) => Ok(val(v)),
+            Ok(v) => Ok(v),
             Err(e) => {
                 // Port of callFunction's body-eval catch: "while calling
                 // <name>" at the lambda pos, then "from call site" at the
@@ -2420,10 +2977,58 @@ impl VM {
         top: bool,
     ) -> Result<bool, ErrId> {
         self.depth_check(pos)?;
+        if let Some(equal) = Self::eq_whnf_fast(a, b, top) {
+            return Ok(equal);
+        }
         self.call_depth += 1;
         let r = self.eq_values_inner(a, b, pos, ctx, top);
         self.call_depth -= 1;
         r
+    }
+
+    /// Equality for already-forced scalar values and list-length mismatches.
+    /// These cases cannot throw or recurse, so entering the recursive force /
+    /// call-depth machinery only adds dispatch overhead. Returning `None`
+    /// preserves the full path for thunks, attrsets, and equal-length nonempty
+    /// lists. The non-top pointer shortcut matches `eq_values_inner` exactly.
+    #[inline]
+    fn eq_whnf_fast(a: VRef, b: VRef, top: bool) -> Option<bool> {
+        let (va, vb) = (val(a), val(b));
+        if va.needs_force() || vb.needs_force() {
+            return None;
+        }
+        if !top && a == b {
+            return Some(true);
+        }
+        match (va.tag(), vb.tag()) {
+            (Tag::Int, Tag::Int) => Some(va.as_int() == vb.as_int()),
+            (Tag::Float, Tag::Float) => Some(va.as_float() == vb.as_float()),
+            (Tag::Int, Tag::Float) => Some(va.as_int() as f64 == vb.as_float()),
+            (Tag::Float, Tag::Int) => Some(va.as_float() == vb.as_int() as f64),
+            (Tag::True | Tag::False, Tag::True | Tag::False) => {
+                Some(va.tag() == vb.tag())
+            }
+            (Tag::Null, Tag::Null) => Some(true),
+            (Tag::String | Tag::SmallString, Tag::String | Tag::SmallString) => {
+                Some(str_bytes(&va) == str_bytes(&vb))
+            }
+            (Tag::Path, Tag::Path) => Some(path_bytes(&va) == path_bytes(&vb)),
+            (Tag::List, Tag::List) => {
+                let (la, lb) = (list_elems(&va).len(), list_elems(&vb).len());
+                if la != lb {
+                    Some(false)
+                } else if la == 0 {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            (Tag::Attrs, Tag::Attrs) => None,
+            // Different WHNF types are unequal. Distinct functions are also
+            // unequal; identical nested function cells returned above through
+            // the non-top pointer rule, matching the existing semantics.
+            _ => Some(false),
+        }
     }
 
     fn eq_values_inner(
@@ -2454,6 +3059,7 @@ impl VM {
         }
         let same_type = match (va.tag(), vb.tag()) {
             (Tag::True | Tag::False, Tag::True | Tag::False) => true,
+            (Tag::String | Tag::SmallString, Tag::String | Tag::SmallString) => true,
             (x, y) => x == y,
         };
         if !same_type {
@@ -2465,7 +3071,7 @@ impl VM {
             Tag::Float => Ok(va.as_float() == vb.as_float()),
             Tag::True | Tag::False => Ok(va.tag() == vb.tag()),
             Tag::Null => Ok(true),
-            Tag::String => Ok(str_bytes(&va) == str_bytes(&vb)),
+            Tag::String | Tag::SmallString => Ok(str_bytes(&va) == str_bytes(&vb)),
             Tag::Path => Ok(path_bytes(&va) == path_bytes(&vb)),
             Tag::List => {
                 let (ea, eb) = (list_elems(&va), list_elems(&vb));
@@ -2492,9 +3098,31 @@ impl VM {
                 if ea.len() != eb.len() {
                     return Ok(false);
                 }
-                for k in 0..ea.len() {
-                    if ea[k].sym != eb[k].sym
-                        || !self.eq_values(ea[k].val, eb[k].val, pos, ctx, false)?
+                // Static attrsets keep their sorted names in an immortal
+                // compiler descriptor.  Equal descriptor identity proves the
+                // key sequence is equal without comparing a single symbol;
+                // equal key sequences from different source sites need only
+                // one linear name pass.  In either case compare the compact
+                // value arrays directly, bypassing AttrsIter's layered merge
+                // and per-entry winner/name checks.
+                if let (Some((da, values_a)), Some((db, values_b))) =
+                    (ea.as_static(), eb.as_static())
+                {
+                    let same_shape = std::ptr::eq(da, db)
+                        || da.names.iter().zip(&db.names).all(|(a, b)| a.0 == b.0);
+                    if !same_shape {
+                        return Ok(false);
+                    }
+                    for (&a, &b) in values_a.iter().zip(values_b) {
+                        if !self.eq_values(a, b, pos, ctx, false)? {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
+                for (a, b) in ea.iter().zip(eb.iter()) {
+                    if a.sym != b.sym
+                        || !self.eq_values(a.val, b.val, pos, ctx, false)?
                     {
                         return Ok(false);
                     }
@@ -2502,8 +3130,8 @@ impl VM {
                 Ok(true)
             }
             // Functions are incomparable.
-            Tag::Closure | Tag::PrimOp | Tag::PrimOpApp => Ok(false),
-            Tag::Thunk | Tag::Thunk0 | Tag::Blackhole | Tag::Blackhole0 | Tag::Failed => {
+            Tag::Closure | Tag::Closure0 | Tag::Closure1 | Tag::PrimOp | Tag::PrimOpApp => Ok(false),
+            Tag::Thunk | Tag::Thunk0 | Tag::Thunk1 | Tag::Blackhole | Tag::Blackhole0 | Tag::Blackhole1 | Tag::Failed => {
                 unreachable!("forced")
             }
         }
@@ -2568,6 +3196,7 @@ impl VM {
 
         let same_type = match (va.tag(), vb.tag()) {
             (Tag::True | Tag::False, Tag::True | Tag::False) => true,
+            (Tag::String | Tag::SmallString, Tag::String | Tag::SmallString) => true,
             (x, y) => x == y,
         };
         if !same_type {
@@ -2593,7 +3222,7 @@ impl VM {
                 }
                 Ok(())
             }
-            Tag::String => {
+            Tag::String | Tag::SmallString => {
                 if str_bytes(&va) != str_bytes(&vb) {
                     let msg = format!(
                         "string '{}' is not equal to string '{}'",
@@ -2713,7 +3342,7 @@ impl VM {
                 }
                 Ok(())
             }
-            Tag::Closure | Tag::PrimOp | Tag::PrimOpApp => Err(self.new_err(
+            Tag::Closure | Tag::Closure0 | Tag::Closure1 | Tag::PrimOp | Tag::PrimOpApp => Err(self.new_err(
                 ErrKind::Assertion,
                 "distinct functions and immediate comparisons of identical functions compare as unequal",
                 NO_POS,
@@ -2722,7 +3351,7 @@ impl VM {
                 // Both numeric: handled by the int/float branch above.
                 Ok(())
             }
-            Tag::Thunk | Tag::Thunk0 | Tag::Blackhole | Tag::Blackhole0 | Tag::Failed => {
+            Tag::Thunk | Tag::Thunk0 | Tag::Thunk1 | Tag::Blackhole | Tag::Blackhole0 | Tag::Blackhole1 | Tag::Failed => {
                 unreachable!("forced")
             }
         }
@@ -2732,12 +3361,25 @@ impl VM {
         if v.tag() != Tag::Attrs {
             return Ok(false);
         }
-        let Some(t) = attrs_get(v, self.syms.type_) else {
+        let attrs = attrs_entries(v);
+        let t = if let Some((desc, values)) = attrs.as_static() {
+            (desc.type_slot != u32::MAX).then(|| {
+                let i = desc.type_slot as usize;
+                Attr {
+                    sym: self.syms.type_.0,
+                    pos: desc.names[i].1.0,
+                    val: values[i],
+                }
+            })
+        } else {
+            attrs.get(self.syms.type_.0)
+        };
+        let Some(t) = t else {
             return Ok(false);
         };
         self.force(t.val, PosIdx(t.pos))?;
         let tv = val(t.val);
-        Ok(tv.tag() == Tag::String && str_bytes(&tv) == b"derivation")
+        Ok(tv.is_string() && str_bytes(&tv) == b"derivation")
     }
 
     // ---------------- coercion ----------------
@@ -2845,7 +3487,9 @@ impl VM {
         self.force(cell, pos)?;
         let v = val(cell);
         match v.tag() {
-            Tag::String => Ok((str_bytes(&v).to_vec(), str_ctx_ids(&v).to_vec())),
+            Tag::String | Tag::SmallString => {
+                Ok((str_bytes(&v).to_vec(), str_ctx_ids(&v).to_vec()))
+            }
             Tag::Path => {
                 if copy_to_store {
                     let path = path_bytes(&v).to_vec();
@@ -3023,4 +3667,192 @@ pub fn canon_path(p: &[u8]) -> Vec<u8> {
 /// Convenience for builtins: make an immortal-safe VRef from a raw pointer.
 pub fn vref(p: *mut Value) -> VRef {
     NonNull::new(p).unwrap()
+}
+
+#[cfg(test)]
+mod attrs_view_tests {
+    use super::*;
+
+    #[test]
+    fn static_shape_attrs_share_metadata_and_compose_with_layers() {
+        let mut heap = Heap::new();
+        let one = heap.alloc_value(Value::int(1));
+        let two = heap.alloc_value(Value::int(2));
+        let twenty = heap.alloc_value(Value::int(20));
+        let three = heap.alloc_value(Value::int(3));
+        let desc = Box::leak(Box::new(crate::chunk::AttrsDesc {
+            names: vec![(Symbol(1), PosIdx(11)), (Symbol(2), PosIdx(12))],
+            type_slot: u32::MAX,
+            pos: PosIdx(10),
+        }));
+        let base = heap.new_static_bindings(desc, &[one, two]);
+        let base_view = attrs_entries(&base);
+        assert_eq!(base_view.get(1).unwrap().pos, 11);
+        assert_eq!(val(base_view.get(2).unwrap().val).as_int(), 2);
+        assert_eq!(base_view.to_vec().iter().map(|a| a.sym).collect::<Vec<_>>(), [1, 2]);
+
+        let layered = heap.new_bindings_layer(
+            base.ptr(),
+            &[
+                Attr { sym: 2, pos: 22, val: twenty },
+                Attr { sym: 3, pos: 23, val: three },
+            ],
+            3,
+            2,
+        );
+        let view = attrs_entries(&layered);
+        let got = view.to_vec();
+        assert_eq!(got.iter().map(|a| a.sym).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(val(got[1].val).as_int(), 20);
+        assert_eq!(got[1].pos, 22);
+    }
+
+    #[test]
+    fn layered_attrs_preserve_sorted_right_biased_semantics() {
+        let mut heap = Heap::new();
+        let one = heap.alloc_value(Value::int(1));
+        let two = heap.alloc_value(Value::int(2));
+        let twenty = heap.alloc_value(Value::int(20));
+        let three = heap.alloc_value(Value::int(3));
+        let base = heap.new_bindings(&[
+            Attr { sym: 1, pos: 11, val: one },
+            Attr { sym: 2, pos: 12, val: two },
+        ]);
+        let layered = heap.new_bindings_layer(
+            base.ptr(),
+            &[
+                Attr { sym: 2, pos: 22, val: twenty },
+                Attr { sym: 3, pos: 23, val: three },
+            ],
+            3,
+            2,
+        );
+        let view = attrs_entries(&layered);
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.depth(), 2);
+        assert_eq!(view.iter().map(|a| a.sym).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(unsafe { (*view.get(2).unwrap().val.as_ptr()).as_int() }, 20);
+        assert_eq!(view.get(2).unwrap().pos, 22);
+    }
+}
+
+#[cfg(test)]
+mod list_tail_view_tests {
+    use super::*;
+
+    #[test]
+    fn tail_views_are_flat_and_bounded() {
+        let mut heap = Heap::new();
+        let cells: Vec<VRef> = (0..32)
+            .map(|i| heap.alloc_value(Value::int(i)))
+            .collect();
+        let base = heap.new_list(&cells);
+        let mut view = base;
+        for offset in 1..=crate::value::MAX_LIST_TAIL_OFFSET {
+            view = view.list_tail_view().expect("within view bound");
+            assert_eq!(view.ptr(), base.ptr(), "views point directly at flat base");
+            assert_eq!(view.list_offset(), offset);
+            assert_eq!(list_elems(&view).len(), cells.len() - offset);
+            assert_eq!(val(list_elems(&view)[0]).as_int(), offset as i64);
+        }
+        assert!(view.list_tail_view().is_none(), "bound forces materialization");
+    }
+
+    #[test]
+    fn tail_view_prefix_admission_excludes_gc_graphs_and_mutable_thunks() {
+        assert!(Value::int(1).is_pointer_free_whnf());
+        assert!(Value::small_string(b"inline").unwrap().is_pointer_free_whnf());
+        assert!(!Value::make(Tag::List, std::ptr::dangling_mut::<u64>() as u64)
+            .is_pointer_free_whnf());
+        assert!(!Value::make(Tag::Thunk0, 0).is_pointer_free_whnf());
+    }
+}
+
+#[cfg(test)]
+mod small_string_tests {
+    use super::*;
+
+    #[test]
+    fn heap_builder_inlines_only_short_context_free_strings() {
+        let mut vm = VM::new(SymbolTable::new(), PosTable::new());
+        let short = vm.new_string_value(b"12345678901234", std::ptr::null_mut());
+        let long = vm.new_string_value(b"123456789012345", std::ptr::null_mut());
+        assert_eq!(short.tag(), Tag::SmallString);
+        assert_eq!(str_bytes(&short), b"12345678901234");
+        assert_eq!(long.tag(), Tag::String);
+        assert_eq!(str_bytes(&long), b"123456789012345");
+
+        let ctx = vm.heap.new_ctx(&[7, 11]);
+        let contextual = vm.new_string_value(b"short", ctx);
+        assert_eq!(contextual.tag(), Tag::String);
+        assert_eq!(str_bytes(&contextual), b"short");
+        assert_eq!(str_ctx_ids(&contextual), &[7, 11]);
+        assert!(str_ctx(&short).is_null());
+    }
+
+    #[test]
+    fn inline_and_heap_strings_have_identical_value_equality() {
+        let mut vm = VM::new(SymbolTable::new(), PosTable::new());
+        let ctx = vm.heap.new_ctx(&[1]);
+        let inline = vm.alloc_cell(Value::small_string(b"same").unwrap());
+        let heap_value = vm.heap.new_string(b"same", ctx);
+        let heap_backed = vm.alloc_cell(heap_value);
+        assert!(vm.eq_values(inline, heap_backed, NO_POS, "", false).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod result_cell_tests {
+    use super::*;
+
+    #[test]
+    fn immutable_scalar_results_use_canonical_cells() {
+        let mut vm = VM::new(SymbolTable::new(), PosTable::new());
+
+        assert_eq!(vm.alloc_result_cell(Value::bool(true)), vm.true_cell);
+        assert_eq!(vm.alloc_result_cell(Value::bool(false)), vm.false_cell);
+        for i in [-128, -1, 0, 127, 255] {
+            let a = vm.alloc_result_cell(Value::int(i));
+            let b = vm.alloc_result_cell(Value::int(i));
+            assert_eq!(a, b);
+            assert_eq!(val(a).as_int(), i);
+        }
+
+        assert_ne!(
+            vm.alloc_result_cell(Value::int(256)),
+            vm.alloc_result_cell(Value::int(256)),
+        );
+        assert_ne!(vm.alloc_cell(Value::int(1)), vm.alloc_cell(Value::int(1)));
+    }
+}
+
+#[cfg(test)]
+mod force_fast_path_tests {
+    use super::*;
+
+    fn vm() -> VM {
+        VM::new(SymbolTable::default(), PosTable::default())
+    }
+
+    #[test]
+    fn whnf_skips_out_of_line_force_without_changing_typed_results() {
+        let mut vm = vm();
+        let int = vm.heap.alloc_value(Value::int(42));
+        let boolean = vm.true_cell;
+
+        vm.force_if_needed(int, NO_POS).unwrap();
+        assert_eq!(vm.force_int(int, NO_POS, "integer context").unwrap(), 42);
+        assert!(vm.force_bool(boolean, NO_POS, "boolean context").unwrap());
+    }
+
+    #[test]
+    fn blackholes_still_enter_force_and_report_recursion() {
+        let mut vm = vm();
+        let cell = vm
+            .heap
+            .alloc_value(Value::make(Tag::Blackhole0, 0));
+        let err = vm.force_if_needed(cell, NO_POS).unwrap_err();
+        assert_eq!(vm.err_kind(err), ErrKind::InfiniteRecursion);
+    }
+
 }

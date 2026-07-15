@@ -111,13 +111,15 @@ fn deep_force_rec(vm: &mut VM, cell: VRef, seen: &mut HashSet<usize>) -> Result<
 }
 
 fn deep_force_body(vm: &mut VM, cell: VRef, seen: &mut HashSet<usize>) -> Result<(), ErrId> {
-    if !seen.insert(cell.as_ptr() as usize) {
-        return Ok(());
-    }
     vm.force(cell, NO_POS)?;
     let v = val(cell);
     match v.tag() {
         Tag::Attrs => {
+            // Only recursive container values can lead back into the graph.
+            // Avoid hashing every scalar leaf reached by deepSeq.
+            if !seen.insert(cell.as_ptr() as usize) {
+                return Ok(());
+            }
             for a in attrs_entries(&v) {
                 deep_force_rec(vm, a.val, seen).map_err(|e| {
                     let name =
@@ -132,6 +134,9 @@ fn deep_force_body(vm: &mut VM, cell: VRef, seen: &mut HashSet<usize>) -> Result
             }
         }
         Tag::List => {
+            if !seen.insert(cell.as_ptr() as usize) {
+                return Ok(());
+            }
             for (i, &el) in list_elems(&v).iter().enumerate() {
                 deep_force_rec(vm, el, seen).map_err(|e| {
                     vm.add_trace(
@@ -175,7 +180,7 @@ fn print_ambiguous_rec(
         Tag::Float => out.extend_from_slice(fmt_f64_g6(v.as_float()).as_bytes()),
         Tag::True => out.extend_from_slice(b"true"),
         Tag::False => out.extend_from_slice(b"false"),
-        Tag::String => print_literal_string(out, str_bytes(&v)),
+        Tag::String | Tag::SmallString => print_literal_string(out, str_bytes(&v)),
         Tag::Path => out.extend_from_slice(path_bytes(&v)),
         Tag::Null => out.extend_from_slice(b"null"),
         Tag::Attrs => {
@@ -214,12 +219,12 @@ fn print_ambiguous_rec(
                 out.push(b']');
             }
         }
-        Tag::Thunk | Tag::Thunk0 => out.extend_from_slice(b"<CODE>"),
-        Tag::Blackhole | Tag::Blackhole0 => {
+        Tag::Thunk | Tag::Thunk0 | Tag::Thunk1 => out.extend_from_slice(b"<CODE>"),
+        Tag::Blackhole | Tag::Blackhole0 | Tag::Blackhole1 => {
             out.extend_from_slice("«potential infinite recursion»".as_bytes())
         }
         Tag::Failed => out.extend_from_slice(b"<CODE>"),
-        Tag::Closure => out.extend_from_slice(b"<LAMBDA>"),
+        Tag::Closure | Tag::Closure0 | Tag::Closure1 => out.extend_from_slice(b"<LAMBDA>"),
         Tag::PrimOp => out.extend_from_slice(b"<PRIMOP>"),
         Tag::PrimOpApp => out.extend_from_slice(b"<PRIMOP-APP>"),
     }
@@ -317,7 +322,7 @@ fn print_value_rec(
         Tag::True => out.extend_from_slice(b"true"),
         Tag::False => out.extend_from_slice(b"false"),
         Tag::Null => out.extend_from_slice(b"null"),
-        Tag::String => {
+        Tag::String | Tag::SmallString => {
             let s = str_bytes(v);
             if s.len() > opts.max_string_length {
                 let mut trunc = s[..opts.max_string_length].to_vec();
@@ -390,7 +395,7 @@ fn print_value_rec(
                 out.extend_from_slice(b"[ ... ]");
             }
         }
-        Tag::Closure => {
+        Tag::Closure | Tag::Closure0 | Tag::Closure1 => {
             out.extend_from_slice("«lambda".as_bytes());
             let (code, _) = thunk_code(v);
             let chunk = code.chunk();
@@ -417,10 +422,10 @@ fn print_value_rec(
                 .as_bytes(),
             );
         }
-        Tag::Blackhole | Tag::Blackhole0 => {
+        Tag::Blackhole | Tag::Blackhole0 | Tag::Blackhole1 => {
             out.extend_from_slice("«potential infinite recursion»".as_bytes())
         }
-        Tag::Thunk | Tag::Thunk0 | Tag::Failed => {
+        Tag::Thunk | Tag::Thunk0 | Tag::Thunk1 | Tag::Failed => {
             out.extend_from_slice("«thunk»".as_bytes())
         }
     }

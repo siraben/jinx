@@ -20,7 +20,6 @@ pub mod derivation;
 pub mod escape_scan;
 pub mod hash;
 pub mod nar;
-pub mod nar_stats;
 pub mod nix32;
 pub mod store_path;
 pub mod wire;

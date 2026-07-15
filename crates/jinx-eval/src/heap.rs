@@ -5,7 +5,8 @@
 //! caller) plus a conservative scan of the native stack and callee-saved
 //! registers (covers Rust builtin temporaries and Cranelift JIT frames), then
 //! sweeps mark-region style (whole blocks with no survivors return to the free
-//! pool; partial blocks are retained, not re-bumped). Minor (young-only)
+//! pool; major sweeps recycle dead value cells and empty 128-byte data lines
+//! inside surviving blocks without moving objects). Minor (young-only)
 //! collections additionally trace a remembered set of old cells mutated since
 //! the last GC — logged by a write barrier at the single `vm::set_b` choke
 //! point — and sweep only young blocks; majors run on the first GC, at a
@@ -63,6 +64,13 @@ pub struct GcStats {
     pub barrier_hits: u64,
 }
 
+#[derive(Clone, Copy)]
+struct DataRun {
+    idx: usize,
+    cursor: usize,
+    end: usize,
+}
+
 pub struct Heap {
     space: BlockSpace,
     /// Current bump blocks (meta indices), if any.
@@ -78,6 +86,12 @@ pub struct Heap {
     /// cursor never moves backward within a mutator epoch, so a recycled cell is
     /// handed out at most once even though allocation doesn't set its mark bit.
     cur_value_recycle: Option<(usize, usize)>,
+    /// Empty Immix-style line runs discovered in data blocks at a major
+    /// collection. Survivors never move. Runs are keyed by exact remaining
+    /// bytes, so a B-tree lower-bound lookup finds the smallest fitting class
+    /// without scanning thousands of holes.
+    recycle_data: std::collections::BTreeMap<usize, Vec<DataRun>>,
+    cur_data_recycle: Option<DataRun>,
     /// Bytes allocated since the last collection.
     alloc_since_gc: usize,
     /// Footprint (bytes) of retained blocks + large objects after last GC.
@@ -144,6 +158,8 @@ impl Heap {
             cur_data: None,
             recycle_value: Vec::new(),
             cur_value_recycle: None,
+            recycle_data: std::collections::BTreeMap::new(),
+            cur_data_recycle: None,
             alloc_since_gc: 0,
             retained: 0,
             min_trigger,
@@ -339,27 +355,77 @@ impl Heap {
             unsafe { p.write(value::header(kind, len)) };
             return p;
         }
-        let idx = match self.cur_data {
-            Some(i) if self.space.meta(i).unwrap().bump() + rounded <= BLOCK_SIZE => i,
-            _ => {
-                let (_, i) = self.space.acquire(BlockKind::Data);
-                self.young_blocks.push(i);
-                self.cur_data = Some(i);
-                i
+        let (idx, off) = if let Some(recycled) = self.try_recycle_data(rounded) {
+            recycled
+        } else if let Some(i) = self.cur_data {
+            let bump = self.space.meta(i).unwrap().bump();
+            if bump + rounded <= BLOCK_SIZE {
+                (i, bump)
+            } else {
+                self.cur_data = None;
+                self.fresh_data()
             }
+        } else {
+            self.fresh_data()
         };
         let base = self.space.base_of(idx);
-        let mut meta = self.space.meta_mut(idx).unwrap();
-        let off = meta.bump();
-        meta.set_bump(off + rounded);
-        meta.set_start(off / GRANULE);
+        self.space.raise_bump(idx, off + rounded);
+        self.space.set_start_at(idx, off);
         let p = (base + off) as *mut u64;
         // SAFETY: freshly carved region inside a mapped block.
         unsafe { p.write(value::header(kind, len)) };
         p
     }
 
+    fn try_recycle_data(&mut self, size: usize) -> Option<(usize, usize)> {
+        if let Some(mut run) = self.cur_data_recycle.take() {
+            if run.cursor + size <= run.end {
+                let off = run.cursor;
+                run.cursor += size;
+                if run.cursor < run.end {
+                    self.cur_data_recycle = Some(run);
+                }
+                return Some((run.idx, off));
+            }
+            self.push_data_run(run);
+        }
+        if let Some(class) = self.recycle_data.range(size..).next().map(|(&k, _)| k) {
+            let runs = self.recycle_data.get_mut(&class).unwrap();
+            let mut run = runs.pop().unwrap();
+            if runs.is_empty() {
+                self.recycle_data.remove(&class);
+            }
+            let off = run.cursor;
+            run.cursor += size;
+            if run.cursor < run.end {
+                self.cur_data_recycle = Some(run);
+            }
+            return Some((run.idx, off));
+        }
+        None
+    }
+
+    fn push_data_run(&mut self, run: DataRun) {
+        let bytes = run.end - run.cursor;
+        if bytes < GRANULE {
+            return;
+        }
+        self.recycle_data.entry(bytes).or_default().push(run);
+    }
+
+    fn fresh_data(&mut self) -> (usize, usize) {
+        let (_, idx) = self.space.acquire(BlockKind::Data);
+        self.young_blocks.push(idx);
+        self.cur_data = Some(idx);
+        (idx, 0)
+    }
+
     pub fn new_string(&mut self, bytes: &[u8], ctx: *mut u64) -> Value {
+        if ctx.is_null() {
+            if let Some(value) = Value::small_string(bytes) {
+                return value;
+            }
+        }
         let p = self.alloc_data(ObjKind::Str, bytes.len());
         // SAFETY: object sized for len bytes at offset 16.
         unsafe {
@@ -395,6 +461,44 @@ impl Heap {
         // SAFETY: object sized for len 16-byte entries.
         unsafe {
             std::ptr::copy_nonoverlapping(entries.as_ptr(), p.add(1) as *mut Attr, entries.len());
+        }
+        Value::make(Tag::Attrs, p as u64)
+    }
+
+    /// Build a static-shape attrset. `desc` belongs to an immortal Program;
+    /// only the per-instance value pointers live in the GC heap.
+    pub fn new_static_bindings(
+        &mut self,
+        desc: &'static crate::chunk::AttrsDesc,
+        values: &[VRef],
+    ) -> Value {
+        debug_assert_eq!(desc.names.len(), values.len());
+        let p = self.alloc_data(ObjKind::BindingsStatic, values.len());
+        unsafe {
+            p.add(1).write(desc as *const _ as u64);
+            std::ptr::copy_nonoverlapping(values.as_ptr(), p.add(2) as *mut VRef, values.len());
+        }
+        Value::make(Tag::Attrs, p as u64)
+    }
+
+    /// Build a bounded attrset layer. `entries` is the flattened right-hand
+    /// operand of `//`, so every entry in it overrides matching entries in
+    /// `base`. `total_len` counts unique names across the logical set.
+    pub fn new_bindings_layer(
+        &mut self,
+        base: *mut u64,
+        entries: &[Attr],
+        total_len: usize,
+        depth: u8,
+    ) -> Value {
+        debug_assert!(entries.windows(2).all(|w| w[0].sym < w[1].sym));
+        debug_assert!(total_len <= u32::MAX as usize);
+        debug_assert!((2..=8).contains(&depth));
+        let p = self.alloc_data(ObjKind::BindingsLayer, entries.len());
+        unsafe {
+            p.add(1).write(base as u64);
+            p.add(2).write((total_len as u64) | ((depth as u64) << 32));
+            std::ptr::copy_nonoverlapping(entries.as_ptr(), p.add(3) as *mut Attr, entries.len());
         }
         Value::make(Tag::Attrs, p as u64)
     }
@@ -479,12 +583,13 @@ impl Heap {
     /// Avoids the temp Vec + copy in the very hot `make_thunk` path.
     pub fn new_thunk_raw(&mut self, tag: Tag, code: *const (), len: usize) -> (Value, *mut VRef) {
         debug_assert!(matches!(tag, Tag::Thunk | Tag::Closure));
-        let p = self.alloc_data(ObjKind::Thunk, len);
-        // SAFETY: object sized for len pointers at offset 16.
-        unsafe {
-            p.add(1).write(code as u64);
-            (Value::make(tag, p as u64), p.add(2) as *mut VRef)
-        }
+        let p = self.alloc_data(ObjKind::Upvals, len);
+        // SAFETY: object is sized for len pointers immediately after its
+        // header. The immortal code pointer is compressed into the cell.
+        (
+            Value::packed_env(tag, code, p),
+            unsafe { p.add(1) as *mut VRef },
+        )
     }
 
     /// Like `new_bindings`, but with `len` UNINITIALIZED entries for the
@@ -512,13 +617,12 @@ impl Heap {
     /// are captured cells. `tag` is Tag::Thunk or Tag::Closure.
     pub fn new_thunk(&mut self, tag: Tag, code: *const (), upvals: &[VRef]) -> Value {
         debug_assert!(matches!(tag, Tag::Thunk | Tag::Closure));
-        let p = self.alloc_data(ObjKind::Thunk, upvals.len());
-        // SAFETY: object sized for len pointers at offset 16.
+        let p = self.alloc_data(ObjKind::Upvals, upvals.len());
+        // SAFETY: object sized for len pointers at offset 8.
         unsafe {
-            p.add(1).write(code as u64);
-            std::ptr::copy_nonoverlapping(upvals.as_ptr(), p.add(2) as *mut VRef, upvals.len());
+            std::ptr::copy_nonoverlapping(upvals.as_ptr(), p.add(1) as *mut VRef, upvals.len());
         }
-        Value::make(tag, p as u64)
+        Value::packed_env(tag, code, p)
     }
 
     pub fn new_primapp(&mut self, prim: *const (), args: &[VRef]) -> Value {
@@ -640,6 +744,9 @@ impl Heap {
             self.cur_value = None;
             self.cur_value_recycle = None;
             self.recycle_value.clear();
+            self.cur_data = None;
+            self.cur_data_recycle = None;
+            self.recycle_data.clear();
         }
         let cur_v = self.cur_value;
         let cur_d = self.cur_data;
@@ -675,6 +782,15 @@ impl Heap {
                         #[cfg(debug_assertions)]
                         self.poison_free_value_cells(idx);
                         self.recycle_value.push(idx);
+                        self.young_blocks.push(idx);
+                    }
+                }
+                if major && self.space.is_data_block(idx) {
+                    let runs = self.space.recyclable_data_runs(idx);
+                    if !runs.is_empty() {
+                        for (start, end) in runs {
+                            self.push_data_run(DataRun { idx, cursor: start, end });
+                        }
                         self.young_blocks.push(idx);
                     }
                 }
@@ -769,7 +885,35 @@ impl Heap {
                 }
             }
         };
+        let check_data = |p: *mut u64, ctx: &str| {
+            let addr = p as usize;
+            if let Some((idx, g)) = self.space.locate(addr) {
+                assert!(
+                    self.space.kind_of(idx) == BlockKind::Data
+                        && self.space.is_start(idx, g)
+                        && self.space.is_marked(idx, g),
+                    "MARK-CLOSURE: {ctx}: marked object -> UNMARKED data {addr:#x}"
+                );
+            }
+        };
         for idx in self.space.live_block_indices() {
+            if self.space.kind_of(idx) == BlockKind::Value {
+                let base = self.space.base_of(idx);
+                let bump = self.space.bump_of(idx);
+                for off in (0..bump).step_by(VALUE_SIZE) {
+                    let g = off / GRANULE;
+                    if self.space.is_start(idx, g) && self.space.is_marked(idx, g) {
+                        let v = unsafe { *((base + off) as *const Value) };
+                        if let Some(c) = v.packed_capture() {
+                            check_cell(c, "packed capture");
+                        }
+                        if v.has_heap_payload() && !v.ptr().is_null() {
+                            check_data(v.ptr(), "value payload");
+                        }
+                    }
+                }
+                continue;
+            }
             if self.space.kind_of(idx) != BlockKind::Data {
                 continue;
             }
@@ -801,6 +945,19 @@ impl Heap {
                             ObjKind::Bindings => {
                                 for a in value::bindings(pm) {
                                     check_cell(a.val, "bindings");
+                                }
+                            }
+                            ObjKind::BindingsStatic => {
+                                let (_, values) = value::bindings_static(pm);
+                                for &cell in values {
+                                    check_cell(cell, "static bindings");
+                                }
+                            }
+                            ObjKind::BindingsLayer => {
+                                let (base, _, _, local) = value::bindings_layer(pm);
+                                check_data(base, "bindings-layer base");
+                                for a in local {
+                                    check_cell(a.val, "bindings-layer");
                                 }
                             }
                             ObjKind::Thunk | ObjKind::PrimApp => {
@@ -966,6 +1123,19 @@ fn trace_data<F: FnMut(VRef)>(space: &BlockSpace, p: *mut u64, push: &mut F) {
                     mark_cell_into(space, a.val, push);
                 }
             }
+            ObjKind::BindingsStatic => {
+                let (_, values) = value::bindings_static(p);
+                for &cell in values {
+                    mark_cell_into(space, cell, push);
+                }
+            }
+            ObjKind::BindingsLayer => {
+                let (base, _, _, local) = value::bindings_layer(p);
+                trace_data(space, base, push);
+                for a in local {
+                    mark_cell_into(space, a.val, push);
+                }
+            }
             ObjKind::Thunk | ObjKind::PrimApp => {
                 let (_, elems) = value::code_and_elems(p);
                 for &e in elems {
@@ -1031,6 +1201,10 @@ impl Marker<'_> {
             let space = self.space;
             trace_data(space, v.ptr(), &mut |c| self.worklist.push(c));
         }
+        if let Some(c) = v.packed_capture() {
+            let space = self.space;
+            mark_cell_into(space, c, &mut |c| self.worklist.push(c));
+        }
     }
 
     /// Conservative scan: any word in [lo, hi) that resolves into the heap
@@ -1066,6 +1240,9 @@ fn single_drain(space: &BlockSpace, mut worklist: Vec<VRef>) {
         let val = unsafe { *v.as_ptr() };
         if val.has_heap_payload() {
             trace_data(space, val.ptr(), &mut |c| worklist.push(c));
+        }
+        if let Some(c) = val.packed_capture() {
+            mark_cell_into(space, c, &mut |c| worklist.push(c));
         }
     }
 }
@@ -1148,6 +1325,12 @@ fn parallel_drain(space: &BlockSpace, seed: Vec<VRef>, nthreads: usize) {
                                 // so it measured within noise — kept out to
                                 // leave the hot loop small.
                                 trace_data(space, val.ptr(), &mut |c| {
+                                    in_flight.fetch_add(1, Ordering::Relaxed);
+                                    worker.push(Task(c));
+                                });
+                            }
+                            if let Some(c) = val.packed_capture() {
+                                mark_cell_into(space, c, &mut |c| {
                                     in_flight.fetch_add(1, Ordering::Relaxed);
                                     worker.push(Task(c));
                                 });
@@ -1311,6 +1494,63 @@ mod tests {
     }
 
     #[test]
+    fn packed_capture_is_a_precise_gc_edge() {
+        #[repr(align(8))]
+        struct AlignedCode(u64);
+        static CODE: AlignedCode = AlignedCode(0);
+        let mut h = Heap::new();
+        let child = h.alloc_value(Value::int(0x1234));
+        let packed = Value::packed_code(Tag::Closure1, (&CODE as *const AlignedCode).cast(), child);
+        assert_eq!(packed.unpacked_code(), (&CODE as *const AlignedCode).cast());
+        let root = h.alloc_value(packed);
+        for _ in 0..10_000 { let _ = deep_list(&mut h, 8); }
+        h.collect(|m| m.mark_cell(root), false);
+        assert_eq!(unsafe { (*child.as_ptr()).as_int() }, 0x1234);
+        assert_eq!(CODE.0, 0);
+    }
+
+    #[test]
+    fn packed_environment_owner_is_a_precise_gc_edge() {
+        #[repr(align(8))]
+        struct AlignedCode(u64);
+        static PARENT: AlignedCode = AlignedCode(0);
+        static CHILD: AlignedCode = AlignedCode(1);
+        let mut h = Heap::new();
+        let captures = [
+            h.alloc_value(Value::int(11)),
+            h.alloc_value(Value::int(22)),
+            h.alloc_value(Value::int(33)),
+        ];
+        let owner = h.new_thunk(Tag::Thunk, (&PARENT as *const AlignedCode).cast(), &captures);
+        assert_eq!(
+            owner.unpacked_code(),
+            (&PARENT as *const AlignedCode).cast()
+        );
+        assert!(!owner.is_shared_env());
+        assert_eq!(
+            unsafe { value::header_kind(*owner.ptr()) },
+            ObjKind::Upvals
+        );
+        let shared = Value::shared_env(
+            Tag::Closure,
+            (&CHILD as *const AlignedCode).cast(),
+            owner.ptr(),
+        );
+        assert_eq!(
+            shared.unpacked_code(),
+            (&CHILD as *const AlignedCode).cast()
+        );
+        assert!(shared.is_shared_env());
+        let root = h.alloc_value(shared);
+        for _ in 0..10_000 { let _ = deep_list(&mut h, 8); }
+        h.collect(|m| m.mark_cell(root), false);
+        let live = unsafe { value::elems(owner.ptr()) };
+        assert_eq!(unsafe { (*live[0].as_ptr()).as_int() }, 11);
+        assert_eq!(unsafe { (*live[2].as_ptr()).as_int() }, 33);
+        assert_eq!(PARENT.0 + CHILD.0, 1);
+    }
+
+    #[test]
     fn conservative_stack_scan_pins_locals() {
         let mut h = Heap::new();
         let live = deep_list(&mut h, 64);
@@ -1326,7 +1566,9 @@ mod tests {
     #[test]
     fn bindings_and_strings_traced() {
         let mut h = Heap::new();
-        let sval = h.new_string(b"hello world", std::ptr::null_mut());
+        // Keep this above the inline-string limit: this test specifically
+        // exercises tracing a heap string payload through bindings.
+        let sval = h.new_string(b"hello world long", std::ptr::null_mut());
         let sref = h.alloc_value(sval);
         let ival = mk_int(&mut h, 7);
         let b = h.new_bindings(&[
@@ -1345,7 +1587,7 @@ mod tests {
             assert_eq!(attrs.len(), 2);
             let s = *attrs[0].val.as_ptr();
             let (bytes, _) = value::str_parts(s.ptr() as *const u64);
-            assert_eq!(bytes, b"hello world");
+            assert_eq!(bytes, b"hello world long");
             assert_eq!((*attrs[1].val.as_ptr()).as_int(), 7);
         }
     }
@@ -1390,6 +1632,50 @@ mod tests {
             );
         }
         assert_eq!(unsafe { leaf_int(live) }, 32);
+    }
+
+    #[test]
+    fn b2_recycles_empty_data_lines_without_moving_survivors() {
+        let mut h = Heap::new();
+        let mut keep = Vec::new();
+        for i in 0..4000usize {
+            let bytes = vec![(i & 0xff) as u8; 72];
+            let v = h.new_string(&bytes, std::ptr::null_mut());
+            let c = h.alloc_value(v);
+            if i % 7 == 0 {
+                keep.push((c, bytes[0]));
+            }
+        }
+        let roots: Vec<VRef> = keep.iter().map(|x| x.0).collect();
+        h.collect(move |m| {
+            for c in roots {
+                m.mark_cell(c);
+            }
+        }, false);
+        assert!(
+            !h.recycle_data.is_empty(),
+            "expected recyclable data-line runs"
+        );
+        let blocks_after_major = h.live_block_count();
+
+        // Refill most holes. Line recycling should absorb this wave without
+        // needing anything close to the original number of data blocks.
+        for i in 0..2500usize {
+            let bytes = vec![0x80 | (i & 0x7f) as u8; 72];
+            let v = h.new_string(&bytes, std::ptr::null_mut());
+            let _ = h.alloc_value(v);
+        }
+        assert!(
+            h.live_block_count() <= blocks_after_major + 4,
+            "data blocks grew despite empty-line recycling: {} -> {}",
+            blocks_after_major,
+            h.live_block_count()
+        );
+        for (c, byte) in keep {
+            let v = unsafe { *c.as_ptr() };
+            let (bytes, _) = unsafe { value::str_parts(v.ptr() as *const u64) };
+            assert_eq!(bytes, vec![byte; 72]);
+        }
     }
 
     /// Regression: the conservative native-stack scan can pin a *dead* value

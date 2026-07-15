@@ -6,12 +6,36 @@
 //! immortal objects (a constant string/path/int never references anything).
 
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 
 use crate::value::{self, ObjKind, Tag, VRef, Value};
 
 /// Leak a value cell.
 pub fn cell(v: Value) -> VRef {
     NonNull::from(Box::leak(Box::new(v)))
+}
+
+/// Canonical cell for a frequently produced small integer. Integer identity
+/// is not observable in Nix, so arithmetic/call results in this range can
+/// share immutable cells just like booleans and compile-time constants do.
+///
+/// Keep the range deliberately small: it covers loop indices, lengths, and
+/// recursive-call arguments without retaining arbitrary arithmetic values.
+pub fn small_int_cell(i: i64) -> Option<VRef> {
+    const MIN: i64 = -128;
+    const MAX: i64 = 255;
+    static CELLS: OnceLock<Box<[Value]>> = OnceLock::new();
+
+    if !(MIN..=MAX).contains(&i) {
+        return None;
+    }
+    let cells = CELLS.get_or_init(|| {
+        (MIN..=MAX)
+            .map(Value::int)
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    });
+    Some(NonNull::from(&cells[(i - MIN) as usize]))
 }
 
 /// Leak a data object with the given header, payload words zeroed.
@@ -26,6 +50,9 @@ fn obj(kind: ObjKind, len: usize) -> *mut u64 {
 
 /// Immortal string value (no context).
 pub fn string(bytes: &[u8]) -> Value {
+    if let Some(value) = Value::small_string(bytes) {
+        return value;
+    }
     let p = obj(ObjKind::Str, bytes.len());
     // SAFETY: object sized for the payload.
     unsafe {

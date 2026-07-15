@@ -76,18 +76,9 @@ impl Stack {
         }
     }
 
-    /// Ensure room for at least `additional` more elements without
-    /// reallocating (used by the JIT before a run of inline pushes).
-    pub fn reserve(&mut self, additional: usize) {
-        let need = self.len + additional;
-        if need > self.cap {
-            let new_cap = need.max(self.cap * 2).max(8);
-            self.grow_to(new_cap);
-        }
-    }
-
-    /// Ensure total capacity is at least `total` elements (used by the JIT at
-    /// frame entry so all of the frame's inline pushes are capacity-safe).
+    /// Ensure total capacity is at least `total` elements (used at frame entry
+    /// so the chunk's bounded operand-stack height cannot trigger growth).
+    #[inline]
     pub fn reserve_to(&mut self, total: usize) {
         if total > self.cap {
             let new_cap = total.max(self.cap * 2).max(8);
@@ -148,6 +139,43 @@ impl Drop for Stack {
             unsafe { alloc::dealloc(self.ptr as *mut u8, layout) }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::Value;
+
+    #[test]
+    fn reserve_to_frame_bound_prevents_mid_frame_growth() {
+        let mut stack = Stack::with_capacity(0);
+        let cell = std::ptr::NonNull::from(Box::leak(Box::new(Value::null())));
+        stack.reserve_to(7);
+        let reserved = stack.cap;
+        for _ in 0..7 {
+            stack.push(cell);
+        }
+        assert_eq!(stack.len(), 7);
+        assert_eq!(stack.cap, reserved);
+    }
+
+    #[test]
+    fn nested_frame_bound_is_absolute() {
+        let mut stack = Stack::with_capacity(0);
+        let cell = std::ptr::NonNull::from(Box::leak(Box::new(Value::null())));
+        stack.reserve_to(3);
+        for _ in 0..3 {
+            stack.push(cell);
+        }
+        let child_base = stack.len();
+        stack.reserve_to(child_base + 9);
+        let reserved = stack.cap;
+        for _ in 0..9 {
+            stack.push(cell);
+        }
+        assert_eq!(stack.cap, reserved);
+    }
+
 }
 
 // The operand stack is only ever touched on the single evaluation thread.

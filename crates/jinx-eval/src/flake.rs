@@ -516,7 +516,7 @@ fn nix_attrs_to_fetch_attrs(vm: &mut VM, cell: VRef, pos: PosIdx) -> Result<Attr
         vm.force(a.val, pos)?;
         let v = val(a.val);
         match v.tag() {
-            Tag::String => {
+            Tag::String | Tag::SmallString => {
                 out.insert(name, FAttr::Str(String::from_utf8_lossy(str_bytes(&v)).into_owned()));
             }
             Tag::Int => {
