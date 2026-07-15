@@ -57,10 +57,13 @@ def load_rss():
     return r
 
 
-def svg_header(w, h, title):
+def svg_header(w, h, title, description):
     return [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
-        f'viewBox="0 0 {w} {h}" font-family="-apple-system,Segoe UI,Roboto,sans-serif">',
+        f'viewBox="0 0 {w} {h}" font-family="-apple-system,Segoe UI,Roboto,sans-serif" '
+        'role="img" aria-labelledby="chart-title chart-description">',
+        f'<title id="chart-title">{html.escape(title)}</title>',
+        f'<desc id="chart-description">{html.escape(description)}</desc>',
         f'<rect width="{w}" height="{h}" fill="{BG}"/>',
         f'<text x="{w/2}" y="28" text-anchor="middle" font-size="17" '
         f'font-weight="700" fill="{INK}">{html.escape(title)}</text>',
@@ -104,9 +107,14 @@ def chart_speedup():
             jkey = "jinx" if "jinx" in d else "jit"
         speed = d["oracle"][0] / d[jkey][0]
         rows.append((label + (" (jit)" if jkey == "jit" else ""), speed))
-    W, rowh, top, left = 720, 42, 56, 250
+    W, rowh, top, left = 720, 42, 68, 250
     H = top + rowh * len(rows) + 30
-    L = svg_header(W, H, "jinx speedup vs C++ Nix (higher is better)")
+    L = svg_header(
+        W,
+        H,
+        "jinx speedup vs C++ Nix (higher is better)",
+        "Jinx speedup over C++ Nix across parser, compute, and realistic nixpkgs evaluations.",
+    )
     maxr = max(r[1] for r in rows) * 1.12
     plotw = W - left - 70
     x0 = left
@@ -136,7 +144,12 @@ def chart_walltime():
         return
     pw, gap, top = 200, 40, 70
     H, W = 300, len(panels) * pw + (len(panels) + 1) * gap
-    L = svg_header(W, H, "Wall time: jinx vs C++ Nix on real nixpkgs evals")
+    L = svg_header(
+        W,
+        H,
+        "Wall time: jinx vs C++ Nix on real nixpkgs evals",
+        "Grouped wall-time bars for hello, Firefox, and NixOS ISO evaluation; lower is better.",
+    )
     baseY, barmax = H - 46, H - 46 - top
     for i, (label, o, j, unit) in enumerate(panels):
         cx = gap + i * (pw + gap) + pw / 2
@@ -168,7 +181,12 @@ def chart_rss():
         return
     pw, gap, top = 200, 40, 70
     H, W = 300, len(panels) * pw + (len(panels) + 1) * gap
-    L = svg_header(W, H, "Peak RSS: jinx vs C++ Nix (lower is better)")
+    L = svg_header(
+        W,
+        H,
+        "Peak RSS: jinx vs C++ Nix (lower is better)",
+        "Grouped peak-memory bars for hello, Firefox, and NixOS ISO evaluation; lower is better.",
+    )
     baseY, barmax = H - 46, H - 46 - top
 
     def fmt(b):

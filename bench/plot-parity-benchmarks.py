@@ -18,8 +18,9 @@ if MODE == "compute":
         ("record-shapes", "static record equality/select"),
     ]
     OUTPUT = sys.argv[3] if len(sys.argv) > 3 else "bench/graphs/compute.svg"
-    width, left, right, top, row_height = 850, 270, 80, 67, 58
+    width, left, right, top, row_height = 850, 270, 80, 88, 58
     title = "Compute-heavy Nix evaluation"
+    description = "C++ Nix parity line with paired jinx interpreter and JIT speedup bars for six compute workloads."
 else:
     if MODE != "strengths":
         raise SystemExit(f"unknown suite: {MODE}")
@@ -31,8 +32,9 @@ else:
         ("iso", "NixOS minimal ISO evaluation"),
     ]
     OUTPUT = sys.argv[3] if len(sys.argv) > 3 else "bench/graphs/eval-strengths.svg"
-    width, left, right, top, row_height = 790, 280, 85, 58, 46
+    width, left, right, top, row_height = 790, 280, 85, 70, 46
     title = "Where jinx materially outperforms C++ Nix"
+    description = "Jinx speedup over C++ Nix for five parity-checked evaluator workloads."
 
 
 def load(name):
@@ -57,7 +59,10 @@ parity_x = left + plot_width / maximum
 
 lines = [
     f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-    f'viewBox="0 0 {width} {height}" font-family="-apple-system,Segoe UI,Roboto,sans-serif">',
+    f'viewBox="0 0 {width} {height}" font-family="-apple-system,Segoe UI,Roboto,sans-serif" '
+    'role="img" aria-labelledby="chart-title chart-description">',
+    f'<title id="chart-title">{html.escape(title)}</title>',
+    f'<desc id="chart-description">{html.escape(description)}</desc>',
     f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
     f'<text x="{width / 2}" y="{27 if MODE == "compute" else 28}" text-anchor="middle" '
     f'font-size="17" font-weight="700" fill="#1a1a2e">{title}</text>',
@@ -74,7 +79,7 @@ lines += [
     f'x2="{parity_x:.1f}" y2="{height - 24}" stroke="#6b7280" stroke-width="1" '
     'stroke-dasharray="4 3"/>',
     f'<text x="{parity_x:.1f}" y="{top - (9 if MODE == "compute" else 14)}" '
-    f'text-anchor="middle" font-size="{10.5 if MODE == "compute" else 11}" fill="#6b7280">'
+    f'text-anchor="middle" font-size="11" fill="#6b7280">'
     f'{"1× C++ Nix" if MODE == "compute" else "1× parity"}</text>',
 ]
 
@@ -108,7 +113,7 @@ for index, (label, speedups, means) in enumerate(rows):
             f'<rect x="{left}" y="{y + 7}" width="{bar_width:.1f}" height="22" rx="3" fill="#2563eb"/>',
             f'<text x="{left + bar_width + 8:.1f}" y="{y + 23}" text-anchor="start" font-size="12.5" '
             f'font-weight="700" fill="#1a1a2e">{speedup:.2f}×</text>',
-            f'<text x="{left - 12}" y="{y + 37}" text-anchor="end" font-size="9.5" '
+            f'<text x="{left - 12}" y="{y + 38}" text-anchor="end" font-size="11" '
             f'fill="#6b7280">{detail}</text>',
         ]
 

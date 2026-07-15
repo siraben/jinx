@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" font-family="-apple-system,Segoe UI,Roboto,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" font-family="-apple-system,Segoe UI,Roboto,sans-serif" role="img" aria-labelledby="chart-title chart-description">
+<title id="chart-title">Wall time: jinx vs C++ Nix on real nixpkgs evals</title>
+<desc id="chart-description">Grouped wall-time bars for hello, Firefox, and NixOS ISO evaluation; lower is better.</desc>
 <rect width="760" height="300" fill="#ffffff"/>
 <text x="380.0" y="28" text-anchor="middle" font-size="17" font-weight="700" fill="#1a1a2e">Wall time: jinx vs C++ Nix on real nixpkgs evals</text>
 <rect x="74.0" y="94.0" width="58.0" height="160.0" rx="3" fill="#9ca3af"/>

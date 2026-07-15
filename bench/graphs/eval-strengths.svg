@@ -1,26 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="790" height="322" viewBox="0 0 790 322" font-family="-apple-system,Segoe UI,Roboto,sans-serif">
-<rect width="790" height="322" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="790" height="334" viewBox="0 0 790 334" font-family="-apple-system,Segoe UI,Roboto,sans-serif" role="img" aria-labelledby="chart-title chart-description">
+<title id="chart-title">Where jinx materially outperforms C++ Nix</title>
+<desc id="chart-description">Jinx speedup over C++ Nix for five parity-checked evaluator workloads.</desc>
+<rect width="790" height="334" fill="#ffffff"/>
 <text x="395.0" y="28" text-anchor="middle" font-size="17" font-weight="700" fill="#1a1a2e">Where jinx materially outperforms C++ Nix</text>
-<line x1="318.2" y1="49" x2="318.2" y2="298" stroke="#6b7280" stroke-width="1" stroke-dasharray="4 3"/>
-<text x="318.2" y="44" text-anchor="middle" font-size="11" fill="#6b7280">1× parity</text>
-<text x="268" y="80" text-anchor="end" font-size="12.5" fill="#1a1a2e">parse all-packages.nix</text>
-<rect x="280" y="65" width="312.9" height="22" rx="3" fill="#2563eb"/>
-<text x="600.9" y="81" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">8.18×</text>
-<text x="268" y="95" text-anchor="end" font-size="9.5" fill="#6b7280">Nix 49.3 ms; jinx 6.0 ms</text>
-<text x="268" y="126" text-anchor="end" font-size="12.5" fill="#1a1a2e">genericClosure, 20k keys</text>
-<rect x="280" y="111" width="379.5" height="22" rx="3" fill="#2563eb"/>
-<text x="667.5" y="127" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">9.93×</text>
-<text x="268" y="141" text-anchor="end" font-size="9.5" fill="#6b7280">Nix 54.1 ms; jinx 5.5 ms</text>
-<text x="268" y="172" text-anchor="end" font-size="12.5" fill="#1a1a2e">deepSeq, wide/shared/cyclic</text>
-<rect x="280" y="157" width="175.5" height="22" rx="3" fill="#2563eb"/>
-<text x="463.5" y="173" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">4.59×</text>
-<text x="268" y="187" text-anchor="end" font-size="9.5" fill="#6b7280">Nix 70.5 ms; jinx 15.4 ms</text>
-<text x="268" y="218" text-anchor="end" font-size="12.5" fill="#1a1a2e">allocation/list/attr operations</text>
-<rect x="280" y="203" width="144.1" height="22" rx="3" fill="#2563eb"/>
-<text x="432.1" y="219" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">3.77×</text>
-<text x="268" y="233" text-anchor="end" font-size="9.5" fill="#6b7280">Nix 53.1 ms; jinx 14.1 ms</text>
-<text x="268" y="264" text-anchor="end" font-size="12.5" fill="#1a1a2e">NixOS minimal ISO evaluation</text>
-<rect x="280" y="249" width="55.6" height="22" rx="3" fill="#2563eb"/>
-<text x="343.6" y="265" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.46×</text>
-<text x="268" y="279" text-anchor="end" font-size="9.5" fill="#6b7280">Nix 6522.5 ms; jinx 4482.6 ms</text>
+<line x1="318.2" y1="61" x2="318.2" y2="310" stroke="#6b7280" stroke-width="1" stroke-dasharray="4 3"/>
+<text x="318.2" y="56" text-anchor="middle" font-size="11" fill="#6b7280">1× parity</text>
+<text x="268" y="92" text-anchor="end" font-size="12.5" fill="#1a1a2e">parse all-packages.nix</text>
+<rect x="280" y="77" width="312.9" height="22" rx="3" fill="#2563eb"/>
+<text x="600.9" y="93" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">8.18×</text>
+<text x="268" y="108" text-anchor="end" font-size="11" fill="#6b7280">Nix 49.3 ms; jinx 6.0 ms</text>
+<text x="268" y="138" text-anchor="end" font-size="12.5" fill="#1a1a2e">genericClosure, 20k keys</text>
+<rect x="280" y="123" width="379.5" height="22" rx="3" fill="#2563eb"/>
+<text x="667.5" y="139" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">9.93×</text>
+<text x="268" y="154" text-anchor="end" font-size="11" fill="#6b7280">Nix 54.1 ms; jinx 5.5 ms</text>
+<text x="268" y="184" text-anchor="end" font-size="12.5" fill="#1a1a2e">deepSeq, wide/shared/cyclic</text>
+<rect x="280" y="169" width="175.5" height="22" rx="3" fill="#2563eb"/>
+<text x="463.5" y="185" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">4.59×</text>
+<text x="268" y="200" text-anchor="end" font-size="11" fill="#6b7280">Nix 70.5 ms; jinx 15.4 ms</text>
+<text x="268" y="230" text-anchor="end" font-size="12.5" fill="#1a1a2e">allocation/list/attr operations</text>
+<rect x="280" y="215" width="144.1" height="22" rx="3" fill="#2563eb"/>
+<text x="432.1" y="231" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">3.77×</text>
+<text x="268" y="246" text-anchor="end" font-size="11" fill="#6b7280">Nix 53.1 ms; jinx 14.1 ms</text>
+<text x="268" y="276" text-anchor="end" font-size="12.5" fill="#1a1a2e">NixOS minimal ISO evaluation</text>
+<rect x="280" y="261" width="55.6" height="22" rx="3" fill="#2563eb"/>
+<text x="343.6" y="277" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.46×</text>
+<text x="268" y="292" text-anchor="end" font-size="11" fill="#6b7280">Nix 6522.5 ms; jinx 4482.6 ms</text>
 </svg>
