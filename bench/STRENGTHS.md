@@ -28,11 +28,11 @@ and nixpkgs `9675111`:
 
 | Workload | C++ Nix | jinx | Speedup |
 |---|---:|---:|---:|
-| Parse `all-packages.nix` | 49.3 ms | 6.0 ms | **8.18×** |
-| `genericClosure`, 20k keys | 54.1 ms | 5.5 ms | **9.93×** |
-| Wide/shared/cyclic `deepSeq` | 70.5 ms | 15.4 ms | **4.59×** |
-| Allocation/list/attr operations | 53.1 ms | 14.1 ms | **3.77×** |
-| NixOS minimal ISO | 6.522 s | 4.483 s | **1.46×** |
+| Parse `all-packages.nix` | 56.4 ms | 7.4 ms | **7.62×** |
+| `genericClosure`, 20k keys | 63.7 ms | 8.4 ms | **7.60×** |
+| Wide/shared/cyclic `deepSeq` | 75.4 ms | 15.9 ms | **4.73×** |
+| Allocation/list/attr operations | 62.6 ms | 15.5 ms | **4.03×** |
+| NixOS minimal ISO | 6.952 s | 4.665 s | **1.49×** |
 
 These are workload-specific strengths. In particular, the attrset-heavy
 Firefox evaluation remains a memory/CPU tradeoff and is intentionally reported

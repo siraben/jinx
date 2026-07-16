@@ -3,24 +3,24 @@
 <desc id="chart-description">Jinx speedup over C++ Nix across parser, compute, and realistic nixpkgs evaluations.</desc>
 <rect width="720" height="350" fill="#ffffff"/>
 <text x="360.0" y="28" text-anchor="middle" font-size="17" font-weight="700" fill="#1a1a2e">jinx speedup vs C++ Nix (higher is better)</text>
-<line x1="298.3" y1="62" x2="298.3" y2="326" stroke="#6b7280" stroke-dasharray="4 3" stroke-width="1"/>
-<text x="298.3" y="58.0" text-anchor="middle" font-size="11" font-weight="400" fill="#6b7280">1× (parity)</text>
+<line x1="296.2" y1="62" x2="296.2" y2="326" stroke="#6b7280" stroke-dasharray="4 3" stroke-width="1"/>
+<text x="296.2" y="58.0" text-anchor="middle" font-size="11" font-weight="400" fill="#6b7280">1× (parity)</text>
 <text x="238.0" y="94.0" text-anchor="end" font-size="12.5" font-weight="400" fill="#1a1a2e">parse all-packages.nix</text>
 <rect x="250.0" y="76.0" width="357.1" height="24.0" rx="3" fill="#2563eb"/>
-<text x="615.1" y="94.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">7.40×</text>
+<text x="615.1" y="94.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">7.72×</text>
 <text x="238.0" y="136.0" text-anchor="end" font-size="12.5" font-weight="400" fill="#1a1a2e">ops.nix (alloc/list) (jit)</text>
-<rect x="250.0" y="118.0" width="238.1" height="24.0" rx="3" fill="#2563eb"/>
-<text x="496.1" y="136.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">4.93×</text>
+<rect x="250.0" y="118.0" width="189.7" height="24.0" rx="3" fill="#2563eb"/>
+<text x="447.7" y="136.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">4.10×</text>
 <text x="238.0" y="178.0" text-anchor="end" font-size="12.5" font-weight="400" fill="#1a1a2e">fib.nix (compute) (jit)</text>
-<rect x="250.0" y="160.0" width="109.7" height="24.0" rx="3" fill="#2563eb"/>
-<text x="367.7" y="178.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">2.27×</text>
+<rect x="250.0" y="160.0" width="105.1" height="24.0" rx="3" fill="#2563eb"/>
+<text x="363.1" y="178.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">2.27×</text>
 <text x="238.0" y="220.0" text-anchor="end" font-size="12.5" font-weight="400" fill="#1a1a2e">nixpkgs -A hello</text>
-<rect x="250.0" y="202.0" width="72.6" height="24.0" rx="3" fill="#2563eb"/>
-<text x="330.6" y="220.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.50×</text>
+<rect x="250.0" y="202.0" width="68.2" height="24.0" rx="3" fill="#2563eb"/>
+<text x="326.2" y="220.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.47×</text>
 <text x="238.0" y="262.0" text-anchor="end" font-size="12.5" font-weight="400" fill="#1a1a2e">nixpkgs -A firefox</text>
-<rect x="250.0" y="244.0" width="67.8" height="24.0" rx="3" fill="#2563eb"/>
-<text x="325.8" y="262.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.41×</text>
+<rect x="250.0" y="244.0" width="70.6" height="24.0" rx="3" fill="#2563eb"/>
+<text x="328.6" y="262.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.53×</text>
 <text x="238.0" y="304.0" text-anchor="end" font-size="12.5" font-weight="400" fill="#1a1a2e">NixOS minimal ISO</text>
-<rect x="250.0" y="286.0" width="71.8" height="24.0" rx="3" fill="#2563eb"/>
-<text x="329.8" y="304.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.49×</text>
+<rect x="250.0" y="286.0" width="67.9" height="24.0" rx="3" fill="#2563eb"/>
+<text x="325.9" y="304.0" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.47×</text>
 </svg>

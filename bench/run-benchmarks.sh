@@ -24,10 +24,10 @@ command -v hyperfine >/dev/null || { echo "hyperfine not on PATH (use: nix shell
   exit 1
 }
 
-# Capture this before opening tracked result files below; otherwise the
-# metadata file reports the benchmark harness's own output as a dirty source
-# tree.
-JINX_DIRTY=$(test -n "$(git -C "$JINX_ROOT" status --porcelain)" && echo yes || echo no)
+# Generated result and graph refreshes do not make the benchmarked source tree
+# dirty. Other tracked or untracked changes still do.
+JINX_DIRTY=$(test -n "$(git -C "$JINX_ROOT" status --porcelain -- . \
+  ':(exclude)bench/graphs/*.svg' ':(exclude)bench/results/**')" && echo yes || echo no)
 
 # Capture enough provenance to explain or reproduce a result directory. This
 # is deliberately plain text so it remains useful without any plotting tools.

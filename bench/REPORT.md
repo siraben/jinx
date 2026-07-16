@@ -31,10 +31,10 @@ recycling lines and simplifying the NAR walker.
 
 | Workload | C++ Nix | jinx | Speedup |
 |---|---:|---:|---:|
-| Parse `all-packages.nix` | 50.2 ms | **6.8 ms** | **7.40x** |
-| nixpkgs `hello` | 228.4 ms | **151.8 ms** | **1.50x** |
-| nixpkgs `firefox` | 656.3 ms | **467.0 ms** | **1.41x** |
-| NixOS minimal ISO | 6.649 s | **4.473 s** | **1.49x** |
+| Parse `all-packages.nix` | 52.2 ms | **6.8 ms** | **7.72x** |
+| nixpkgs `hello` | 226.5 ms | **153.6 ms** | **1.47x** |
+| nixpkgs `firefox` | 747.5 ms | **489.7 ms** | **1.53x** |
+| NixOS minimal ISO | 7.213 s | **4.910 s** | **1.47x** |
 
 These are end-to-end evaluations, not parser or opcode microbenchmarks. The
 ISO workload includes substantial filesystem and NAR work; `hello` and Firefox
@@ -42,9 +42,9 @@ exercise the evaluator without collecting in the measured configuration.
 
 | Workload | C++ Nix peak RSS | jinx peak RSS | jinx / Nix |
 |---|---:|---:|---:|
-| `hello` | 135 MiB | **159 MiB** | 1.18x |
+| `hello` | 136 MiB | **159 MiB** | 1.17x |
 | `firefox` | 405 MiB | **520 MiB** | 1.29x |
-| NixOS minimal ISO | 1.73 GiB | **1.81 GiB** | 1.05x |
+| NixOS minimal ISO | 1.73 GiB | **1.82 GiB** | 1.05x |
 
 Jinx intentionally trades resident memory for stable object addresses, cheap
 call-by-need updates, and throughput. The compute suite shows where later

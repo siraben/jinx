@@ -23,7 +23,7 @@ honestly in [`KNOWN_DIVERGENCES.md`](KNOWN_DIVERGENCES.md).
 | Store | real writes via `nix-daemon` — `.drv`, `toFile`, `path`/`filterSource`, IFD builds |
 | GC | non-moving sticky-mark generational mark-region (Immix-style value-cell + 128-byte data-line recycling, precise execution safepoints, prefetched **parallel work-stealing mark**); passes the suite under forced collection |
 | JIT | Cranelift, all 40 opcodes; off by default — `--jit` wins only on compute-dense code |
-| Performance | `parse` **~7.4×**, `hello` **~1.50×**, `firefox` **~1.41×**, NixOS ISO **~1.49×** faster than C++ Nix; x86_64-linux validated ([benchmarks](#benchmarks)) |
+| Performance | `parse` **~7.7×**, `hello` **~1.47×**, `firefox` **~1.53×**, NixOS ISO **~1.47×** faster than C++ Nix; x86_64-linux validated ([benchmarks](#benchmarks)) |
 
 ## Layout
 

@@ -38,7 +38,8 @@ test -n "$ORACLE" && test -x "$ORACLE" || {
 }
 mkdir -p "$OUTDIR"
 
-dirty=$(test -n "$(git -C "$ROOT" status --porcelain)" && echo yes || echo no)
+dirty=$(test -n "$(git -C "$ROOT" status --porcelain -- . \
+  ':(exclude)bench/graphs/*.svg' ':(exclude)bench/results/**')" && echo yes || echo no)
 {
   echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   [[ "$MODE" == compute ]] && echo "system=$(uname -a)"
