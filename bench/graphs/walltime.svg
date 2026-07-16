@@ -4,23 +4,23 @@
 <rect width="760" height="300" fill="#ffffff"/>
 <text x="380.0" y="28" text-anchor="middle" font-size="17" font-weight="700" fill="#1a1a2e">Wall time: jinx vs C++ Nix on real nixpkgs evals</text>
 <rect x="74.0" y="94.0" width="58.0" height="160.0" rx="3" fill="#9ca3af"/>
-<rect x="148.0" y="147.6" width="58.0" height="106.4" rx="3" fill="#2563eb"/>
-<text x="103.0" y="87.0" text-anchor="middle" font-size="11.5" font-weight="400" fill="#6b7280">228ms</text>
-<text x="177.0" y="140.6" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a1a2e">152ms</text>
+<rect x="148.0" y="145.5" width="58.0" height="108.5" rx="3" fill="#2563eb"/>
+<text x="103.0" y="87.0" text-anchor="middle" font-size="11.5" font-weight="400" fill="#6b7280">227ms</text>
+<text x="177.0" y="138.5" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a1a2e">154ms</text>
 <text x="140.0" y="272.0" text-anchor="middle" font-size="13" font-weight="400" fill="#1a1a2e">hello</text>
-<text x="140.0" y="288.0" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">1.50× faster</text>
+<text x="140.0" y="288.0" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">1.47× faster</text>
 <rect x="314.0" y="94.0" width="58.0" height="160.0" rx="3" fill="#9ca3af"/>
-<rect x="388.0" y="140.2" width="58.0" height="113.8" rx="3" fill="#2563eb"/>
-<text x="343.0" y="87.0" text-anchor="middle" font-size="11.5" font-weight="400" fill="#6b7280">656ms</text>
-<text x="417.0" y="133.2" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a1a2e">467ms</text>
+<rect x="388.0" y="149.2" width="58.0" height="104.8" rx="3" fill="#2563eb"/>
+<text x="343.0" y="87.0" text-anchor="middle" font-size="11.5" font-weight="400" fill="#6b7280">748ms</text>
+<text x="417.0" y="142.2" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a1a2e">490ms</text>
 <text x="380.0" y="272.0" text-anchor="middle" font-size="13" font-weight="400" fill="#1a1a2e">firefox</text>
-<text x="380.0" y="288.0" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">1.41× faster</text>
+<text x="380.0" y="288.0" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">1.53× faster</text>
 <rect x="554.0" y="94.0" width="58.0" height="160.0" rx="3" fill="#9ca3af"/>
-<rect x="628.0" y="146.4" width="58.0" height="107.6" rx="3" fill="#2563eb"/>
-<text x="583.0" y="87.0" text-anchor="middle" font-size="11.5" font-weight="400" fill="#6b7280">6.65s</text>
-<text x="657.0" y="139.4" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a1a2e">4.47s</text>
+<rect x="628.0" y="145.1" width="58.0" height="108.9" rx="3" fill="#2563eb"/>
+<text x="583.0" y="87.0" text-anchor="middle" font-size="11.5" font-weight="400" fill="#6b7280">7.21s</text>
+<text x="657.0" y="138.1" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a1a2e">4.91s</text>
 <text x="620.0" y="272.0" text-anchor="middle" font-size="13" font-weight="400" fill="#1a1a2e">NixOS ISO</text>
-<text x="620.0" y="288.0" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">1.49× faster</text>
+<text x="620.0" y="288.0" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">1.47× faster</text>
 <rect x="560.0" y="44.0" width="12.0" height="12.0" rx="3" fill="#9ca3af"/>
 <text x="578.0" y="54.0" text-anchor="start" font-size="11.5" font-weight="400" fill="#6b7280">C++ Nix</text>
 <rect x="650.0" y="44.0" width="12.0" height="12.0" rx="3" fill="#2563eb"/>

@@ -3,26 +3,26 @@
 <desc id="chart-description">Jinx speedup over C++ Nix for five parity-checked evaluator workloads.</desc>
 <rect width="790" height="334" fill="#ffffff"/>
 <text x="395.0" y="28" text-anchor="middle" font-size="17" font-weight="700" fill="#1a1a2e">Where jinx materially outperforms C++ Nix</text>
-<line x1="318.2" y1="61" x2="318.2" y2="310" stroke="#6b7280" stroke-width="1" stroke-dasharray="4 3"/>
-<text x="318.2" y="56" text-anchor="middle" font-size="11" fill="#6b7280">1× parity</text>
+<line x1="329.8" y1="61" x2="329.8" y2="310" stroke="#6b7280" stroke-width="1" stroke-dasharray="4 3"/>
+<text x="329.8" y="56" text-anchor="middle" font-size="11" fill="#6b7280">1× parity</text>
 <text x="268" y="92" text-anchor="end" font-size="12.5" fill="#1a1a2e">parse all-packages.nix</text>
-<rect x="280" y="77" width="312.9" height="22" rx="3" fill="#2563eb"/>
-<text x="600.9" y="93" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">8.18×</text>
-<text x="268" y="108" text-anchor="end" font-size="11" fill="#6b7280">Nix 49.3 ms; jinx 6.0 ms</text>
+<rect x="280" y="77" width="379.5" height="22" rx="3" fill="#2563eb"/>
+<text x="667.5" y="93" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">7.62×</text>
+<text x="268" y="108" text-anchor="end" font-size="11" fill="#6b7280">Nix 56.4 ms; jinx 7.4 ms</text>
 <text x="268" y="138" text-anchor="end" font-size="12.5" fill="#1a1a2e">genericClosure, 20k keys</text>
-<rect x="280" y="123" width="379.5" height="22" rx="3" fill="#2563eb"/>
-<text x="667.5" y="139" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">9.93×</text>
-<text x="268" y="154" text-anchor="end" font-size="11" fill="#6b7280">Nix 54.1 ms; jinx 5.5 ms</text>
+<rect x="280" y="123" width="378.8" height="22" rx="3" fill="#2563eb"/>
+<text x="666.8" y="139" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">7.60×</text>
+<text x="268" y="154" text-anchor="end" font-size="11" fill="#6b7280">Nix 63.7 ms; jinx 8.4 ms</text>
 <text x="268" y="184" text-anchor="end" font-size="12.5" fill="#1a1a2e">deepSeq, wide/shared/cyclic</text>
-<rect x="280" y="169" width="175.5" height="22" rx="3" fill="#2563eb"/>
-<text x="463.5" y="185" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">4.59×</text>
-<text x="268" y="200" text-anchor="end" font-size="11" fill="#6b7280">Nix 70.5 ms; jinx 15.4 ms</text>
+<rect x="280" y="169" width="235.6" height="22" rx="3" fill="#2563eb"/>
+<text x="523.6" y="185" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">4.73×</text>
+<text x="268" y="200" text-anchor="end" font-size="11" fill="#6b7280">Nix 75.4 ms; jinx 15.9 ms</text>
 <text x="268" y="230" text-anchor="end" font-size="12.5" fill="#1a1a2e">allocation/list/attr operations</text>
-<rect x="280" y="215" width="144.1" height="22" rx="3" fill="#2563eb"/>
-<text x="432.1" y="231" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">3.77×</text>
-<text x="268" y="246" text-anchor="end" font-size="11" fill="#6b7280">Nix 53.1 ms; jinx 14.1 ms</text>
+<rect x="280" y="215" width="200.8" height="22" rx="3" fill="#2563eb"/>
+<text x="488.8" y="231" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">4.03×</text>
+<text x="268" y="246" text-anchor="end" font-size="11" fill="#6b7280">Nix 62.6 ms; jinx 15.5 ms</text>
 <text x="268" y="276" text-anchor="end" font-size="12.5" fill="#1a1a2e">NixOS minimal ISO evaluation</text>
-<rect x="280" y="261" width="55.6" height="22" rx="3" fill="#2563eb"/>
-<text x="343.6" y="277" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.46×</text>
-<text x="268" y="292" text-anchor="end" font-size="11" fill="#6b7280">Nix 6522.5 ms; jinx 4482.6 ms</text>
+<rect x="280" y="261" width="74.2" height="22" rx="3" fill="#2563eb"/>
+<text x="362.2" y="277" text-anchor="start" font-size="12.5" font-weight="700" fill="#1a1a2e">1.49×</text>
+<text x="268" y="292" text-anchor="end" font-size="11" fill="#6b7280">Nix 6952.1 ms; jinx 4664.8 ms</text>
 </svg>

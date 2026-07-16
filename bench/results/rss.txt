@@ -1,6 +1,6 @@
-rss-hello-oracle 142016512
+rss-hello-oracle 142344192
 rss-hello-jinx 166854656
-rss-firefox-oracle 424181760
+rss-firefox-oracle 424542208
 rss-firefox-jinx 545636352
-rss-iso-oracle 1852882944
-rss-iso-jinx 1948581888
+rss-iso-oracle 1854226432
+rss-iso-jinx 1948942336
